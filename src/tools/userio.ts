@@ -2,6 +2,8 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import { StateStore, findPlan, findUserResponseRequest, findUserStream } from "../lib/state.js";
+import { probeTelegramStatus } from "../lib/telegram_status.js";
+import { resolveStateDir } from "../lib/state_dir.js";
 import type { AuditLog } from "../lib/audit.js";
 
 /**
@@ -47,14 +49,32 @@ export function registerUserIo(server: McpServer, store: StateStore, audit: Audi
             delivered: false,
           };
           plan.userNotifications.push(note);
-          return {
-            plan_id,
-            notification_id: note.id,
-            queued: true,
-            delivered_via_telegram: "pending — depends on `orqlaude tg start` running with at least one whitelisted user.",
-          };
+          return { plan_id, notification_id: note.id };
         });
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        // v0.5.3+: probe Telegram status so the orchestrator knows whether
+        // the notification will actually be delivered.
+        const tg = await probeTelegramStatus(resolveStateDir().path);
+        const willDeliver = tg.status === "active";
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  ...(result as object),
+                  queued: true,
+                  telegram_status: tg.status,
+                  will_deliver: willDeliver,
+                  delivery_note: willDeliver
+                    ? "Notifier is active. Message should arrive within ~5s."
+                    : `Telegram is ${tg.status}. ${tg.notes.join(" ")} If you need this message to reach the user, use AskUserQuestion as the in-chat fallback.`,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
       },
       ({ plan_id }) => ({ planId: plan_id })
     )
@@ -95,11 +115,29 @@ export function registerUserIo(server: McpServer, store: StateStore, audit: Audi
             short_id: shortId,
             timeout_at: req.timeoutAt,
             has_options: Boolean(options && options.length > 0),
-            next_step:
-              "Poll `poll_user_response(request_id)` periodically. It returns status=`pending` until the user answers (or timeout). If no Telegram bot is running, the user can't respond — fall back to AskUserQuestion.",
           };
         });
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        const tg = await probeTelegramStatus(resolveStateDir().path);
+        const reachable = tg.status === "active";
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  ...(result as object),
+                  telegram_status: tg.status,
+                  reachable,
+                  next_step: reachable
+                    ? "Poll `poll_user_response(request_id)` periodically. It returns status=`pending` until the user answers (or timeout)."
+                    : `Telegram is ${tg.status}. The user cannot respond via Telegram right now. Either ${tg.notes[0] ?? "ensure the bot is running"}, OR fall back to AskUserQuestion for the in-chat surface.`,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
       },
       ({ plan_id }) => ({ planId: plan_id })
     )

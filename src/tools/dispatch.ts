@@ -3,6 +3,8 @@ import { z } from "zod";
 import { StateStore, findPlan, findTask } from "../lib/state.js";
 import { jsonlPathFor, snapshotSession } from "../lib/jsonl_tail.js";
 import { detectHallucination, extractToolUses } from "../lib/hallucination.js";
+import { spawnAgnetViaCli, findGitRoot, cleanupPlanWorktrees } from "../lib/spawn_cli.js";
+import { resolveStateDir } from "../lib/state_dir.js";
 import type { AuditLog } from "../lib/audit.js";
 
 /**
@@ -54,11 +56,22 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
             spawn_strategies: [
               {
                 priority: 1,
-                tool: "mcp__ccd_session__spawn_task",
+                tool: "mcp__orqlaude__spawn_via_cli",
                 preferred: true,
-                isolation: "worktree",
-                visibility: "Desktop Code sidebar (each Agnet has its own session)",
-                note: "Recommended. Creates an isolated git worktree session. The Agnet self-registers via checkin on its first turn.",
+                isolation: "dedicated git worktree per task (created by orqlaude)",
+                visibility: "JSONL on disk; appears in Desktop sidebar on app restart",
+                note: "RECOMMENDED. orqlaude creates the worktree, pre-allocates the session id, spawns claude -p directly. No reliance on the orchestrator picking the right tool, no worktree collisions between siblings, broker is wired automatically. Call mcp__orqlaude__spawn_via_cli(plan_id, task_id) — no other args needed; the prompt is already in state.",
+                args: {
+                  plan_id: plan.id,
+                  task_id: next.id,
+                },
+              },
+              {
+                priority: 2,
+                tool: "mcp__ccd_session__spawn_task",
+                isolation: "worktree (host-managed)",
+                visibility: "Claude Desktop Code sidebar (live)",
+                note: "Use this if you want the Agnet visible in your Desktop sidebar immediately. The host creates the worktree. The Agnet self-registers via checkin on first turn. Worktree-collision bug observed in 0.4.x — prefer spawn_via_cli for reliability until further validation.",
                 load_if_missing: "ToolSearch query: 'select:mcp__ccd_session__spawn_task'.",
                 args: {
                   title: next.title,
@@ -67,29 +80,16 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
                 },
               },
               {
-                priority: 2,
+                priority: 3,
                 tool: "Agent (host built-in)",
-                isolation: "none (shares parent cwd + filesystem)",
+                isolation: "NONE — shares the orchestrator's cwd + filesystem",
                 visibility: "in-session tool use only — no Desktop session",
-                note: "Fallback. Faster (no chip click) but loses worktree isolation. Concurrent Agnets WILL race on shared files unless they call claim_files aggressively. Self-registration via checkin still works, but the Agnet runs as a sub-call of YOUR session — when it returns, the broker connection ends.",
-                warning: "By choosing this, you accept that parallel file edits between Agnets may collide. claim_files in the broker is your only conflict-detection signal.",
+                warning:
+                  "AVOID for parallel fleets. The Agnet runs in the SAME worktree as you. Concurrent siblings will collide on git operations, potentially wiping uncommitted work. Only use if you're running a single task or have verified there's no sibling activity. Even then, claim_files is your only collision signal.",
                 args: {
                   subagent_type: "general-purpose",
                   description: next.title.slice(0, 60),
                   prompt: spawnPrompt,
-                },
-              },
-              {
-                priority: 3,
-                tool: "shell: claude -p (headless)",
-                isolation: "explicit worktree via --worktree flag",
-                visibility: "JSONL only — won't appear in Desktop sidebar until app restart",
-                note: "CLI fallback for non-Desktop hosts. Spawn via Bash: `claude -p '<prompt>' --worktree fleet-<short_id> --session-id <new-uuid> --output-format stream-json`. The Agnet self-registers via checkin if orqlaude is in the worktree's .mcp.json.",
-                args: {
-                  command_template:
-                    "claude -p '<PROMPT>' --worktree fleet-" +
-                    next.id.slice(0, 8) +
-                    " --output-format stream-json --permission-mode bypassPermissions",
                 },
               },
             ],
@@ -98,6 +98,80 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
           };
         });
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      },
+      ({ plan_id }) => ({ planId: plan_id })
+    )
+  );
+
+  // ---- spawn_via_cli (orqlaude-owned spawning, v0.5.3+) --------------------
+  server.tool(
+    "spawn_via_cli",
+    "PREFERRED SPAWN PATH. orqlaude creates a dedicated git worktree for this task, pre-allocates the Agnet's session_id, and spawns `claude -p` directly. No reliance on the orchestrator picking the right spawn tool. The Agnet's broker is auto-wired (orqlaude is passed inline via --mcp-config). Returns the worktree path + session_id + pid. Side effects: creates `<project>/.orqlaude-worktrees/<plan_short>-<agnet>/`. Requires the `claude` binary on PATH or via CLAUDE_BIN env. Caveat: spawned sessions don't appear in Desktop sidebar until app restart (the JSONL is on disk; the in-memory cache hasn't seen it).",
+    {
+      plan_id: z.string(),
+      task_id: z.string(),
+      project_root: z.string().optional().describe("Optional override of the git root. Defaults to walking up from cwd until a .git is found."),
+      claude_bin: z.string().optional().describe("Optional override of the claude binary path."),
+    },
+    audit.wrap(
+      "spawn_via_cli",
+      async ({ plan_id, task_id, project_root, claude_bin }) => {
+        const result = await store.update(async (state) => {
+          const plan = findPlan(state, plan_id);
+          const task = findTask(plan, task_id);
+          if (task.spawnedSessionId) {
+            throw new Error(`Task ${task_id} already has a spawned session (${task.spawnedSessionId}). Use kill_task / cleanup_worktrees if you want to re-spawn.`);
+          }
+          const root = project_root ?? findGitRoot(process.cwd());
+          const stateDir = resolveStateDir().path;
+          const spawn = await spawnAgnetViaCli({
+            projectRoot: root,
+            stateDir,
+            planId: plan.id,
+            taskId: task.id,
+            agnetName: task.agnetName,
+            prompt: buildSpawnPrompt(plan.id, task.id, task.prompt, task.branchHint),
+            branchHint: task.branchHint,
+            claudeBin: claude_bin,
+          });
+          // Pre-register the session so checkin from the child is idempotent.
+          task.spawnedSessionId = spawn.sessionId;
+          task.worktreePath = spawn.worktreePath;
+          task.worktreeBranch = spawn.branch;
+          task.status = "running";
+          task.startedAt = Date.now();
+          return {
+            plan_id,
+            task_id,
+            agnet: task.agnetName ? `Agnet ${task.agnetName}` : "Agnet",
+            session_id: spawn.sessionId,
+            worktree_path: spawn.worktreePath,
+            branch: spawn.branch,
+            pid: spawn.pid,
+            jsonl_path: spawn.jsonlPath,
+            next_step: "The Agnet is running detached. Poll status(plan_id) for activity, or read the JSONL directly. The child will call checkin on its first turn — but since we pre-registered the session, that call will be idempotent.",
+          };
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      },
+      ({ plan_id }) => ({ planId: plan_id })
+    )
+  );
+
+  // ---- cleanup_worktrees (companion to spawn_via_cli, v0.5.3+) -------------
+  server.tool(
+    "cleanup_worktrees",
+    "Remove all orqlaude-managed worktrees for a plan (typically called after `collect`). Only touches paths under <project>/.orqlaude-worktrees/<plan_short>-*. Force-removes via `git worktree remove --force` then falls back to rm -rf if git refuses.",
+    {
+      plan_id: z.string(),
+      project_root: z.string().optional(),
+    },
+    audit.wrap(
+      "cleanup_worktrees",
+      async ({ plan_id, project_root }) => {
+        const root = project_root ?? findGitRoot(process.cwd());
+        const removed = await cleanupPlanWorktrees(root, plan_id);
+        return { content: [{ type: "text", text: JSON.stringify({ plan_id, removed_count: removed.length, removed }, null, 2) }] };
       },
       ({ plan_id }) => ({ planId: plan_id })
     )
