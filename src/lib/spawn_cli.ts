@@ -236,6 +236,11 @@ export async function spawnAgnetViaCli(input: SpawnViaCliInput): Promise<SpawnVi
     sessionId,
     "--output-format",
     "stream-json",
+    // v0.7.3: claude CLI now requires --verbose whenever
+    // --output-format=stream-json is used. Without it the child bails
+    // with: "Error: When using --print, --output-format=stream-json
+    // requires --verbose". Always emit them as a pair.
+    "--verbose",
     "--permission-mode",
     input.permissionMode ?? "bypassPermissions",
     "--mcp-config",
