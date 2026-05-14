@@ -38,6 +38,31 @@ export function registerBroker(server: McpServer, store: StateStore, audit: Audi
           // Already-registered session?
           let found = planForSession(state, session_id);
           let selfRegistered = false;
+          // v0.5.3+: conflict detection. If the caller's session is already
+          // bound to a task BUT they passed a different task_id from their
+          // prompt, surface that as a hard error — silently mis-binding wastes
+          // the work because collect() will attribute it to the wrong task.
+          if (found && task_id && found.task.id !== task_id) {
+            return {
+              registered: true,
+              conflict: {
+                kind: "session_task_mismatch",
+                prompt_task_id: task_id,
+                registered_task_id: found.task.id,
+                registered_task_title: found.task.title,
+                explanation:
+                  "Your session is bound to a different task than the task_id in your prompt. Likely cause: the orchestrator generated your prompt from a stale next_task call, OR two Agnets accidentally received the same prompt. orqlaude is sticking with your session's existing registration — flag this to the orchestrator immediately via post_note.",
+              },
+              plan_id: found.plan.id,
+              task_id: found.task.id,
+              task_title: found.task.title,
+              messages: [],
+              stop_signal: null,
+              blocking_notes_acked: [],
+              guidance:
+                "STOP your current work and post_note the conflict to the orchestrator. Don't proceed — your output will be attributed to the wrong task in collect().",
+            };
+          }
           // First-turn self-registration path.
           if (!found && task_id) {
             const target = unclaimedTaskById(state, task_id);
@@ -46,13 +71,35 @@ export function registerBroker(server: McpServer, store: StateStore, audit: Audi
               target.task.status = "running";
               found = target;
               selfRegistered = true;
+            } else {
+              // v0.5.3+: surface why we couldn't claim — is the task already
+              // owned by someone else, or doesn't exist at all?
+              const anyMatch = Object.values(state.plans)
+                .flatMap((p) => p.tasks)
+                .find((t) => t.id === task_id);
+              if (anyMatch && anyMatch.spawnedSessionId) {
+                return {
+                  registered: false,
+                  conflict: {
+                    kind: "task_already_claimed",
+                    task_id,
+                    claimed_by_session: anyMatch.spawnedSessionId,
+                    task_title: anyMatch.title,
+                    explanation: `Task ${task_id} is already claimed by session ${anyMatch.spawnedSessionId}. Your prompt's task_id is stale or duplicated — flag it to the orchestrator.`,
+                  },
+                  messages: [],
+                  stop_signal: null,
+                  blocking_notes_acked: [],
+                  guidance: "STOP and post_note to the orchestrator. Don't do work that won't be tracked.",
+                };
+              }
             }
           }
           if (!found) {
             return {
               registered: false,
               note: task_id
-                ? "task_id provided but no matching unclaimed dispatched task. Either the plan moved on or another spawn claimed it."
+                ? "task_id provided but no matching unclaimed task. Either the plan moved on or the id was never registered (e.g. orchestrator forgot to call next_task)."
                 : "This session is not registered. On your first checkin, pass your task_id too (it's in the prompt under 'task_id:').",
               messages: [],
               stop_signal: null,
