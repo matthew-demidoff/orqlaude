@@ -36,6 +36,8 @@ export interface SpawnViaCliResult {
   commandLine: string;
   stderrPath: string;
   stdoutPath: string;
+  /** v0.7.1+: path to the file we wrote with the --mcp-config payload. */
+  mcpConfigPath: string;
 }
 
 export interface SpawnViaCliInput {
@@ -174,12 +176,13 @@ export async function spawnAgnetViaCli(input: SpawnViaCliInput): Promise<SpawnVi
       `claude binary ${claudeBin} is not executable. Check permissions or set CLAUDE_BIN to a working binary.`
     );
   }
-  // 1b. Validate mcp-config JSON parses (sanity check; we built it ourselves).
+  // 1b. Build the MCP config body + validate it parses (sanity check; we
+  //     built it ourselves).
   const thisFile = fileURLToPath(import.meta.url);
   const serverEntry = path.resolve(path.dirname(thisFile), "..", "server.js");
-  const mcpConfig = buildMcpConfig(serverEntry, input.stateDir);
+  const mcpConfigBody = buildMcpConfig(serverEntry, input.stateDir);
   try {
-    JSON.parse(mcpConfig);
+    JSON.parse(mcpConfigBody);
   } catch (err) {
     throw new Error(`Internal: built malformed --mcp-config JSON: ${(err as Error).message}`);
   }
@@ -202,9 +205,16 @@ export async function spawnAgnetViaCli(input: SpawnViaCliInput): Promise<SpawnVi
   const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
   const jsonlPath = path.join(home, ".claude", "projects", wt.path.replace(/\//g, "-"), `${sessionId}.jsonl`);
 
-  // 4. Log files.
+  // 4. Log files + mcp-config file.
+  // v0.7.1: claude --mcp-config always expects a FILE PATH despite the help
+  // text claiming "files or strings." Passing the JSON body inline made the
+  // child try to open(2) a path > NAME_MAX bytes long and bail with
+  // ENAMETOOLONG. Write the body to a temp file in the worktree and pass
+  // that path instead.
   const stderrPath = path.join(wt.path, ".orqlaude.stderr.log");
   const stdoutPath = path.join(wt.path, ".orqlaude.stdout.log");
+  const mcpConfigPath = path.join(wt.path, ".orqlaude.mcp.json");
+  await fs.writeFile(mcpConfigPath, mcpConfigBody, { mode: 0o600 });
   const stderrFh = await fs.open(stderrPath, "w");
   const stdoutFh = await fs.open(stdoutPath, "w");
 
@@ -220,7 +230,7 @@ export async function spawnAgnetViaCli(input: SpawnViaCliInput): Promise<SpawnVi
     "--permission-mode",
     input.permissionMode ?? "bypassPermissions",
     "--mcp-config",
-    mcpConfig,
+    mcpConfigPath, // v0.7.1: path-to-file, not inline JSON
   ];
   if (input.budgetCapUsd) {
     args.push("--max-budget-usd", String(input.budgetCapUsd));
@@ -274,6 +284,7 @@ export async function spawnAgnetViaCli(input: SpawnViaCliInput): Promise<SpawnVi
     commandLine,
     stderrPath,
     stdoutPath,
+    mcpConfigPath,
   };
 }
 
