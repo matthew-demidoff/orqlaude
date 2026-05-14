@@ -4,7 +4,7 @@ Multi-agent orchestrator for Claude Code. One primary Claude session decomposes 
 
 The name is **orq**hestrator + **Claude**.
 
-> Status: **v0.2.0** — 19 tools, 11 tests passing, CI green. Token-first budgets (Max-friendly), self-registering child agents, hallucination detection, file-claim broker, audit log, resumability, and an auto-review pipeline. Telegram bot is on the roadmap (v0.3).
+> Status: **v0.3.0** — 19 tools, 11 tests passing, CI green. Token-first budgets (Max-friendly), self-registering child agents, hallucination detection, file-claim broker, audit log, resumability, auto-review pipeline, and a **Telegram bot** for fleet notifications + remote control.
 
 ## Why orqlaude exists
 
@@ -189,12 +189,50 @@ orqlaude/
 └── dist/                       # tsc output (published to npm)
 ```
 
-## Known gaps (v0.2 → v0.3 roadmap)
+## Telegram bot
 
-- **Telegram bot** — `orqlaude tg setup / start / whitelist` to receive notifications, approve fleets from your phone, query status while away. Designed; not yet shipped.
+orqlaude can notify you on Telegram when fleet events happen and accept commands from your phone.
+
+```sh
+# One-time setup (creates ~/.orqlaude/telegram.json, mode 600)
+orqlaude tg setup
+# (paste your bot token from @BotFather)
+
+# Message your bot /start in Telegram to learn your user id, then:
+orqlaude tg whitelist <your_user_id> --owner --label "you"
+
+# Run the bot (foreground; daemonize with launchctl / systemd / nohup as you prefer)
+cd /path/to/your/project
+orqlaude tg start
+```
+
+**Notifications pushed to you:**
+- 📋 New plan created
+- ✅ Plan approved (spawn imminent)
+- ✓ Task done (with PR URL)
+- ❌ Task failed / 🛑 cancelled
+- 📝 New agent note (with severity from `post_note`)
+- 💸 Auto-cancel on budget overrun
+- 🎉 Fleet collected
+
+**Commands you can send (whitelisted users only):**
+- `/plans` — active plans
+- `/status <plan_id>` — refreshed task list with token usage
+- `/show <plan_id>` — raw plan JSON
+- `/notes <plan_id>` — recent agent notes
+- `/kill <plan_id> <task_id> <reason>` — STOP a runaway agent
+- `/whitelist <user_id> [label]` (owner-only) — add another user
+- `/help` / `/whoami`
+
+The bot uses raw `fetch` against Telegram's Bot API — zero extra deps. State is shared with the MCP via the same `StateStore`, so commands take effect on the next status() / checkin().
+
+## Known gaps (v0.3 → v0.4 roadmap)
+
 - **Cost-learning estimates** — current baselines are tuned to a single Haiku probe. Future: write per-task realized costs to history and use moving averages.
 - **N chips = N clicks** — Anthropic's `spawn_task` is per-click by design. Worth filing as feedback. Until then, batch-spawn isn't possible through that API.
-- **Second-model hallucination check** — periodic Haiku cross-validation is on the v0.3 roadmap, gated by opt-in.
+- **Second-model hallucination check** — periodic Haiku cross-validation of recent activity, opt-in.
+- **Multi-project Telegram bot** — currently the bot watches a single project. Multi-project watching is a small extension to the config schema.
+- **Inline approve buttons in Telegram** — `/approve <plan_id>` and inline keyboards so you can confirm fleets from your phone.
 
 ## License
 
