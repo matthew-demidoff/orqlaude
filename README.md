@@ -132,13 +132,13 @@ Without a running `orqlaude tg start`, `notify_user` queues silently, `request_u
 
 #### Streaming transport
 
-orqlaude streams via Telegram's `sendMessageDraft` endpoint (the native streaming preview API, intended for agent output). Drafts are ephemeral (~30s) and updates that share the same `draft_id` are animated client-side. When a stream ends, orqlaude follows up with a `sendMessage` to persist the final content as a normal chat message with a `✓` marker.
+orqlaude streams by opening a single Telegram message with `sendMessage`, then calling `editMessageText` on each append. The final `stream_to_user_end` does one more edit appending a `✓` marker.
 
-If the bot's Telegram server doesn't yet expose `sendMessageDraft` (older deployments), orqlaude falls back to a single `sendMessage` + repeated `editMessageText` per stream. The fallback is transparent — you don't need to do anything; the notifier flips a `transport: "edit"` flag on the stream and continues.
+(v0.5.1 briefly used `sendMessageDraft` for animated, ephemeral previews — reverted in v0.5.4 after that endpoint proved unreliable in the standard Bot API.)
 
 Limits to know:
 - A Telegram message tops out at 4096 chars. orqlaude caps stream content at 3800 to leave room for the title + completion marker; further appends are silently truncated.
-- The draft path throttles at 400 ms between updates per stream; the edit fallback throttles at 1.5 s (matching the Bot API rate limit for `editMessageText`).
+- Edits are rate-limited (~1/sec per message); orqlaude throttles to 1.5 s between edits per stream.
 - If you need to stream more than 4 kb of output, start a new stream when you're approaching the cap.
 
 ### Health

@@ -2,6 +2,11 @@ import { TelegramApi } from "./api.js";
 import { loadConfig } from "./config.js";
 import { handleCommand, handleCallbackQuery } from "./commands.js";
 import { Notifier } from "./notifier.js";
+import { StateStore } from "../lib/state.js";
+import { resolveStateDir } from "../lib/state_dir.js";
+import { style } from "../lib/style.js";
+import path from "node:path";
+import { existsSync } from "node:fs";
 
 /**
  * Bot main loop.
@@ -21,13 +26,67 @@ export async function runBot(projectDir: string): Promise<void> {
   }
   const api = new TelegramApi(cfg.botToken);
   const me = await api.getMe();
-  process.stdout.write(`orqlaude tg: connected as @${me.username} (bot id ${me.id})\n`);
-  process.stdout.write(`orqlaude tg: watching ${projectDir}\n`);
-  if (cfg.whitelist.length === 0 && !cfg.ownerId) {
-    process.stdout.write(`orqlaude tg: NO whitelist yet. Have your user message /start to learn your id, then run \`orqlaude tg whitelist <id> --owner\`.\n`);
-  } else {
-    process.stdout.write(`orqlaude tg: whitelist has ${cfg.whitelist.length} user(s), owner=${cfg.ownerId ?? "none"}.\n`);
+
+  // v0.5.4: print a self-diagnostic block so a mismatch between the MCP
+  // server's state dir and the bot's watched dir is immediately visible.
+  // This is the single most common cause of "I called notify_user but
+  // nothing arrived" — the MCP server runs with cwd=/ → state goes to
+  // ~/.orqlaude/projects/root-..., but the bot was started from a real
+  // project directory and watches that project's .orqlaude/ instead.
+  const stateDir = path.join(projectDir, ".orqlaude");
+  const stateFile = path.join(stateDir, "orqlaude-state.json");
+  const stateExists = existsSync(stateFile);
+  let planCount = 0;
+  let pendingNotifications = 0;
+  if (stateExists) {
+    try {
+      const store = new StateStore(stateDir);
+      const stats = await store.read((s) => {
+        const plans = Object.values(s.plans);
+        const pending = plans.reduce(
+          (acc, p) => acc + p.userNotifications.filter((n) => !n.delivered).length,
+          0
+        );
+        return { count: plans.length, pending };
+      });
+      planCount = stats.count;
+      pendingNotifications = stats.pending;
+    } catch {
+      /* malformed state; leave counts at 0 */
+    }
   }
+  // Where would the MCP server REALLY put state if it were launched right now?
+  const wouldBeStateDir = resolveStateDir();
+
+  process.stdout.write(`${style.coral("◆ orqlaude tg")} — running\n`);
+  process.stdout.write(`  ${style.sand("bot:")}      @${me.username} (id ${me.id})\n`);
+  process.stdout.write(`  ${style.sand("watching:")} ${projectDir}\n`);
+  process.stdout.write(`  ${style.sand("state:")}    ${stateFile} ${stateExists ? style.coral("(exists)") : style.crimson("(missing)")}\n`);
+  if (stateExists) {
+    process.stdout.write(`             ${planCount} plan(s), ${pendingNotifications} pending notification(s)\n`);
+  }
+  process.stdout.write(`  ${style.sand("whitelist:")} ${cfg.whitelist.length} user(s), owner=${cfg.ownerId ?? "none"}\n`);
+
+  // Loud warning if the MCP server (if it were starting from THIS bot's cwd)
+  // would resolve to a different state dir. Surfaces the cwd=/ mismatch.
+  if (wouldBeStateDir.path !== stateDir) {
+    process.stdout.write(
+      `\n  ${style.crimson("⚠ STATE-DIR MISMATCH:")} an MCP server starting from this dir would resolve to:\n` +
+        `      ${wouldBeStateDir.path}\n` +
+        `      (source: ${wouldBeStateDir.source})\n` +
+        `  If your orqlaude MCP is launched with a different cwd (cwd=/ is common in MCP hosts), it's writing\n` +
+        `  state to ITS resolved dir, not this one. Set ORQLAUDE_STATE_DIR in the MCP server's .mcp.json env block\n` +
+        `  to ${stateDir} so they share state.\n\n`
+    );
+  }
+
+  if (cfg.whitelist.length === 0 && !cfg.ownerId) {
+    process.stdout.write(
+      `  ${style.crimson("NO whitelist yet.")} Have your user message /start to learn your id, then run\n` +
+        `  ${style.coral(`orql tg whitelist <id> --owner`)}\n`
+    );
+  }
+  process.stdout.write(`\n${style.dim("polling for updates…")}\n`);
 
   const notifier = new Notifier(projectDir, cfg, api);
 

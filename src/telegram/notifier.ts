@@ -32,22 +32,9 @@ interface NotifierCursor {
   notifiedUserStreamIds: string[];
 }
 
-/** Minimum interval between edits when using the editMessageText fallback
- *  (the Bot API limits edits to ~1/sec per chat; we use 1.5s for headroom).
- *  sendMessageDraft is designed for streaming so we use a shorter throttle. */
+/** Minimum interval between edits to a streaming message (Telegram caps
+ *  editMessageText at ~1/sec per chat; we use 1.5s for headroom). */
 const STREAM_EDIT_THROTTLE_MS = 1500;
-const STREAM_DRAFT_THROTTLE_MS = 400;
-
-/**
- * Derive a stable, non-zero 48-bit integer draft_id from a stream UUID. Same
- * stream UUID always yields the same draft_id, so a restart of the notifier
- * can pick up an in-flight stream and continue animating it.
- */
-function streamDraftId(streamId: string): number {
-  const hex = streamId.replace(/-/g, "").slice(0, 12);  // 48 bits, safely in MAX_SAFE_INTEGER
-  const n = parseInt(hex, 16);
-  return n === 0 ? 1 : n;
-}
 
 const EMPTY_CURSOR: NotifierCursor = {
   initialized: false,
@@ -228,20 +215,12 @@ export class Notifier {
       }
     }
 
-    // ---- v0.5+ stream handling (draft-first, edit fallback) ----
+    // ---- stream handling (edit-based, v0.5.4+) ----
     //
-    // For each stream we maintain ONE of two transports per Telegram chat:
-    //   1. "draft" (preferred, v0.5.1+): sendMessageDraft with a stable
-    //      draft_id. Telegram animates updates and shows them as an
-    //      ephemeral preview. When the stream ends we call sendMessage to
-    //      persist the final content.
-    //   2. "edit" (fallback): sendMessage once + editMessageText for each
-    //      update. Used when sendMessageDraft is unavailable on the bot's
-    //      Telegram server.
-    //
-    // We probe draft on first attempt; if it fails (404 / method not found),
-    // we switch the stream's transport to "edit" and stick with it for the
-    // rest of its lifecycle.
+    // sendMessageDraft was tried in v0.5.1 but didn't reliably exist in the
+    // standard Bot API, so we're back to the original v0.5.0 transport:
+    // one sendMessage to open the message, then editMessageText for each
+    // update, with a final edit to add the ✓ marker on stream end.
     for (const plan of plans) {
       for (const stream of plan.userStreams) {
         const isNew = !cursor.notifiedUserStreamIds.includes(stream.id);
@@ -249,80 +228,14 @@ export class Notifier {
         const justEnded = stream.status === "ended" && !stream.finalSent;
         if (!isNew && !hasNewContent && !justEnded) continue;
 
-        // Throttle: drafts are designed for streaming, so we tick faster.
-        const throttle = stream.transport === "edit" ? STREAM_EDIT_THROTTLE_MS : STREAM_DRAFT_THROTTLE_MS;
+        // Throttle to stay under Telegram's edit rate limit (~1/sec).
         const now = Date.now();
-        if (!isNew && !justEnded && stream.lastEditedAt && now - stream.lastEditedAt < throttle) {
+        if (!isNew && !justEnded && stream.lastEditedAt && now - stream.lastEditedAt < STREAM_EDIT_THROTTLE_MS) {
           continue;
         }
 
-        const draftId = stream.draftId ?? streamDraftId(stream.id);
-        if (!stream.draftId) {
-          // First touch — record draft id.
-          await store.update((state) => {
-            for (const p of Object.values(state.plans)) {
-              const s = p.userStreams.find((x) => x.id === stream.id);
-              if (s) s.draftId = draftId;
-            }
-          });
-        }
-
         for (const entry of this.cfg.whitelist) {
-          // Effective transport: explicit, else default to "draft" and let
-          // the first call probe.
-          const transport = stream.transport ?? "draft";
-
-          if (transport === "draft") {
-            // Draft path. text="" on initial empty content gives the
-            // Telegram "Thinking…" placeholder.
-            const text = formatStreamMessage(stream);
-            const result = await this.api.sendMessageDraft(entry.chatId, draftId, text, { parseMode: "Markdown" });
-            if (!result.ok) {
-              // Server doesn't support drafts (or other failure). Switch to
-              // edit fallback for the rest of this stream's life.
-              process.stderr.write(
-                `[orqlaude tg stream] sendMessageDraft failed (${result.status}); falling back to edit. body=${result.body.slice(0, 200)}\n`
-              );
-              await store.update((state) => {
-                for (const p of Object.values(state.plans)) {
-                  const s = p.userStreams.find((x) => x.id === stream.id);
-                  if (s) s.transport = "edit";
-                }
-              });
-              // Now do the edit-path open in this same tick.
-              await openOrEditEditMode(this.api, store, stream, entry.chatId, justEnded);
-            } else {
-              // Draft sent. Record delivery state.
-              await store.update((state) => {
-                for (const p of Object.values(state.plans)) {
-                  const s = p.userStreams.find((x) => x.id === stream.id);
-                  if (s) {
-                    s.transport = "draft";
-                    s.telegramChatId = s.telegramChatId ?? entry.chatId;
-                    s.lastDeliveredContent = text;
-                    s.lastEditedAt = Date.now();
-                  }
-                }
-              });
-              // On end: persist the final message via sendMessage and mark.
-              if (justEnded) {
-                try {
-                  await this.api.sendMessage(entry.chatId, formatStreamEnded(stream), { parseMode: "Markdown" });
-                  await store.update((state) => {
-                    for (const p of Object.values(state.plans)) {
-                      const s = p.userStreams.find((x) => x.id === stream.id);
-                      if (s) s.finalSent = true;
-                    }
-                  });
-                } catch (err) {
-                  process.stderr.write(`[orqlaude tg stream] final persist failed: ${(err as Error).message}\n`);
-                }
-              }
-            }
-          } else {
-            // Edit path.
-            await openOrEditEditMode(this.api, store, stream, entry.chatId, justEnded);
-          }
+          await openOrEditEditMode(this.api, store, stream, entry.chatId, justEnded);
         }
 
         if (isNew) cursor.notifiedUserStreamIds.push(stream.id);
