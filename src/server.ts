@@ -25,7 +25,7 @@ const audit = new AuditLog(stateDir);
 
 const server = new McpServer({
   name: "orqlaude",
-  version: "0.5.6",
+  version: "0.6.0",
 });
 
 registerPing(server);

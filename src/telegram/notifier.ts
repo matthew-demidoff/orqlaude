@@ -3,6 +3,8 @@ import path from "node:path";
 import { StateStore, type Plan, type UserResponseRequest, type UserStream } from "../lib/state.js";
 import { TelegramApi, type InlineKeyboardButton } from "./api.js";
 import { agnetLabel } from "../lib/agnet.js";
+import { readPreferences } from "../lib/preferences.js";
+import { localNotification } from "../lib/notifications.js";
 import type { TelegramConfig } from "./config.js";
 
 /**
@@ -215,6 +217,20 @@ export class Notifier {
       }
     }
 
+    // v0.6.0: also fire macOS notifications if the user opted in via
+    // `orql notify on`. Best-effort; never blocks Telegram delivery.
+    try {
+      const prefs = await readPreferences();
+      if (prefs.localNotifications && plainMessages.length > 0) {
+        for (const msg of plainMessages) {
+          const { title, body } = splitForNotification(msg);
+          localNotification(title, body, "orqlaude");
+        }
+      }
+    } catch {
+      /* swallow — local notifications are best-effort */
+    }
+
     // ---- stream handling (edit-based, v0.5.4+) ----
     //
     // sendMessageDraft was tried in v0.5.1 but didn't reliably exist in the
@@ -349,6 +365,21 @@ async function openOrEditEditMode(
   } catch (err) {
     process.stderr.write(`[orqlaude tg stream] edit-mode update failed: ${(err as Error).message}\n`);
   }
+}
+
+/**
+ * Strip Markdown decoration from a queued Telegram message and split into
+ * a short title + remaining body suitable for a desktop notification.
+ * Falls back to the whole message as body when there's no clear split.
+ */
+function splitForNotification(msg: string): { title: string; body: string } {
+  // Strip markdown bold/italic markers, leading emoji-and-asterisks, etc.
+  const plain = msg.replace(/[*_`]/g, "").replace(/\\([_*`\[])/g, "$1").trim();
+  const newlineAt = plain.indexOf("\n");
+  if (newlineAt === -1 || newlineAt > 80) {
+    return { title: plain.slice(0, 80), body: plain.length > 80 ? plain.slice(80, 280) : "" };
+  }
+  return { title: plain.slice(0, newlineAt).slice(0, 80), body: plain.slice(newlineAt + 1, newlineAt + 280) };
 }
 
 function buildInlineKeyboard(shortId: string, options: string[]): InlineKeyboardButton[][] {
