@@ -92,6 +92,45 @@ export interface FileClaim {
   claimedAt: number;
 }
 
+/**
+ * Outbound message from primary Claude to the user. Pushed to Telegram by
+ * the notifier on its next tick. Lives on the plan so it can be filtered by
+ * which fleet it belongs to.
+ */
+export interface UserNotification {
+  id: string;
+  taskId?: string;
+  text: string;
+  urgency: "low" | "normal" | "high";
+  createdAt: number;
+  delivered: boolean;
+  deliveredAt?: number;
+}
+
+/**
+ * Outbound question from primary Claude to the user, with an awaited
+ * response. The notifier pushes to Telegram (with an inline keyboard if
+ * `options` is set). The bot writes the user's choice/text back here on
+ * callback_query. Primary Claude polls via `poll_user_response`.
+ */
+export interface UserResponseRequest {
+  id: string;
+  shortId: string;          // first 8 chars of id, used in Telegram for human-friendly ref
+  taskId?: string;
+  prompt: string;
+  options?: string[];
+  createdAt: number;
+  timeoutAt: number;
+  delivered: boolean;
+  deliveredAt?: number;
+  /** Telegram message_id of the question, so the bot can edit it on response. */
+  telegramMessageId?: number;
+  telegramChatId?: number;
+  response?: string;
+  respondedAt?: number;
+  cancelled?: boolean;
+}
+
 export interface Plan {
   id: string;
   createdAt: number;
@@ -112,15 +151,18 @@ export interface Plan {
   notes: Note[];
   messages: Message[];
   claims: FileClaim[];
+  /** v0.4+: outbound notifications / questions from primary Claude to user. */
+  userNotifications: UserNotification[];
+  userResponseRequests: UserResponseRequest[];
   reviewPlanId?: string;
 }
 
 export interface State {
-  schemaVersion: 2;
+  schemaVersion: 3;
   plans: Record<string, Plan>;
 }
 
-const EMPTY_STATE: State = { schemaVersion: 2, plans: {} };
+const EMPTY_STATE: State = { schemaVersion: 3, plans: {} };
 const LOCK_TIMEOUT_MS = 5_000;
 const LOCK_RETRY_BASE_MS = 30;
 
@@ -264,11 +306,11 @@ function sleep(ms: number): Promise<void> {
   return new Promise((res) => setTimeout(res, ms));
 }
 
-/** Forward-compatible migration from earlier schemas. */
+/** Forward-compatible migration from earlier schemas. v1 → v3 in one pass. */
 function migrate(input: Partial<State> & { schemaVersion?: number }): State {
   const v = input.schemaVersion ?? 1;
-  if (v === 2 && input.plans) return input as State;
-  const out: State = { schemaVersion: 2, plans: {} };
+  if (v === 3 && input.plans) return input as State;
+  const out: State = { schemaVersion: 3, plans: {} };
   for (const [id, plan] of Object.entries(input.plans ?? {})) {
     const p = plan as Plan & { budgetCapUsd?: number; perAgentCapUsd?: number };
     out.plans[id] = {
@@ -279,6 +321,8 @@ function migrate(input: Partial<State> & { schemaVersion?: number }): State {
       notes: p.notes ?? [],
       messages: p.messages ?? [],
       claims: p.claims ?? [],
+      userNotifications: p.userNotifications ?? [],
+      userResponseRequests: p.userResponseRequests ?? [],
     } as Plan;
   }
   return out;
@@ -307,7 +351,20 @@ export function newPlan(
     notes: [],
     messages: [],
     claims: [],
+    userNotifications: [],
+    userResponseRequests: [],
   };
+}
+
+export function findUserResponseRequest(
+  state: State,
+  requestId: string
+): { plan: Plan; req: UserResponseRequest } | undefined {
+  for (const plan of Object.values(state.plans)) {
+    const req = plan.userResponseRequests.find((r) => r.id === requestId || r.shortId === requestId);
+    if (req) return { plan, req };
+  }
+  return undefined;
 }
 
 export function findPlan(state: State, planId: string): Plan {

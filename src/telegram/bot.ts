@@ -1,6 +1,6 @@
 import { TelegramApi } from "./api.js";
 import { loadConfig } from "./config.js";
-import { handleCommand } from "./commands.js";
+import { handleCommand, handleCallbackQuery } from "./commands.js";
 import { Notifier } from "./notifier.js";
 
 /**
@@ -60,6 +60,10 @@ export async function runBot(projectDir: string): Promise<void> {
         if (u.message) {
           await handleCommand(api, u.message, projectDir).catch((err) => {
             process.stderr.write(`[command] ${(err as Error).message}\n`);
+          });
+        } else if (u.callback_query) {
+          await handleCallbackQuery(api, u.callback_query, projectDir).catch((err: unknown) => {
+            process.stderr.write(`[callback] ${(err as Error).message}\n`);
           });
         }
       }
