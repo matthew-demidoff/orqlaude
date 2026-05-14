@@ -64,3 +64,16 @@ test("error_ui: errorLine includes ✗ glyph and optional suggestion", async () 
   assert.ok(withSuggestion.includes("try foo"));
   assert.ok(withSuggestion.includes("→"));
 });
+
+test("v0.6.1 taglines: exactly 149, all non-empty, no consecutive duplicates", async () => {
+  const { TAGLINES } = await import("../cli/taglines.js");
+  assert.equal(TAGLINES.length, 149);
+  for (let i = 0; i < TAGLINES.length; i++) {
+    assert.ok(typeof TAGLINES[i] === "string" && TAGLINES[i].length > 0, `tagline ${i} is empty`);
+  }
+  // The picker uses a never-repeat-last constraint, so duplicates between
+  // non-adjacent indices are fine — but adjacent duplicates would defeat it.
+  for (let i = 1; i < TAGLINES.length; i++) {
+    assert.notEqual(TAGLINES[i], TAGLINES[i - 1], `adjacent duplicate at ${i - 1}/${i}`);
+  }
+});
