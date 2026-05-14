@@ -114,12 +114,16 @@ These let primary Claude push messages to and pull answers from the **user** (vi
 
 Without a running `orqlaude tg start`, `notify_user` queues silently, `request_user_response` will always `timed_out`, and streaming tools accumulate content in state but no message lands on Telegram. Fall back to `AskUserQuestion` if Telegram is unavailable.
 
-#### Streaming caveat
+#### Streaming transport
 
-Telegram has no native "streaming text" endpoint. We simulate it via `editMessageText` on a tight cadence. Limits to know:
-- One Telegram message tops out at ~4096 chars. orqlaude caps stream content at 3800 to leave room for the title + completion marker; further appends are silently truncated.
-- Edits per message are rate-limited (~1/sec). orqlaude's notifier throttles to 1.5s between edits per stream.
-- If you need to stream more than 4kb of output, start a new stream when you're approaching the cap.
+orqlaude streams via Telegram's `sendMessageDraft` endpoint (the native streaming preview API, intended for agent output). Drafts are ephemeral (~30s) and updates that share the same `draft_id` are animated client-side. When a stream ends, orqlaude follows up with a `sendMessage` to persist the final content as a normal chat message with a `✓` marker.
+
+If the bot's Telegram server doesn't yet expose `sendMessageDraft` (older deployments), orqlaude falls back to a single `sendMessage` + repeated `editMessageText` per stream. The fallback is transparent — you don't need to do anything; the notifier flips a `transport: "edit"` flag on the stream and continues.
+
+Limits to know:
+- A Telegram message tops out at 4096 chars. orqlaude caps stream content at 3800 to leave room for the title + completion marker; further appends are silently truncated.
+- The draft path throttles at 400 ms between updates per stream; the edit fallback throttles at 1.5 s (matching the Bot API rate limit for `editMessageText`).
+- If you need to stream more than 4 kb of output, start a new stream when you're approaching the cap.
 
 ### Health
 
