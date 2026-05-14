@@ -44,20 +44,39 @@ orqlaude is the thin layer that adds those things. It never spawns processes its
 npm install -g @synaplink/orqlaude   # CLI + MCP server
 ```
 
-In your project, add to `.mcp.json` (or copy `.mcp.json.template`):
+Then wire it into Claude Desktop's MCP config in one command:
+
+```sh
+cd /path/to/your/project
+orql setup
+```
+
+`orql setup` **patches** Claude Desktop's `claude_desktop_config.json` in place — adds an `orqlaude` MCP server entry pointed at this project's state dir, and **preserves every other server you have configured** (lm-studio, etc.) plus the entire `preferences` block. Writes a timestamped `.bak` before changing anything. Re-runs are idempotent — if the entry is already correct, it reports `already correct; nothing to do` and exits without touching the file.
+
+Flags:
+- `--state-dir <path>` override the default (which walks up from cwd for a `.git`)
+- `--config-path <path>` override Claude Desktop's config path
+- `--yes` skip prompts
+
+Fully quit and relaunch Claude Desktop after running. The `mcp__orqlaude__*` tools will then appear in your sessions.
+
+If you'd rather edit the config yourself, the entry should look like:
 
 ```json
 {
   "mcpServers": {
     "orqlaude": {
       "command": "npx",
-      "args": ["-y", "@synaplink/orqlaude"]
+      "args": ["-y", "-p", "@synaplink/orqlaude", "orqlaude-mcp"],
+      "env": {
+        "ORQLAUDE_STATE_DIR": "/absolute/path/to/your/project/.orqlaude"
+      }
     }
   }
 }
 ```
 
-Restart your Claude Code session. The `mcp__orqlaude__*` tools will appear.
+The `ORQLAUDE_STATE_DIR` env var is important — it pins state to a specific path so the MCP server (running with `cwd=/` on some hosts) and the Telegram bot (running in your project) share the same state file.
 
 ## Spawning Agnets: which tool to use
 
