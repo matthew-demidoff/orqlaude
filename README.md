@@ -363,6 +363,13 @@ The bot uses raw `fetch` against Telegram's Bot API — zero extra deps. State i
 **Symptom: `ENOENT: no such file or directory, mkdir '/.orqlaude'` on `create_plan`.**
 Your MCP host launched orqlaude with `cwd=/`. v0.3.2+ auto-falls back to `~/.orqlaude/projects/...` but the explicit fix is to set `ORQLAUDE_STATE_DIR` in your `.mcp.json` env block (see `.mcp.json.template`). Verify with `mcp__orqlaude__ping` — it now returns `warnings` and `state_dir_source`.
 
+**Symptom: `spawn_via_cli` returned a PID but `status()` shows `died_at_launch` shortly after, with a stderr_excerpt + command_line.**
+This is the v0.7.0 hardening doing its job. The child `claude -p` process exited within the 1.5s healthcheck window. Read `stderr_excerpt` (or open `stderr_path` directly) for the cause. Common ones:
+1. `claude` isn't authenticated on this user account (`claude auth status` to check; `claude auth login --claudeai` to fix).
+2. The `--mcp-config` JSON references a server entry that doesn't exist (rare; orqlaude validates this pre-spawn).
+3. The user's environment lacks something `claude` needs (HOME, locale).
+Copy the `command_line` field and paste it into a shell to reproduce by hand.
+
 **Symptom: spawn_task chip appeared, agent ran, but `status()` shows the task as `dispatched` forever.**
 The child agent isn't calling `checkin` on its first turn — its prompt didn't get the orqlaude protocol block, or `mcp__orqlaude__checkin` isn't available in the spawned session. Manual unblock: `register_spawn(plan_id, task_id, session_id)` where session_id is the child's session UUID (find via `mcp__ccd_session_mgmt__list_sessions`). For the proper fix, make sure orqlaude is in the spawned worktree's `.mcp.json` (commit `.mcp.json` to the repo so worktrees inherit it).
 
