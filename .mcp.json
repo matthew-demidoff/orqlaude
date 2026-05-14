@@ -2,7 +2,10 @@
   "mcpServers": {
     "orqlaude": {
       "command": "node",
-      "args": ["/Users/matthew/Documents/orqlaude/dist/server.js"]
+      "args": ["/Users/matthew/Documents/orqlaude/dist/server.js"],
+      "env": {
+        "ORQLAUDE_STATE_DIR": "/Users/matthew/Documents/orqlaude/.orqlaude"
+      }
     }
   }
 }

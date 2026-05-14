@@ -1,0 +1,81 @@
+{
+  "schemaVersion": 2,
+  "plans": {
+    "843752de-1017-47af-8544-a2b82e4faacb": {
+      "id": "843752de-1017-47af-8544-a2b82e4faacb",
+      "createdAt": 1778781516144,
+      "rootTask": "Review the three orqlaude commits (6457abc, 9f357e4, e2d9881) that comprise v0.2.0 + v0.3.0 — token budgets, hallucination detection, broker, CLI, tests, review_prs, and the Telegram bot subsystem.",
+      "budgetCapTokens": 600000,
+      "perAgentCapTokens": 200000,
+      "status": "dispatching",
+      "tasks": [
+        {
+          "title": "Review v0.2.0 Phase 1 (commit 6457abc)",
+          "prompt": "You are reviewing one commit in the orqlaude repo at /Users/matthew/Documents/orqlaude. The commit is 6457abc and adds: token-first budgeting, audit log, self-registration via checkin, hallucination detection, file-claim broker, JSONL byte-offset caching, kill_task / resume_plan / list_plans lifecycle tools, and v1→v2 schema migration.\n\nDo this:\n1. cd to the orqlaude repo. The branch is main; this commit is the second-most-recent (HEAD~2 from main). Inspect the full diff: `git show 6457abc --stat` then `git show 6457abc`.\n2. Read every file the commit added or modified. Don't skim — open them and reason through:\n   - src/lib/state.ts (schema, migration, plan helpers)\n   - src/lib/audit.ts (append-only log + tool wrap)\n   - src/lib/budgeting.ts (token estimator, buddy-tokens.json reader)\n   - src/lib/hallucination.ts (path validation + tool-pattern checks)\n   - src/lib/jsonl_tail.ts (byte-offset cache)\n   - src/tools/dispatch.ts, broker.ts, planning.ts, lifecycle.ts (the tool surface)\n3. Specifically check for:\n   - Race conditions: the state store uses an in-process Promise chain for write-lock. Is there any path where a concurrent read sees torn state?\n   - Hallucination detector false negatives: are there obvious patterns it'd miss? False positives that would over-alert?\n   - The migration code: does v1→v2 handle missing fields safely? What if the schema is malformed?\n   - The JSONL cache: what happens if the file is truncated mid-read? Rotated? Renamed?\n   - The auto-cancel-on-overbudget path in dispatch.ts status(): are the STOP messages idempotent (won't double-queue if status is called twice)?\n   - Security: is the audit redactor adequate? Could a malicious tool arg leak via summarize()?\n4. Run the tests against this commit: `npm test`. Report failures.\n5. Post your findings as a GitHub commit comment:\n   ```\n   gh api repos/SynapLink/orqlaude/commits/6457abc/comments -f body=\"$(cat <<EOF\n   ... your review here, severity-tagged: [BLOCKER], [CONCERN], [NIT] ...\n   EOF\n   )\"\n   ```\n6. Also write your review to reviews/6457abc.md in your worktree, commit it on a branch like `review/phase1`, push, and open a PR.\n7. Be specific — quote line numbers and exact code. 'Looks fine' is not a review.\n\nIf you find no issues at all, your review should still detail what you checked, what tests you ran, and confirm specific things you verified (e.g., 'verified the migrate() function in state.ts:130 handles missing budgetCapTokens by deriving from budgetCapUsd × 25000').",
+          "tldr": "Review the token-budget + hallucination-detection commit (6457abc): check race conditions, false positives, security, and post findings on GitHub.",
+          "scope": [
+            "src/lib/state.ts",
+            "src/lib/audit.ts",
+            "src/lib/budgeting.ts",
+            "src/lib/hallucination.ts",
+            "src/lib/jsonl_tail.ts",
+            "src/tools/broker.ts",
+            "src/tools/dispatch.ts",
+            "src/tools/lifecycle.ts",
+            "src/tools/planning.ts"
+          ],
+          "branchHint": "review/phase1",
+          "id": "6b253fe5-8610-457d-9040-fb76c17be88c",
+          "status": "dispatched",
+          "startedAt": 1778781550062
+        },
+        {
+          "title": "Review v0.2.0 Phase 2 (commit 9f357e4)",
+          "prompt": "You are reviewing one commit in the orqlaude repo at /Users/matthew/Documents/orqlaude. The commit is 9f357e4 and adds: the CLI binary (read-only inspection), the test suite (11 tests using node:test), the GitHub Actions CI workflow, the review_prs tool, and the npm-publish wiring (scoped name @synaplink/orqlaude, files allowlist, bin entry, .mcp.json.template).\n\nDo this:\n1. cd to the orqlaude repo. The commit is 9f357e4 (HEAD~1 from main on this branch). Inspect: `git show 9f357e4`.\n2. Read every file the commit added or modified:\n   - src/cli.ts (the CLI binary)\n   - src/tools/review.ts (review_prs tool)\n   - src/__tests__/state.test.ts\n   - src/__tests__/hallucination.test.ts\n   - .github/workflows/ci.yml\n   - package.json (publish wiring)\n   - .mcp.json.template\n   - README.md changes\n3. Specifically check:\n   - CLI: do the read-only commands actually crash gracefully on missing state? Is the path-truncation safe for very long titles?\n   - review_prs: the prompt-building function — does it handle PR URLs from unusual remotes (non-github)? What if pr_url is malformed?\n   - Tests: is coverage adequate? What state-mutation paths aren't tested? What concerns aren't tested (e.g., the schema migration test only covers one shape)?\n   - CI: is it pinned to a specific Node major? What about caching? Does it test on macOS too?\n   - package.json: is the `files` allowlist correct (no source ts files leaked)? Is the bin path correct relative to the dist root?\n   - .mcp.json.template: does the `npx -y @synaplink/orqlaude` command actually work end-to-end? Try it: `npx -y @synaplink/orqlaude --help`.\n4. Try running `npm test` — confirm 11 passing.\n5. Post your findings as a GitHub commit comment via `gh api repos/SynapLink/orqlaude/commits/9f357e4/comments -f body=\"$(cat <<EOF\n   ... your review ...\n   EOF\n   )\"`.\n6. Write reviews/9f357e4.md, commit on branch `review/phase2`, push, open a PR.\n7. Be specific — quote code, name files, propose patches if you find issues.",
+          "tldr": "Review the CLI + tests + CI + review_prs + npm-publish commit (9f357e4): check CLI robustness, test coverage, CI scope, and post findings on GitHub.",
+          "scope": [
+            "src/cli.ts",
+            "src/tools/review.ts",
+            "src/__tests__/state.test.ts",
+            "src/__tests__/hallucination.test.ts",
+            ".github/workflows/ci.yml",
+            "package.json",
+            ".mcp.json.template"
+          ],
+          "branchHint": "review/phase2",
+          "id": "836f1476-80ee-4cac-b339-b908a7749c25",
+          "status": "dispatched",
+          "startedAt": 1778781575390
+        },
+        {
+          "title": "Review v0.3.0 Telegram bot (commit e2d9881)",
+          "prompt": "You are reviewing one commit in the orqlaude repo at /Users/matthew/Documents/orqlaude. The commit is e2d9881 and adds the Telegram bot subsystem: config (~/.orqlaude/telegram.json mode 600), zero-dep Telegram Bot API client (raw fetch, long-polling), command handlers (/plans /status /show /notes /kill /whitelist /help /whoami /start), notifier (per-project cursor → delta detection → Markdown push), and the bot main loop (5s notifier tick + 30s getUpdates long-poll).\n\nDo this:\n1. cd to the orqlaude repo. The commit is e2d9881 (HEAD on main). Inspect: `git show e2d9881`.\n2. Read every file in src/telegram/:\n   - config.ts (storage)\n   - api.ts (Telegram API client)\n   - commands.ts (handlers)\n   - notifier.ts (delta detection)\n   - bot.ts (main loop)\n   Plus the CLI wiring in src/cli.ts (the cmdTg* functions).\n3. Specifically check:\n   - Security: bot token storage — is mode 600 atomically applied? Could the token leak via tmp-file naming, audit log, error messages, or process-list visibility (env vars)?\n   - Whitelist enforcement: is /start really safe to be open? Could an attacker brute-force user_ids?\n   - The /kill command: it directly mutates state via StateStore. Is that safe if the orqlaude MCP is concurrently running another tool call?\n   - Notifier: cursor advances BEFORE send — is the failure mode 'occasionally miss a notification' actually true? Could it ever DOUBLE-send?\n   - Long-poll loop: does it handle network errors gracefully? What if Telegram rate-limits? What if the bot token is revoked mid-poll?\n   - Markdown rendering: are user-supplied strings (task titles, note text) escaped before being sent with parse_mode='Markdown'? A title containing `*` or `_` could break parsing.\n   - Race between notifier tick and getUpdates: both call StateStore concurrently. The lock should serialize, but is there a deadlock risk?\n4. Try the setup flow locally if you can: `orqlaude tg help`, `orqlaude tg show`.\n5. Post findings as a GitHub commit comment: `gh api repos/SynapLink/orqlaude/commits/e2d9881/comments -f body=\"$(cat <<EOF\n   ... review ...\n   EOF\n   )\"`.\n6. Write reviews/e2d9881.md, commit on branch `review/phase3`, push, open a PR.\n7. Telegram security is critical — be especially thorough on token handling, whitelist enforcement, and Markdown injection.",
+          "tldr": "Review the Telegram bot commit (e2d9881): focus on token security, whitelist enforcement, Markdown injection, and concurrent state mutation.",
+          "scope": [
+            "src/telegram/config.ts",
+            "src/telegram/api.ts",
+            "src/telegram/commands.ts",
+            "src/telegram/notifier.ts",
+            "src/telegram/bot.ts",
+            "src/cli.ts"
+          ],
+          "branchHint": "review/phase3",
+          "id": "f0d69d94-3c4e-4ab6-b529-fc9d73bb5f70",
+          "status": "dispatched",
+          "startedAt": 1778781576094
+        }
+      ],
+      "notes": [],
+      "messages": [],
+      "claims": [],
+      "estimatedTokens": 255000,
+      "estimatedCostUsd": 0.5715,
+      "budgetCapUsd": 24,
+      "perAgentCapUsd": 8,
+      "modelForEstimate": "claude-sonnet-4-6",
+      "effortMultiplier": 1,
+      "estimatedDurationSec": 240,
+      "approvedAt": 1778781549394
+    }
+  }
+}

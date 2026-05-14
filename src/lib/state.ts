@@ -3,16 +3,22 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 
 /**
- * orqlaude state store — single JSON file per project, atomically written.
+ * orqlaude state store — single JSON file per project, atomically written
+ * with cross-process file-lock serialization (v0.3.1+).
  *
- * Why JSON not SQLite: state is small (a fleet rarely has more than ~10 agents,
- * a handful of notes/messages), and atomic JSON writes via tmp+rename are
- * sufficient for the concurrency we expect (handful of MCP calls per second).
- * If contention becomes a problem, swap to node:sqlite without changing the
- * external API of this module.
+ * Concurrency model:
+ *   • In-process: a Promise chain (`writeLock`) serializes mutations within
+ *     one Node process. Reads also funnel through it so they don't observe
+ *     mid-mutation state.
+ *   • Cross-process: each mutation grabs a sidecar lock file (`<dir>/lock`)
+ *     via fs.open with O_CREAT|O_EXCL. Stale locks (PID no longer alive) are
+ *     reclaimed on retry. This serializes orqlaude MCP-server writes against
+ *     CLI / Telegram-bot writes against agent self-registrations.
+ *   • Atomic writes: tmp file + rename, never partial.
+ *   • Rollback: a deep snapshot is taken before each mutator runs; on throw,
+ *     the in-memory cache is restored.
  *
- * Schema version 2 (v0.2.0): tokens-first budget, file claims, audit
- * resumability hooks.
+ * Schema v2: tokens-first budgets, file claims, lifecycle hooks.
  */
 
 export type TaskStatus = "pending" | "dispatched" | "running" | "done" | "failed" | "cancelled";
@@ -36,7 +42,6 @@ export interface Task {
   branchHint?: string;
   status: TaskStatus;
   spawnedSessionId?: string;
-  // Cost / token tracking — populated from JSONL tail.
   costUsd?: number;
   tokensUsed?: number;
   startedAt?: number;
@@ -44,7 +49,6 @@ export interface Task {
   prUrl?: string;
   summary?: string;
   exitReason?: string;
-  // STOP signal for kill_task. Delivered on next checkin.
   stopRequested?: { reason: string; requestedAt: number };
 }
 
@@ -56,7 +60,7 @@ export interface Note {
   blocking: boolean;
   postedAt: number;
   acked: boolean;
-  prUrl?: string; // optional: PR url attached via post_note (mirrored to task)
+  prUrl?: string;
 }
 
 export interface Message {
@@ -67,12 +71,12 @@ export interface Message {
   queuedAt: number;
   delivered: boolean;
   deliveredAt?: number;
-  kind?: "directed" | "stop"; // "stop" → child agent must terminate
+  kind?: "directed" | "stop";
 }
 
 export interface FileClaim {
-  path: string;          // canonical path (absolute, normalized)
-  claimedBy: string;     // session id of the claiming agent
+  path: string;
+  claimedBy: string;
   taskId: string;
   reason?: string;
   claimedAt: number;
@@ -82,11 +86,9 @@ export interface Plan {
   id: string;
   createdAt: number;
   rootTask: string;
-  // Token budget (Max-friendly). USD remains tracked but isn't the gate.
   budgetCapTokens: number;
   perAgentCapTokens: number;
   estimatedTokens?: number;
-  // USD informational fields (carried for legacy / non-Max users).
   budgetCapUsd?: number;
   perAgentCapUsd?: number;
   estimatedCostUsd?: number;
@@ -100,7 +102,7 @@ export interface Plan {
   notes: Note[];
   messages: Message[];
   claims: FileClaim[];
-  reviewPlanId?: string; // populated when review_prs spawns a review fleet
+  reviewPlanId?: string;
 }
 
 export interface State {
@@ -109,74 +111,163 @@ export interface State {
 }
 
 const EMPTY_STATE: State = { schemaVersion: 2, plans: {} };
+const LOCK_TIMEOUT_MS = 5_000;
+const LOCK_RETRY_BASE_MS = 30;
 
 export class StateStore {
   private filePath: string;
+  private lockPath: string;
   private cache: State | null = null;
   private writeLock: Promise<void> = Promise.resolve();
 
   constructor(stateDir: string) {
     this.filePath = path.join(stateDir, "orqlaude-state.json");
+    this.lockPath = path.join(stateDir, "lock");
   }
 
-  private async load(): Promise<State> {
-    if (this.cache) return this.cache;
+  /**
+   * Always reload from disk under the lock to defeat cross-process staleness.
+   */
+  private async loadFresh(): Promise<State> {
     try {
       const raw = await fs.readFile(this.filePath, "utf8");
       const parsed = JSON.parse(raw) as Partial<State>;
-      this.cache = migrate(parsed);
+      const state = migrate(parsed);
+      this.cache = state;
+      return state;
     } catch (err: any) {
       if (err.code === "ENOENT") {
         this.cache = structuredClone(EMPTY_STATE);
-      } else {
-        throw err;
+        return this.cache;
       }
+      throw err;
     }
-    return this.cache!;
   }
 
-  async update<T>(mutator: (state: State) => T | Promise<T>): Promise<T> {
+  /** Read path: still funneled through the writeLock so we never see torn
+   *  state from a partially-applied mutator in this process. */
+  async read<T>(reader: (state: State) => T): Promise<T> {
     let release: () => void = () => {};
     const next = new Promise<void>((res) => (release = res));
     const prev = this.writeLock;
     this.writeLock = prev.then(() => next);
     await prev;
     try {
-      const state = await this.load();
-      const result = await mutator(state);
-      await this.persist(state);
-      return result;
+      // Cheap path: if we have a cache, use it. Cache is always written
+      // through after a successful persist, so it reflects the last
+      // committed state.
+      const state = this.cache ?? (await this.loadFresh());
+      return reader(state);
     } finally {
       release();
     }
   }
 
-  async read<T>(reader: (state: State) => T): Promise<T> {
-    const state = await this.load();
-    return reader(state);
+  /**
+   * Mutate state under both an in-process lock and a cross-process file lock.
+   * Re-reads from disk before applying the mutator to pick up writes from
+   * other processes (Telegram bot, CLI, fresh MCP invocation). On throw,
+   * restores the in-memory cache from the pre-mutation snapshot.
+   */
+  async update<T>(mutator: (state: State) => T | Promise<T>): Promise<T> {
+    let releaseInProcess: () => void = () => {};
+    const next = new Promise<void>((res) => (releaseInProcess = res));
+    const prev = this.writeLock;
+    this.writeLock = prev.then(() => next);
+    await prev;
+    try {
+      await this.acquireFileLock();
+      // Always reload from disk under the lock — another process may have
+      // written since we last cached.
+      const fresh = await this.loadFresh();
+      const snapshot = structuredClone(fresh);
+      try {
+        const result = await mutator(fresh);
+        await this.persist(fresh);
+        return result;
+      } catch (err) {
+        // Roll back the in-memory cache to the pre-mutation snapshot so
+        // subsequent readers see the correct state.
+        this.cache = snapshot;
+        throw err;
+      } finally {
+        await this.releaseFileLock();
+      }
+    } finally {
+      releaseInProcess();
+    }
+  }
+
+  private async acquireFileLock(): Promise<void> {
+    await fs.mkdir(path.dirname(this.lockPath), { recursive: true });
+    const start = Date.now();
+    while (Date.now() - start < LOCK_TIMEOUT_MS) {
+      try {
+        const fh = await fs.open(this.lockPath, "wx", 0o600);
+        await fh.write(`${process.pid}\n${Date.now()}\n`);
+        await fh.close();
+        return;
+      } catch (err: any) {
+        if (err.code !== "EEXIST") throw err;
+        // Lock exists. Check if it's stale (PID no longer alive).
+        try {
+          const held = (await fs.readFile(this.lockPath, "utf8")).split("\n")[0]?.trim();
+          const heldPid = parseInt(held ?? "", 10);
+          if (Number.isFinite(heldPid) && !isProcessAlive(heldPid)) {
+            await fs.unlink(this.lockPath).catch(() => {});
+            continue;
+          }
+        } catch {
+          /* race: someone deleted it before we read. retry. */
+        }
+        await sleep(LOCK_RETRY_BASE_MS + Math.random() * LOCK_RETRY_BASE_MS);
+      }
+    }
+    throw new Error(`orqlaude: could not acquire state lock (${this.lockPath}) within ${LOCK_TIMEOUT_MS}ms`);
+  }
+
+  private async releaseFileLock(): Promise<void> {
+    await fs.unlink(this.lockPath).catch(() => {
+      /* already gone; not fatal */
+    });
   }
 
   private async persist(state: State): Promise<void> {
     await fs.mkdir(path.dirname(this.filePath), { recursive: true });
-    const tmp = `${this.filePath}.${process.pid}.tmp`;
-    await fs.writeFile(tmp, JSON.stringify(state, null, 2));
+    const tmp = `${this.filePath}.${process.pid}.${Date.now()}.tmp`;
+    await fs.writeFile(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
     await fs.rename(tmp, this.filePath);
     this.cache = state;
   }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((res) => setTimeout(res, ms));
 }
 
 /** Forward-compatible migration from earlier schemas. */
 function migrate(input: Partial<State> & { schemaVersion?: number }): State {
   const v = input.schemaVersion ?? 1;
   if (v === 2 && input.plans) return input as State;
-  // v1 → v2: synthesize token fields from USD if missing.
   const out: State = { schemaVersion: 2, plans: {} };
   for (const [id, plan] of Object.entries(input.plans ?? {})) {
     const p = plan as Plan & { budgetCapUsd?: number; perAgentCapUsd?: number };
     out.plans[id] = {
       ...p,
-      budgetCapTokens: p.budgetCapTokens ?? Math.round((p.budgetCapUsd ?? 5) * 25_000), // rough $0.04/k
+      budgetCapTokens: p.budgetCapTokens ?? Math.round((p.budgetCapUsd ?? 5) * 25_000),
       perAgentCapTokens: p.perAgentCapTokens ?? Math.round((p.perAgentCapUsd ?? 1) * 25_000),
+      tasks: p.tasks ?? [],
+      notes: p.notes ?? [],
+      messages: p.messages ?? [],
       claims: p.claims ?? [],
     } as Plan;
   }
@@ -225,7 +316,6 @@ export function findTaskBySession(plan: Plan, sessionId: string): Task | undefin
   return plan.tasks.find((t) => t.spawnedSessionId === sessionId);
 }
 
-/** Locate the plan+task a given child session belongs to. */
 export function planForSession(state: State, sessionId: string): { plan: Plan; task: Task } | undefined {
   for (const plan of Object.values(state.plans)) {
     const task = findTaskBySession(plan, sessionId);
@@ -234,11 +324,6 @@ export function planForSession(state: State, sessionId: string): { plan: Plan; t
   return undefined;
 }
 
-/**
- * Find a dispatched-but-unclaimed task by task_id. Used for self-registration:
- * when a freshly-spawned child agent calls `checkin` with its task_id (which we
- * embed in the spawn prompt), we can adopt it.
- */
 export function unclaimedTaskById(state: State, taskId: string): { plan: Plan; task: Task } | undefined {
   for (const plan of Object.values(state.plans)) {
     const task = plan.tasks.find((t) => t.id === taskId && !t.spawnedSessionId);
@@ -247,7 +332,6 @@ export function unclaimedTaskById(state: State, taskId: string): { plan: Plan; t
   return undefined;
 }
 
-/** Normalize a path for claim comparison (handle . , .. , trailing slash, case). */
 export function normalizeClaimPath(p: string, cwd: string): string {
   const abs = path.isAbsolute(p) ? p : path.resolve(cwd, p);
   return path.normalize(abs);
