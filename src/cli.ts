@@ -35,7 +35,7 @@ import { openPlan } from "./cli/open.js";
 import { showAbout } from "./cli/about.js";
 import { runEasterEgg } from "./cli/easter_egg.js";
 
-const VERSION = "0.7.0";
+const VERSION = "0.7.1";
 
 /**
  * orqlaude CLI — read-only inspection of state + audit log + Telegram setup
