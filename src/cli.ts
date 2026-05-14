@@ -12,6 +12,15 @@ import { runBot } from "./telegram/bot.js";
 import { resolveStateDir } from "./lib/state_dir.js";
 import { style, styleStatus, banner } from "./lib/style.js";
 import { agnetLabel } from "./lib/agnet.js";
+import {
+  findDesktopConfigPath,
+  readDesktopConfig,
+  planPatch,
+  writeDesktopConfigAtomic,
+  buildOrqlaudeEntry,
+} from "./lib/desktop_config.js";
+import { execSync } from "node:child_process";
+import { existsSync } from "node:fs";
 
 /**
  * orqlaude CLI — read-only inspection of state + audit log + Telegram setup
@@ -45,6 +54,8 @@ async function main(): Promise<number> {
       return await cmdHistory(parseLimit(rest));
     case "where":
       return cmdWhere();
+    case "setup":
+      return await cmdSetup(rest);
     case "tg":
       return await cmdTg(rest);
     default:
@@ -56,6 +67,10 @@ async function main(): Promise<number> {
 
 function printHelp(): void {
   console.log(banner());
+  console.log("");
+  console.log(style.bold(style.cream("Setup")));
+  console.log(`  ${style.coral("orql setup")} ${style.sand("[--state-dir PATH] [--yes]")}`);
+  console.log(`                                  Wire orqlaude into Claude Desktop's MCP config (idempotent, preserves other servers)`);
   console.log("");
   console.log(style.bold(style.cream("Inspection")));
   console.log(`  ${style.coral("orqlaude list")}                   List every plan in this project`);
@@ -157,6 +172,120 @@ async function cmdShow(planId: string | undefined): Promise<number> {
     console.error((err as Error).message);
     return 1;
   }
+}
+
+// ---- setup -----------------------------------------------------------------
+
+/**
+ * Detect a sensible default state dir for the current shell. Walks up from
+ * cwd for a `.git`; falls back to cwd.
+ */
+function defaultStateDir(): string {
+  let dir = process.cwd();
+  for (let i = 0; i < 10; i++) {
+    if (existsSync(path.join(dir, ".git"))) {
+      return path.join(dir, ".orqlaude");
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return path.join(process.cwd(), ".orqlaude");
+}
+
+async function cmdSetup(args: string[]): Promise<number> {
+  console.log(banner());
+  console.log("");
+  console.log(style.bold(style.cream("Setup")));
+  console.log("Wires orqlaude into Claude Desktop's MCP config.");
+  console.log("");
+
+  // Parse flags
+  const stateDirIdx = args.indexOf("--state-dir");
+  const overrideStateDir = stateDirIdx !== -1 ? args[stateDirIdx + 1] : null;
+  const yes = args.includes("--yes") || args.includes("-y");
+  const configPathIdx = args.indexOf("--config-path");
+  const configPath =
+    configPathIdx !== -1 ? args[configPathIdx + 1] : findDesktopConfigPath();
+
+  console.log(`  ${style.sand("config:")}    ${configPath}`);
+
+  // 1. Read existing config (preserve everything we don't own).
+  let existing;
+  try {
+    existing = await readDesktopConfig(configPath);
+  } catch (err) {
+    console.error("");
+    console.error(style.crimson(`✗ ${(err as Error).message}`));
+    return 1;
+  }
+  if (!existing) {
+    console.log(`  ${style.sand("status:")}    ${style.crimson("config file does not exist — will create")}`);
+  } else {
+    const otherServerCount = Object.keys(existing.mcpServers ?? {}).filter((k) => k !== "orqlaude").length;
+    const orqEntry = existing.mcpServers?.orqlaude;
+    const has = orqEntry ? style.coral("orqlaude entry present") : style.sand("no orqlaude entry yet");
+    console.log(`  ${style.sand("status:")}    ${has}, ${otherServerCount} other server(s) preserved`);
+  }
+
+  // 2. Pick state dir.
+  let stateDir = overrideStateDir;
+  if (!stateDir) {
+    const suggested = defaultStateDir();
+    if (yes) {
+      stateDir = suggested;
+    } else {
+      const rl = readline.createInterface({ input: stdin, output: stdout });
+      const answer = (await rl.question(`\n  ${style.coral("?")} state dir (where plans/audit live) [${suggested}]: `)).trim();
+      rl.close();
+      stateDir = answer || suggested;
+    }
+  }
+  stateDir = path.resolve(stateDir);
+
+  // 3. Compute patch.
+  const plan = planPatch(existing, stateDir);
+  console.log("");
+  console.log(style.bold(style.cream("Plan")));
+  switch (plan.action) {
+    case "noop":
+      console.log(`  ${style.coral("✓")} already correct; nothing to do`);
+      return 0;
+    case "create-config":
+      console.log(`  ${style.coral("→")} create ${configPath} with one server (orqlaude → ${stateDir})`);
+      break;
+    case "create-server":
+      console.log(`  ${style.coral("→")} add orqlaude entry (→ ${stateDir}); preserve existing servers + preferences`);
+      break;
+    case "update-server":
+      console.log(`  ${style.coral("→")} update orqlaude entry`);
+      console.log(`        ${style.sand("before:")}  ${JSON.stringify(plan.before)}`);
+      console.log(`        ${style.sand("after:")}   ${JSON.stringify(plan.after)}`);
+      break;
+  }
+
+  // 4. Confirm + write.
+  if (!yes) {
+    const rl2 = readline.createInterface({ input: stdin, output: stdout });
+    const ans = (await rl2.question(`\n  ${style.coral("?")} apply? [Y/n] `)).trim().toLowerCase();
+    rl2.close();
+    if (ans && ans !== "y" && ans !== "yes") {
+      console.log(style.crimson("  ✗ cancelled"));
+      return 1;
+    }
+  }
+  const { backupPath } = await writeDesktopConfigAtomic(configPath, plan.config);
+  console.log("");
+  console.log(style.bold(style.coral("Done.")));
+  console.log(`  ${style.sand("config:")}    ${configPath}`);
+  if (backupPath) console.log(`  ${style.sand("backup:")}    ${backupPath}`);
+  console.log(`  ${style.sand("state dir:")} ${stateDir}`);
+  console.log("");
+  console.log(style.dim("Next steps:"));
+  console.log(style.dim("  1. Fully quit Claude Desktop (Cmd-Q on macOS) and relaunch."));
+  console.log(style.dim("  2. Open a session in this project. Call `mcp__orqlaude__ping` — it should report state_dir_source:'env'."));
+  console.log(style.dim("  3. (Optional) Set up the Telegram bot: `orql tg setup`."));
+  return 0;
 }
 
 function cmdWhere(): number {
