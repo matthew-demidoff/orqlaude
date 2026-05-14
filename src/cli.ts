@@ -21,6 +21,20 @@ import {
 } from "./lib/desktop_config.js";
 import { execSync } from "node:child_process";
 import { existsSync } from "node:fs";
+// v0.6.0 additions
+import { hasJsonFlag, emitJson } from "./lib/json_out.js";
+import { errorLine, formatError, infoLine } from "./lib/error_ui.js";
+import { readPreferences, updatePreferences } from "./lib/preferences.js";
+import { maybeCheckForUpdate } from "./lib/update_check.js";
+import { pickPlanId } from "./lib/picker.js";
+import { localNotification, isNotificationsAvailable } from "./lib/notifications.js";
+import { watchPlan } from "./cli/watch.js";
+import { runDoctor } from "./cli/doctor.js";
+import { tailAudit } from "./cli/tail.js";
+import { openPlan } from "./cli/open.js";
+import { showAbout } from "./cli/about.js";
+
+const VERSION = "0.6.0";
 
 /**
  * orqlaude CLI — read-only inspection of state + audit log + Telegram setup
@@ -36,32 +50,132 @@ const STATE_DIR_RESOLUTION = resolveStateDir();
 const STATE_DIR = STATE_DIR_RESOLUTION.path;
 
 async function main(): Promise<number> {
+  // Background tasks (don't block on result).
+  const updatePromise = maybeCheckForUpdate(VERSION);
+
   const [cmd, ...rest] = process.argv.slice(2);
-  switch (cmd) {
-    case undefined:
-    case "help":
-    case "-h":
-    case "--help":
-      printHelp();
+
+  // First-run welcome — skip for purely informational commands so the user
+  // can `orql --version` / `orql about` without forcing the onboarding.
+  if (cmd !== "--version" && cmd !== "-v" && cmd !== "about" && cmd !== "help" && cmd !== "--help" && cmd !== "-h") {
+    await maybeShowWelcome();
+  }
+  const isJson = hasJsonFlag(rest);
+  let exitCode = 0;
+  try {
+    switch (cmd) {
+      case undefined:
+        // Bare `orql` → banner + project summary, not the long help.
+        exitCode = await cmdBare();
+        break;
+      case "help":
+      case "-h":
+      case "--help":
+        printHelp();
+        exitCode = 0;
+        break;
+      case "--version":
+      case "-v":
+        process.stdout.write(`orqlaude ${VERSION}\n`);
+        exitCode = 0;
+        break;
+      case "list":
+        exitCode = await cmdList(isJson);
+        break;
+      case "status":
+        exitCode = await cmdStatus(rest[0], isJson);
+        break;
+      case "show":
+        exitCode = await cmdShow(rest[0], isJson);
+        break;
+      case "history":
+        exitCode = await cmdHistory(parseLimit(rest), isJson);
+        break;
+      case "where":
+        exitCode = cmdWhere(isJson);
+        break;
+      case "setup":
+        exitCode = await cmdSetup(rest);
+        break;
+      case "watch":
+        exitCode = await cmdWatch(rest[0]);
+        break;
+      case "doctor":
+        exitCode = await runDoctor(VERSION);
+        break;
+      case "tail":
+        exitCode = await tailAudit(STATE_DIR, rest[0]);
+        break;
+      case "open":
+        exitCode = await cmdOpen(rest[0]);
+        break;
+      case "notify":
+        exitCode = await cmdNotify(rest);
+        break;
+      case "about":
+        exitCode = showAbout(VERSION);
+        break;
+      case "tg":
+        exitCode = await cmdTg(rest);
+        break;
+      default:
+        process.stderr.write(errorLine(`unknown subcommand: ${cmd}`, `try \`orql help\``));
+        exitCode = 1;
+    }
+  } catch (err) {
+    const { message, suggestion } = formatError(err);
+    process.stderr.write(errorLine(message, suggestion));
+    exitCode = 1;
+  }
+  // Tail the update-check notice after the main output, if any.
+  await updatePromise;
+  return exitCode;
+}
+
+async function maybeShowWelcome(): Promise<void> {
+  const prefs = await readPreferences();
+  if (prefs.welcomedAt) return;
+  console.log(banner());
+  console.log("");
+  console.log(`  ${style.coral("welcome to orqlaude.")} this is your first run.`);
+  console.log("");
+  console.log(`  ${style.sand("•")} ${style.cream("orql setup")}        wire into Claude Desktop's MCP config (run from your project root)`);
+  console.log(`  ${style.sand("•")} ${style.cream("orql tg setup")}     (optional) configure a Telegram bot for notifications`);
+  console.log(`  ${style.sand("•")} ${style.cream("orql doctor")}       check that everything's wired correctly`);
+  console.log(`  ${style.sand("•")} ${style.cream("orql watch <id>")}   live dashboard for a running fleet`);
+  console.log(`  ${style.sand("•")} ${style.cream("orql help")}         full reference`);
+  console.log("");
+  console.log(style.dim(`(this message won't show again. happy fleeting.)\n`));
+  await updatePreferences((p) => {
+    p.welcomedAt = Date.now();
+  });
+}
+
+async function cmdBare(): Promise<number> {
+  console.log(banner());
+  console.log("");
+  // Project summary if state exists, else hint at setup.
+  try {
+    const store = new StateStore(STATE_DIR);
+    const plans = await store.read((s) => Object.values(s.plans));
+    if (plans.length === 0) {
+      console.log(style.sand("  No plans yet in this project.") + "  " + style.dim("(`orql help` for commands)"));
       return 0;
-    case "list":
-      return await cmdList();
-    case "status":
-      return await cmdStatus(rest[0]);
-    case "show":
-      return await cmdShow(rest[0]);
-    case "history":
-      return await cmdHistory(parseLimit(rest));
-    case "where":
-      return cmdWhere();
-    case "setup":
-      return await cmdSetup(rest);
-    case "tg":
-      return await cmdTg(rest);
-    default:
-      console.error(`Unknown subcommand: ${cmd}`);
-      printHelp();
-      return 1;
+    }
+    const active = plans.filter((p) => p.status !== "collected");
+    console.log(style.bold(style.cream("active plans:")));
+    for (const p of active.slice(0, 5)) {
+      const done = p.tasks.filter((t) => t.status === "done").length;
+      const status = styleStatus(p.status)(p.status);
+      console.log(`  ${style.dim(p.id.slice(0, 8))}…  ${status}  ${done}/${p.tasks.length}  ${truncate(p.rootTask, 60)}`);
+    }
+    if (active.length > 5) console.log(style.dim(`  …and ${active.length - 5} more`));
+    console.log("");
+    console.log(style.dim("  `orql watch <id>` to monitor live · `orql help` for all commands"));
+    return 0;
+  } catch (err) {
+    console.log(style.sand("  (couldn't read state — run `orql setup` to wire orqlaude)"));
+    return 0;
   }
 }
 
@@ -69,15 +183,23 @@ function printHelp(): void {
   console.log(banner());
   console.log("");
   console.log(style.bold(style.cream("Setup")));
-  console.log(`  ${style.coral("orql setup")} ${style.sand("[--state-dir PATH] [--yes]")}`);
-  console.log(`                                  Wire orqlaude into Claude Desktop's MCP config (idempotent, preserves other servers)`);
+  console.log(`  ${style.coral("orql setup")} ${style.sand("[--state-dir PATH] [--yes]")}    Wire orqlaude into Claude Desktop's MCP config`);
+  console.log(`  ${style.coral("orql doctor")}                              Verify your install end-to-end`);
+  console.log("");
+  console.log(style.bold(style.cream("Live")));
+  console.log(`  ${style.coral("orql watch")} ${style.sand("<plan_id>")}                    Live fleet dashboard (1Hz refresh, Ctrl-C to exit)`);
+  console.log(`  ${style.coral("orql tail")} ${style.sand("[plan_id]")}                     Stream the audit log; filter by plan prefix if given`);
+  console.log(`  ${style.coral("orql open")} ${style.sand("<plan_id>")}                     Open all PRs from a plan in your browser`);
   console.log("");
   console.log(style.bold(style.cream("Inspection")));
-  console.log(`  ${style.coral("orqlaude list")}                   List every plan in this project`);
-  console.log(`  ${style.coral("orqlaude status")} ${style.sand("<plan_id>")}       Refreshed status of one plan`);
-  console.log(`  ${style.coral("orqlaude show")} ${style.sand("<plan_id>")}         Raw plan JSON`);
-  console.log(`  ${style.coral("orqlaude history")} ${style.sand("[--limit N]")}    Tail the audit log (default 30)`);
-  console.log(`  ${style.coral("orqlaude where")}                  Show resolved state dir (debug)`);
+  console.log(`  ${style.coral("orql list")} ${style.sand("[--json]")}                      List plans in this project`);
+  console.log(`  ${style.coral("orql status")} ${style.sand("[plan_id] [--json]")}          Refreshed status (prompts for plan if omitted)`);
+  console.log(`  ${style.coral("orql show")} ${style.sand("[plan_id] [--json]")}            Raw plan JSON`);
+  console.log(`  ${style.coral("orql history")} ${style.sand("[--limit N] [--json]")}       Tail the audit log`);
+  console.log(`  ${style.coral("orql where")} ${style.sand("[--json]")}                     Show resolved state dir`);
+  console.log("");
+  console.log(style.bold(style.cream("Notifications")));
+  console.log(`  ${style.coral("orql notify on|off|test|status")}           macOS desktop notifications (paired with Telegram)`);
   console.log("");
   console.log(style.bold(style.cream("Telegram")));
   console.log(`  ${style.coral("orqlaude tg setup")}               Configure bot token (interactive)`);
@@ -93,9 +215,13 @@ function printHelp(): void {
 
 // ---- read-only inspection -------------------------------------------------
 
-async function cmdList(): Promise<number> {
+async function cmdList(isJson = false): Promise<number> {
   const store = new StateStore(STATE_DIR);
   const plans = await store.read((s) => Object.values(s.plans).sort((a, b) => b.createdAt - a.createdAt));
+  if (isJson) {
+    emitJson(plans);
+    return 0;
+  }
   if (plans.length === 0) {
     console.log(style.sand("No plans yet in this project."));
     return 0;
@@ -115,10 +241,20 @@ async function cmdList(): Promise<number> {
   return 0;
 }
 
-async function cmdStatus(planId: string | undefined): Promise<number> {
+async function cmdStatus(planId: string | undefined, isJson = false): Promise<number> {
   if (!planId) {
-    console.error("usage: orqlaude status <plan_id>");
-    return 2;
+    const picked = await pickPlanId(STATE_DIR);
+    if (!picked) return 1;
+    planId = picked;
+  }
+  if (isJson) {
+    const store = new StateStore(STATE_DIR);
+    const data = await store.read((s) => {
+      const p = requirePlan(s.plans, planId!);
+      return p;
+    });
+    emitJson(data);
+    return 0;
   }
   const store = new StateStore(STATE_DIR);
   let plan: Plan;
@@ -158,18 +294,23 @@ async function cmdStatus(planId: string | undefined): Promise<number> {
   return 0;
 }
 
-async function cmdShow(planId: string | undefined): Promise<number> {
+async function cmdShow(planId: string | undefined, isJson = false): Promise<number> {
   if (!planId) {
-    console.error("usage: orqlaude show <plan_id>");
-    return 2;
+    const picked = await pickPlanId(STATE_DIR, true);
+    if (!picked) return 1;
+    planId = picked;
   }
   const store = new StateStore(STATE_DIR);
   try {
-    const plan = await store.read((s) => requirePlan(s.plans, planId));
-    console.log(JSON.stringify(plan, null, 2));
+    const plan = await store.read((s) => requirePlan(s.plans, planId!));
+    if (isJson) {
+      emitJson(plan);
+    } else {
+      console.log(JSON.stringify(plan, null, 2));
+    }
     return 0;
   } catch (err) {
-    console.error((err as Error).message);
+    process.stderr.write(errorLine((err as Error).message));
     return 1;
   }
 }
@@ -288,7 +429,11 @@ async function cmdSetup(args: string[]): Promise<number> {
   return 0;
 }
 
-function cmdWhere(): number {
+function cmdWhere(isJson = false): number {
+  if (isJson) {
+    emitJson(STATE_DIR_RESOLUTION);
+    return 0;
+  }
   console.log(banner());
   console.log("");
   console.log(`  ${style.sand("cwd:")}        ${STATE_DIR_RESOLUTION.cwd}`);
@@ -299,9 +444,77 @@ function cmdWhere(): number {
   return 0;
 }
 
-async function cmdHistory(limit: number): Promise<number> {
+// ---- v0.6.0 commands -------------------------------------------------------
+
+async function cmdWatch(planIdArg: string | undefined): Promise<number> {
+  let planId = planIdArg;
+  if (!planId) {
+    const picked = await pickPlanId(STATE_DIR);
+    if (!picked) return 1;
+    planId = picked;
+  }
+  return watchPlan(STATE_DIR, planId);
+}
+
+async function cmdOpen(planIdArg: string | undefined): Promise<number> {
+  let planId = planIdArg;
+  if (!planId) {
+    const picked = await pickPlanId(STATE_DIR, true);
+    if (!picked) return 1;
+    planId = picked;
+  }
+  return openPlan(STATE_DIR, planId);
+}
+
+async function cmdNotify(args: string[]): Promise<number> {
+  const [sub] = args;
+  switch (sub) {
+    case "on":
+      if (!isNotificationsAvailable()) {
+        process.stderr.write(errorLine("macOS desktop notifications only — your platform isn't supported."));
+        return 1;
+      }
+      await updatePreferences((p) => {
+        p.localNotifications = true;
+      });
+      console.log(style.coral("✓ ") + "local notifications enabled. The Telegram bot will also fire macOS notifications.");
+      console.log(style.dim("  (run `orql notify test` to verify.)"));
+      return 0;
+    case "off":
+      await updatePreferences((p) => {
+        p.localNotifications = false;
+      });
+      console.log(style.coral("✓ ") + "local notifications disabled.");
+      return 0;
+    case "test":
+      if (!isNotificationsAvailable()) {
+        process.stderr.write(errorLine("macOS desktop notifications only."));
+        return 1;
+      }
+      localNotification("orqlaude", "if you see this, notifications work.", "test");
+      console.log(style.coral("✓ ") + "test notification sent.");
+      return 0;
+    case "status":
+    case undefined: {
+      const prefs = await readPreferences();
+      const enabled = !!prefs.localNotifications;
+      console.log(`  ${style.sand("local notifications:")} ${enabled ? style.coral("on") : style.crimson("off")}`);
+      console.log(`  ${style.sand("platform supported:")}  ${isNotificationsAvailable() ? style.coral("yes (macOS)") : style.crimson("no")}`);
+      return 0;
+    }
+    default:
+      process.stderr.write(errorLine(`unknown subcommand: ${sub}`, "try `orql notify on|off|test|status`"));
+      return 1;
+  }
+}
+
+async function cmdHistory(limit: number, isJson = false): Promise<number> {
   const audit = new AuditLog(STATE_DIR);
   const events = await audit.tail(limit);
+  if (isJson) {
+    emitJson(events);
+    return 0;
+  }
   if (events.length === 0) {
     console.log("(no audit events yet)");
     return 0;
