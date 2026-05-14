@@ -131,7 +131,7 @@ test("schema v1 migrates to v2 with token caps synthesized", async () => {
   // Reload via a new store (the test store already cached empty).
   const fresh = new StateStore(dir);
   const migrated = await fresh.read((s) => s);
-  assert.equal(migrated.schemaVersion, 2);
+  assert.equal(migrated.schemaVersion, 3);
   assert.equal(migrated.plans["p1"].budgetCapTokens, 4 * 25_000);
   assert.deepEqual(migrated.plans["p1"].claims, []);
 });

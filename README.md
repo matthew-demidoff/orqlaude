@@ -99,11 +99,23 @@ Restart your Claude Code session. The `mcp__orqlaude__*` tools will appear.
 | `resume_plan(plan_id)` | Pick up an in-flight plan after a Desktop-app restart or new session. Refreshes per-task status from JSONL, returns a "do this next" hint. |
 | `list_plans(include_collected?)` | All plans known to orqlaude in this project, active first. |
 
+### Broker-to-user (v0.4+)
+
+These let primary Claude push messages to and pull answers from the **user** (via Telegram if configured, with a `/respond` text fallback).
+
+| Tool | Purpose |
+|---|---|
+| `notify_user(plan_id, text, urgency?, task_id?)` | One-way push to user's Telegram. urgency = `low`/`normal`/`high` (affects emoji). Returns immediately. |
+| `request_user_response(plan_id, prompt, options?[], timeout_sec?, task_id?)` | Ask the user a question. With `options`, Telegram shows inline-keyboard buttons; without, user replies via `/respond <short_id> <text>`. Returns `request_id` + `short_id`. Defaults to a 10-minute timeout. |
+| `poll_user_response(request_id)` | Returns `status: pending\|answered\|timed_out\|cancelled` + `response` once available. Safe to poll repeatedly. |
+
+Without a running `orqlaude tg start`, `notify_user` queues silently and `request_user_response` will always `timed_out` — fall back to `AskUserQuestion` if Telegram is unavailable.
+
 ### Health
 
 | Tool | Purpose |
 |---|---|
-| `ping(echo?)` | Returns version, cwd, node, pid. |
+| `ping(echo?)` | Returns version, cwd, state_dir, state_dir_source, warnings[], node, pid. First call after install to verify wiring + state-dir resolution. |
 
 ## End-to-end walkthrough
 
@@ -239,6 +251,8 @@ orqlaude tg start
 - `/show <plan_id>` — raw plan JSON
 - `/notes <plan_id>` — recent agent notes
 - `/kill <plan_id> <task_id> <reason>` — STOP a runaway agent
+- `/respond <short_id> <text>` — answer a `request_user_response` question (v0.4+)
+- Tap inline-keyboard buttons on any `request_user_response` with options (v0.4+)
 - `/whitelist <user_id> [label]` (owner-only) — add another user
 - `/help` / `/whoami`
 
