@@ -81,11 +81,12 @@ test("v0.5 schema: newPlan initializes userStreams empty", async () => {
   assert.deepEqual(plan.userStreams, []);
 });
 
-test("TelegramApi.sendMessageDraft rejects draft_id=0 (v0.5.1)", async () => {
+test("TelegramApi has the expected post-v0.5.4 surface", async () => {
+  // v0.5.4 removed sendMessageDraft after sendMessage proved unreliable in
+  // the standard Bot API. Confirm it's no longer exported.
   const { TelegramApi } = await import("../telegram/api.js");
   const api = new TelegramApi("test:token");
-  await assert.rejects(
-    () => api.sendMessageDraft(123, 0, "hi"),
-    /must be a non-zero integer/
-  );
+  assert.equal(typeof (api as unknown as { sendMessage: unknown }).sendMessage, "function");
+  assert.equal(typeof (api as unknown as { editMessageText: unknown }).editMessageText, "function");
+  assert.equal((api as unknown as { sendMessageDraft?: unknown }).sendMessageDraft, undefined);
 });
