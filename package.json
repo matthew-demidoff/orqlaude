@@ -1,10 +1,11 @@
 {
   "name": "@synaplink/orqlaude",
-  "version": "0.5.1",
-  "description": "Multi-agent orchestrator for Claude Code. One primary session decomposes a complex task, gets a single budget approval, then dispatches N parallel agents via the Desktop app's native spawn_task. Tracks cost/status via JSONL tails; brokers messages between agents; detects hallucination; manages PRs.",
+  "version": "0.5.2",
+  "description": "Multi-agent orchestrator for Claude Code. One primary session decomposes a complex task, gets a single budget approval, then dispatches N parallel Agnets via the Desktop app's native spawn_task (with explicit fallbacks). Tracks cost/status via JSONL tails; brokers messages between Agnets; streams to Telegram; detects hallucination; manages PRs.",
   "type": "module",
   "bin": {
     "orqlaude": "./dist/cli.js",
+    "orql": "./dist/cli.js",
     "orqlaude-mcp": "./dist/server.js"
   },
   "main": "./dist/server.js",

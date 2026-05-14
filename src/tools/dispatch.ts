@@ -20,7 +20,7 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
   // ---- next_task ------------------------------------------------------------
   server.tool(
     "next_task",
-    "Return the next pending task to dispatch, or null if all tasks have been spawned. The returned prompt embeds the task_id and instructs the agent to self-register via `checkin` on its first turn — so register_spawn is usually unnecessary.",
+    "Return the next pending task to dispatch, plus a priority-ordered list of `spawn_strategies` describing exactly which tool to call with what args. The recommended strategy uses `mcp__ccd_session__spawn_task` (worktree isolation + Desktop sidebar). Fallbacks: the host's built-in `Agent` tool (in-session, no isolation), or a shelled-out `claude -p` (headless CLI). Pick deliberately — picking the host's Agent tool by habit loses orqlaude's worktree isolation and means agents may collide on shared files.",
     { plan_id: z.string() },
     audit.wrap(
       "next_task",
@@ -38,17 +38,63 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
           }
           next.status = "dispatched";
           next.startedAt = Date.now();
+          const spawnPrompt = buildSpawnPrompt(plan.id, next.id, next.prompt, next.branchHint);
           return {
             plan_id,
             task: {
               task_id: next.id,
               title: next.title,
-              prompt: buildSpawnPrompt(plan.id, next.id, next.prompt, next.branchHint),
+              prompt: spawnPrompt,
               tldr: next.tldr,
               scope: next.scope ?? [],
+              agnet: next.agnetName ? `Agnet ${next.agnetName}` : "Agnet",
             },
+            // Priority-ordered spawn options. Orchestrators should walk the
+            // list and pick the first one they have available in context.
+            spawn_strategies: [
+              {
+                priority: 1,
+                tool: "mcp__ccd_session__spawn_task",
+                preferred: true,
+                isolation: "worktree",
+                visibility: "Desktop Code sidebar (each Agnet has its own session)",
+                note: "Recommended. Creates an isolated git worktree session. The Agnet self-registers via checkin on its first turn.",
+                load_if_missing: "ToolSearch query: 'select:mcp__ccd_session__spawn_task'.",
+                args: {
+                  title: next.title,
+                  prompt: spawnPrompt,
+                  tldr: next.tldr,
+                },
+              },
+              {
+                priority: 2,
+                tool: "Agent (host built-in)",
+                isolation: "none (shares parent cwd + filesystem)",
+                visibility: "in-session tool use only — no Desktop session",
+                note: "Fallback. Faster (no chip click) but loses worktree isolation. Concurrent Agnets WILL race on shared files unless they call claim_files aggressively. Self-registration via checkin still works, but the Agnet runs as a sub-call of YOUR session — when it returns, the broker connection ends.",
+                warning: "By choosing this, you accept that parallel file edits between Agnets may collide. claim_files in the broker is your only conflict-detection signal.",
+                args: {
+                  subagent_type: "general-purpose",
+                  description: next.title.slice(0, 60),
+                  prompt: spawnPrompt,
+                },
+              },
+              {
+                priority: 3,
+                tool: "shell: claude -p (headless)",
+                isolation: "explicit worktree via --worktree flag",
+                visibility: "JSONL only — won't appear in Desktop sidebar until app restart",
+                note: "CLI fallback for non-Desktop hosts. Spawn via Bash: `claude -p '<prompt>' --worktree fleet-<short_id> --session-id <new-uuid> --output-format stream-json`. The Agnet self-registers via checkin if orqlaude is in the worktree's .mcp.json.",
+                args: {
+                  command_template:
+                    "claude -p '<PROMPT>' --worktree fleet-" +
+                    next.id.slice(0, 8) +
+                    " --output-format stream-json --permission-mode bypassPermissions",
+                },
+              },
+            ],
             next_step:
-              "Call `mcp__ccd_session__spawn_task` with this title/prompt/tldr. The spawned agent will self-register via checkin on its first turn — usually no manual register_spawn needed.",
+              "Pick a strategy and call its tool. Strategy 1 (mcp__ccd_session__spawn_task) is strongly preferred — it gives worktree isolation, Desktop sidebar visibility, and the cleanest broker integration. The Agnet will self-register via checkin on first turn; you don't need to call register_spawn manually unless strategy 2 was used and the Agnet failed to call checkin.",
           };
         });
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
@@ -144,6 +190,29 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
         const totalTokens = snapshots.reduce((sum, s: any) => sum + (s.tokens_used ?? 0), 0);
         const totalCost = snapshots.reduce((sum, s: any) => sum + (s.cost_usd ?? 0), 0);
 
+        // v0.5.2: orphan detection — dispatched > 60s ago without
+        // self-registering. Often means the orchestrator used a non-orqlaude
+        // spawn tool (e.g. host's Agent) and the Agnet skipped checkin.
+        const ORPHAN_THRESHOLD_MS = 60_000;
+        const orphans = plan0.tasks
+          .filter(
+            (t) =>
+              t.status === "dispatched" &&
+              !t.spawnedSessionId &&
+              t.startedAt &&
+              Date.now() - t.startedAt > ORPHAN_THRESHOLD_MS
+          )
+          .map((t) => ({
+            task_id: t.id,
+            title: t.title,
+            agnet: t.agnetName ? `Agnet ${t.agnetName}` : "Agnet",
+            dispatched_ago_sec: Math.round((Date.now() - (t.startedAt ?? 0)) / 1000),
+            likely_cause:
+              "Spawned via host Agent tool (or chip not clicked). The Agnet didn't call checkin. Either (a) it never started, (b) it bypassed the orqlaude protocol footer, or (c) it spawned but completed too fast to register.",
+            remedy:
+              "If you can identify its session id via mcp__ccd_session_mgmt__list_sessions, call register_spawn manually. Otherwise the task is invisible to orqlaude until a follow-up checkin arrives.",
+          }));
+
         // ---- budget enforcement: kill on overbudget --------------------------
         const overbudget = totalTokens > plan0.budgetCapTokens;
         let autoCancelled = false;
@@ -188,12 +257,16 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
                   budget_remaining_tokens: Math.max(0, plan0.budgetCapTokens - totalTokens),
                   total_cost_usd: totalCost,
                   hallucination_alerts: concerningAgents,
+                  orphan_alerts: orphans,
                   agents: snapshots,
-                  next_step: concerningAgents.length > 0
-                    ? "One or more agents show hallucination signs. Consider `send_message` to nudge, or `kill_task` if the agent is irrecoverable."
-                    : autoCancelled
-                    ? "Fleet auto-cancelled (overbudget). STOP messages queued to all running children."
-                    : undefined,
+                  next_step:
+                    orphans.length > 0
+                      ? `${orphans.length} Agnet(s) appear orphaned — dispatched > 60s without self-registering via checkin. Likely cause: spawn used host Agent tool instead of mcp__ccd_session__spawn_task. Check orphan_alerts[].remedy.`
+                      : concerningAgents.length > 0
+                      ? "One or more agents show hallucination signs. Consider `send_message` to nudge, or `kill_task` if the agent is irrecoverable."
+                      : autoCancelled
+                      ? "Fleet auto-cancelled (overbudget). STOP messages queued to all running children."
+                      : undefined,
                 },
                 null,
                 2
@@ -275,29 +348,50 @@ function buildSpawnPrompt(planId: string, taskId: string, userPrompt: string, br
   const branchSection = branchHint ? `\n\nSuggested branch: \`${branchHint}\`.` : "";
   return `${userPrompt}${branchSection}
 
----
-
-ORQLAUDE FLEET PROTOCOL
+═══════════════════════════════════════════════════════════════
+ORQLAUDE FLEET PROTOCOL — READ BEFORE DOING ANYTHING ELSE
+═══════════════════════════════════════════════════════════════
 plan_id: ${planId}
 task_id: ${taskId}
 
-Step 1 — register yourself.
-Your FIRST action must be to call \`mcp__orqlaude__checkin\` with your session id (from $CLAUDE_CODE_SESSION_ID) AND the task_id above. This claims your task and lets the orchestrator track you.
+▶ STEP 1 — REGISTER YOURSELF (REQUIRED, IMMEDIATELY)
+   Your FIRST tool call MUST be \`mcp__orqlaude__checkin\` with:
+     • session_id: your own session id (from $CLAUDE_CODE_SESSION_ID env)
+     • task_id:    ${taskId}  (from this prompt)
 
-Step 2 — do the work.
-Complete the task above. Read before editing. Run tests before committing.
+   If you skip this, the orchestrator can't see you, your work is
+   invisible in status(), and any STOP / kill signals will go
+   undelivered. You will be classified as an ORPHAN Agnet within 60s.
 
-Step 3 — periodic check-ins.
-Call \`mcp__orqlaude__checkin\` every few turns to pull any directed messages from the orchestrator (the primary Claude). If you receive a STOP message, commit what you have and exit immediately.
+   If \`mcp__orqlaude__checkin\` is not available as a tool, run:
+     ToolSearch  query: "select:mcp__orqlaude__checkin"
+   and try again. If that still fails, orqlaude isn't loaded in your
+   .mcp.json — STOP and tell the orchestrator before doing any work.
 
-Step 4 — share findings (optional).
-If you discover something other agents should know (a removed function, a schema change), call \`mcp__orqlaude__post_note\` with the finding. Set \`blocking: true\` if it must be ack'd before you continue.
+▶ STEP 2 — DO THE WORK
+   Complete the task above. Read before editing. Run tests before committing.
 
-Step 5 — claim files (optional, recommended).
-Before editing files that others might touch, call \`mcp__orqlaude__claim_files\` with the absolute paths. Conflicts surface to the orchestrator.
+▶ STEP 3 — PERIODIC CHECK-INS
+   Call \`mcp__orqlaude__checkin\` every few turns. Pulls queued
+   messages from the orchestrator. If you receive a STOP message,
+   commit what you have and exit immediately.
 
-Step 6 — finish.
-When done, commit, push, open a PR via \`gh pr create\`, then call \`mcp__orqlaude__post_note\` with the PR URL. The orchestrator's \`collect\` reads it from there.
+▶ STEP 4 — SHARE FINDINGS (OPTIONAL)
+   Discovered something other Agnets should know (a removed function,
+   a schema change)? Call \`mcp__orqlaude__post_note\` with the finding.
+   \`blocking: true\` if it must be ack'd before you continue.
+
+▶ STEP 5 — CLAIM FILES (RECOMMENDED FOR PARALLEL FLEETS)
+   Before editing files that others might touch, call
+   \`mcp__orqlaude__claim_files\` with the absolute paths. Conflicts
+   surface to the orchestrator. ESPECIALLY IMPORTANT if the orchestrator
+   spawned you via the host's \`Agent\` tool (no worktree isolation).
+
+▶ STEP 6 — FINISH
+   Commit, push, open a PR via \`gh pr create\`, then call
+   \`mcp__orqlaude__post_note\` with the PR URL. The orchestrator's
+   \`collect\` reads it from there.
+═══════════════════════════════════════════════════════════════
 `;
 }
 
