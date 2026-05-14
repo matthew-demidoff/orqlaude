@@ -33,8 +33,9 @@ import { runDoctor } from "./cli/doctor.js";
 import { tailAudit } from "./cli/tail.js";
 import { openPlan } from "./cli/open.js";
 import { showAbout } from "./cli/about.js";
+import { runEasterEgg } from "./cli/easter_egg.js";
 
-const VERSION = "0.6.0";
+const VERSION = "0.6.1";
 
 /**
  * orqlaude CLI — read-only inspection of state + audit log + Telegram setup
@@ -152,31 +153,10 @@ async function maybeShowWelcome(): Promise<void> {
 }
 
 async function cmdBare(): Promise<number> {
-  console.log(banner());
-  console.log("");
-  // Project summary if state exists, else hint at setup.
-  try {
-    const store = new StateStore(STATE_DIR);
-    const plans = await store.read((s) => Object.values(s.plans));
-    if (plans.length === 0) {
-      console.log(style.sand("  No plans yet in this project.") + "  " + style.dim("(`orql help` for commands)"));
-      return 0;
-    }
-    const active = plans.filter((p) => p.status !== "collected");
-    console.log(style.bold(style.cream("active plans:")));
-    for (const p of active.slice(0, 5)) {
-      const done = p.tasks.filter((t) => t.status === "done").length;
-      const status = styleStatus(p.status)(p.status);
-      console.log(`  ${style.dim(p.id.slice(0, 8))}…  ${status}  ${done}/${p.tasks.length}  ${truncate(p.rootTask, 60)}`);
-    }
-    if (active.length > 5) console.log(style.dim(`  …and ${active.length - 5} more`));
-    console.log("");
-    console.log(style.dim("  `orql watch <id>` to monitor live · `orql help` for all commands"));
-    return 0;
-  } catch (err) {
-    console.log(style.sand("  (couldn't read state — run `orql setup` to wire orqlaude)"));
-    return 0;
-  }
+  // Bare `orql` runs the easter egg — the diamond logo + an animated
+  // typewriter cycling through 149 tagline variants. Ctrl-C exits.
+  // To see active plans use `orql list`; for the dashboard `orql watch`.
+  return runEasterEgg();
 }
 
 function printHelp(): void {
