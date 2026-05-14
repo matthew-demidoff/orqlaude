@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
-import { StateStore, findPlan, findUserResponseRequest } from "../lib/state.js";
+import { StateStore, findPlan, findUserResponseRequest, findUserStream } from "../lib/state.js";
 import type { AuditLog } from "../lib/audit.js";
 
 /**
@@ -102,6 +102,111 @@ export function registerUserIo(server: McpServer, store: StateStore, audit: Audi
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       },
       ({ plan_id }) => ({ planId: plan_id })
+    )
+  );
+
+  // ---- stream_to_user_start -------------------------------------------------
+  server.tool(
+    "stream_to_user_start",
+    "PRIMARY CLAUDE → USER (Telegram), streaming. Open a streaming message: Telegram sends an initial message, and subsequent stream_to_user_append calls EDIT that same message to add content. The user sees a single message that grows in place — the Telegram equivalent of a streamed assistant reply. Returns a stream_id. Call stream_to_user_end when finished (the message gets a ✓ marker). Telegram rate-limits edits to ~1/1.5s; the notifier coalesces appends.",
+    {
+      plan_id: z.string(),
+      title: z.string().min(1).max(120).describe("Bold header shown at the top of the message. E.g. 'Agnet Verdant — reviewing PR #42' or 'Fleet summary'."),
+      initial_content: z.string().default("").describe("Optional starting content for the message body."),
+      task_id: z.string().optional(),
+    },
+    audit.wrap(
+      "stream_to_user_start",
+      async ({ plan_id, title, initial_content, task_id }) => {
+        const result = await store.update((state) => {
+          const plan = findPlan(state, plan_id);
+          const id = randomUUID();
+          const shortId = id.slice(0, 8);
+          plan.userStreams.push({
+            id,
+            shortId,
+            taskId: task_id,
+            title,
+            content: initial_content,
+            status: "active",
+            createdAt: Date.now(),
+          });
+          return {
+            plan_id,
+            stream_id: id,
+            short_id: shortId,
+            next_step:
+              "Call stream_to_user_append(stream_id, chunk_text) with each new chunk. Call stream_to_user_end(stream_id) when finished.",
+          };
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      },
+      ({ plan_id }) => ({ planId: plan_id })
+    )
+  );
+
+  // ---- stream_to_user_append ------------------------------------------------
+  server.tool(
+    "stream_to_user_append",
+    "Append a chunk to a streaming message previously opened with stream_to_user_start. The notifier will edit the corresponding Telegram message on its next tick (subject to a ~1.5s rate-limit coalesce). Returns the current full length for sanity-check; if content exceeds Telegram's 4096-char limit, further appends will be silently truncated until you start a new stream.",
+    {
+      stream_id: z.string().describe("Either the full UUID or the 8-char short_id."),
+      chunk: z.string().min(1).max(4000).describe("The text to append. Plain text recommended; Markdown is allowed but escape special chars yourself."),
+    },
+    audit.wrap(
+      "stream_to_user_append",
+      async ({ stream_id, chunk }) => {
+        const result = await store.update((state) => {
+          const found = findUserStream(state, stream_id);
+          if (!found) return { ok: false, note: "stream not found" };
+          const { stream } = found;
+          if (stream.status === "ended") return { ok: false, note: "stream already ended" };
+          // Cap total content at Telegram's 4096-char limit (minus headroom
+          // for the title + completion marker).
+          const MAX = 3800;
+          const room = Math.max(0, MAX - stream.content.length);
+          stream.content += chunk.slice(0, room);
+          return {
+            ok: true,
+            stream_id: stream.id,
+            current_length: stream.content.length,
+            truncated: chunk.length > room,
+          };
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      },
+      ({ stream_id }) => ({})
+    )
+  );
+
+  // ---- stream_to_user_end ---------------------------------------------------
+  server.tool(
+    "stream_to_user_end",
+    "Mark a streaming message complete. The notifier will do a final edit appending a ✓ marker to the Telegram message. No-op if the stream is already ended.",
+    {
+      stream_id: z.string(),
+      final_chunk: z.string().optional().describe("Optional last bit of content to append before finalizing."),
+    },
+    audit.wrap(
+      "stream_to_user_end",
+      async ({ stream_id, final_chunk }) => {
+        const result = await store.update((state) => {
+          const found = findUserStream(state, stream_id);
+          if (!found) return { ok: false, note: "stream not found" };
+          const { stream } = found;
+          if (stream.status === "ended") return { ok: true, note: "already ended" };
+          if (final_chunk) {
+            const MAX = 3800;
+            const room = Math.max(0, MAX - stream.content.length);
+            stream.content += final_chunk.slice(0, room);
+          }
+          stream.status = "ended";
+          stream.endedAt = Date.now();
+          return { ok: true, stream_id: stream.id };
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      },
+      ({ stream_id }) => ({})
     )
   );
 

@@ -1,7 +1,8 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { StateStore, type Plan, type UserResponseRequest } from "../lib/state.js";
+import { StateStore, type Plan, type UserResponseRequest, type UserStream } from "../lib/state.js";
 import { TelegramApi, type InlineKeyboardButton } from "./api.js";
+import { agnetLabel } from "../lib/agnet.js";
 import type { TelegramConfig } from "./config.js";
 
 /**
@@ -27,7 +28,13 @@ interface NotifierCursor {
   notifiedUserNotificationIds: string[];
   /** v0.4: ids of userResponseRequests already pushed. */
   notifiedUserRequestIds: string[];
+  /** v0.5: ids of userStreams already opened on Telegram. */
+  notifiedUserStreamIds: string[];
 }
+
+/** Minimum interval between edits to the same Telegram message (ms). The
+ *  Telegram Bot API limits edits to ~1/sec per chat; we use 1.5s for headroom. */
+const STREAM_EDIT_THROTTLE_MS = 1500;
 
 const EMPTY_CURSOR: NotifierCursor = {
   initialized: false,
@@ -37,6 +44,7 @@ const EMPTY_CURSOR: NotifierCursor = {
   alertedHallucinations: [],
   notifiedUserNotificationIds: [],
   notifiedUserRequestIds: [],
+  notifiedUserStreamIds: [],
 };
 
 const URGENCY_EMOJI: Record<string, string> = { low: "💬", normal: "📢", high: "🚨" };
@@ -84,6 +92,7 @@ export class Notifier {
         if (plan.notes.length > 0) cursor.lastNoteId = plan.notes[plan.notes.length - 1].id;
         for (const n of plan.userNotifications) cursor.notifiedUserNotificationIds.push(n.id);
         for (const r of plan.userResponseRequests) cursor.notifiedUserRequestIds.push(r.id);
+        for (const s of plan.userStreams) cursor.notifiedUserStreamIds.push(s.id);
       }
       cursor.initialized = true;
       await this.saveCursor();
@@ -126,31 +135,38 @@ export class Notifier {
       for (const task of plan.tasks) {
         const prev = cursor.taskStatus[task.id];
         if (prev !== task.status) {
+          // v0.5: prefix every task-status message with the Agnet designation
+          // so the user sees who's reporting in.
+          const agnet = escapeMd(agnetLabel(task.agnetName));
+          const title = escapeMd(truncate(task.title, 50));
           if (task.status === "done") {
             const prSuffix = task.prUrl ? `\n${task.prUrl}` : "";
-            plainMessages.push(`✓ *${escapeMd(truncate(task.title, 60))}* — done${prSuffix}`);
+            plainMessages.push(`✓ *${agnet}* finished — _${title}_${prSuffix}`);
           } else if (task.status === "failed") {
             plainMessages.push(
-              `❌ *${escapeMd(truncate(task.title, 60))}* — failed${task.exitReason ? `\n${escapeMd(task.exitReason)}` : ""}`
+              `❌ *${agnet}* failed — _${title}_${task.exitReason ? `\n${escapeMd(task.exitReason)}` : ""}`
             );
           } else if (task.status === "cancelled") {
-            plainMessages.push(`🛑 *${escapeMd(truncate(task.title, 60))}* — cancelled`);
+            plainMessages.push(`🛑 *${agnet}* cancelled — _${title}_`);
+          } else if (task.status === "running" && prev === "dispatched") {
+            plainMessages.push(`▶ *${agnet}* started — _${title}_`);
           }
           cursor.taskStatus[task.id] = task.status;
         }
       }
 
-      // ---- agent notes ----
+      // ---- agent (Agnet) notes ----
       let foundLast = cursor.lastNoteId === null;
       for (const note of plan.notes) {
         if (!foundLast) {
           if (note.id === cursor.lastNoteId) foundLast = true;
           continue;
         }
-        const taskTitle = plan.tasks.find((t) => t.id === note.taskId)?.title ?? note.taskId.slice(0, 8);
+        const task = plan.tasks.find((t) => t.id === note.taskId);
+        const agnet = escapeMd(agnetLabel(task?.agnetName));
         const blocking = note.blocking ? " 🟡 blocking" : "";
         plainMessages.push(
-          `📝 *${escapeMd(truncate(taskTitle, 50))}*${blocking}\n${escapeMd(truncate(note.text, 300))}${note.prUrl ? `\n${note.prUrl}` : ""}`
+          `📝 *${agnet}*${blocking}\n${escapeMd(truncate(note.text, 300))}${note.prUrl ? `\n${note.prUrl}` : ""}`
         );
         cursor.lastNoteId = note.id;
       }
@@ -199,6 +215,72 @@ export class Notifier {
       }
     }
 
+    // ---- v0.5: stream handling ----
+    // For each active stream that's either (a) not yet opened on Telegram,
+    // or (b) has content beyond what we last edited, send/edit. Throttled
+    // to STREAM_EDIT_THROTTLE_MS per stream per chat.
+    for (const plan of plans) {
+      for (const stream of plan.userStreams) {
+        const isNew = !cursor.notifiedUserStreamIds.includes(stream.id);
+        const hasNewContent = stream.lastDeliveredContent !== stream.content;
+        const isEndedAndNotFinalized = stream.status === "ended" && stream.lastDeliveredContent !== formatStreamEnded(stream);
+        if (!isNew && !hasNewContent && !isEndedAndNotFinalized) continue;
+
+        if (isNew) {
+          // Open the stream on each whitelisted chat. First chat's
+          // message_id is the canonical "edit target."
+          for (const entry of this.cfg.whitelist) {
+            try {
+              const text = formatStreamMessage(stream);
+              const { message_id } = await this.api.sendMessage(entry.chatId, text, { parseMode: "Markdown" });
+              if (stream.telegramMessageId === undefined) {
+                await store.update((state) => {
+                  for (const p of Object.values(state.plans)) {
+                    const s = p.userStreams.find((x) => x.id === stream.id);
+                    if (s) {
+                      s.telegramMessageId = message_id;
+                      s.telegramChatId = entry.chatId;
+                      s.lastDeliveredContent = stream.content;
+                      s.lastEditedAt = Date.now();
+                    }
+                  }
+                });
+              }
+            } catch (err) {
+              process.stderr.write(`[orqlaude tg stream] open failed: ${(err as Error).message}\n`);
+            }
+          }
+          cursor.notifiedUserStreamIds.push(stream.id);
+          continue;
+        }
+
+        // Edit-on-update path — throttled.
+        const now = Date.now();
+        if (stream.lastEditedAt && now - stream.lastEditedAt < STREAM_EDIT_THROTTLE_MS && stream.status !== "ended") {
+          continue; // not yet time
+        }
+        if (!stream.telegramMessageId || !stream.telegramChatId) continue;
+        try {
+          const text =
+            stream.status === "ended" ? formatStreamEnded(stream) : formatStreamMessage(stream);
+          await this.api.editMessageText(stream.telegramChatId, stream.telegramMessageId, text, {
+            parseMode: "Markdown",
+          });
+          await store.update((state) => {
+            for (const p of Object.values(state.plans)) {
+              const s = p.userStreams.find((x) => x.id === stream.id);
+              if (s) {
+                s.lastDeliveredContent = text;
+                s.lastEditedAt = Date.now();
+              }
+            }
+          });
+        } catch (err) {
+          process.stderr.write(`[orqlaude tg stream] edit failed: ${(err as Error).message}\n`);
+        }
+      }
+    }
+
     // Send question pushes. Persist message_id back into state so the bot
     // can edit on response.
     for (const qp of questionPushes) {
@@ -229,6 +311,17 @@ export class Notifier {
       }
     }
   }
+}
+
+function formatStreamMessage(stream: UserStream): string {
+  // Title bold; body plain (caller-escaped if they care).
+  const body = stream.content ? `\n${stream.content}` : "";
+  return `*${escapeMd(stream.title)}*${body}`;
+}
+
+function formatStreamEnded(stream: UserStream): string {
+  const body = stream.content ? `\n${stream.content}` : "";
+  return `*${escapeMd(stream.title)}* ✓${body}`;
 }
 
 function buildInlineKeyboard(shortId: string, options: string[]): InlineKeyboardButton[][] {

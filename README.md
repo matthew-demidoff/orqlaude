@@ -1,6 +1,6 @@
 # @synaplink/orqlaude
 
-Multi-agent orchestrator for Claude Code. One primary Claude session decomposes a complex task into N parallel sub-tasks, gets a single user approval, then dispatches N child agents (each in its own session and worktree) via the Claude Desktop app's native `mcp__ccd_session__spawn_task`. Tracks cost/tokens via JSONL tails, brokers messages between agents, detects hallucination, manages PRs, and can spawn a reviewer agent per PR at the end.
+Multi-agent orchestrator for Claude Code. One primary Claude session decomposes a complex task into N parallel **Agnets** (orqlaude's name for spawned workers), gets a single user approval, then dispatches each Agnet (in its own session and worktree) via the Claude Desktop app's native `mcp__ccd_session__spawn_task`. Tracks cost/tokens via JSONL tails, brokers messages between Agnets, detects hallucination, manages PRs, streams updates to your Telegram, and can spawn a reviewer Agnet per PR at the end.
 
 The name is **orq**hestrator + **Claude**.
 
@@ -99,7 +99,7 @@ Restart your Claude Code session. The `mcp__orqlaude__*` tools will appear.
 | `resume_plan(plan_id)` | Pick up an in-flight plan after a Desktop-app restart or new session. Refreshes per-task status from JSONL, returns a "do this next" hint. |
 | `list_plans(include_collected?)` | All plans known to orqlaude in this project, active first. |
 
-### Broker-to-user (v0.4+)
+### Broker-to-user (v0.4+, expanded in v0.5)
 
 These let primary Claude push messages to and pull answers from the **user** (via Telegram if configured, with a `/respond` text fallback).
 
@@ -108,8 +108,18 @@ These let primary Claude push messages to and pull answers from the **user** (vi
 | `notify_user(plan_id, text, urgency?, task_id?)` | One-way push to user's Telegram. urgency = `low`/`normal`/`high` (affects emoji). Returns immediately. |
 | `request_user_response(plan_id, prompt, options?[], timeout_sec?, task_id?)` | Ask the user a question. With `options`, Telegram shows inline-keyboard buttons; without, user replies via `/respond <short_id> <text>`. Returns `request_id` + `short_id`. Defaults to a 10-minute timeout. |
 | `poll_user_response(request_id)` | Returns `status: pending\|answered\|timed_out\|cancelled` + `response` once available. Safe to poll repeatedly. |
+| `stream_to_user_start(plan_id, title, initial_content?, task_id?)` | **v0.5+** Open a streaming Telegram message. Returns `stream_id`. |
+| `stream_to_user_append(stream_id, chunk)` | **v0.5+** Append a chunk; notifier edits the Telegram message in place (throttled ~1 edit/1.5s). |
+| `stream_to_user_end(stream_id, final_chunk?)` | **v0.5+** Finalize the stream — adds a `✓` marker to the message. |
 
-Without a running `orqlaude tg start`, `notify_user` queues silently and `request_user_response` will always `timed_out` — fall back to `AskUserQuestion` if Telegram is unavailable.
+Without a running `orqlaude tg start`, `notify_user` queues silently, `request_user_response` will always `timed_out`, and streaming tools accumulate content in state but no message lands on Telegram. Fall back to `AskUserQuestion` if Telegram is unavailable.
+
+#### Streaming caveat
+
+Telegram has no native "streaming text" endpoint. We simulate it via `editMessageText` on a tight cadence. Limits to know:
+- One Telegram message tops out at ~4096 chars. orqlaude caps stream content at 3800 to leave room for the title + completion marker; further appends are silently truncated.
+- Edits per message are rate-limited (~1/sec). orqlaude's notifier throttles to 1.5s between edits per stream.
+- If you need to stream more than 4kb of output, start a new stream when you're approaching the cap.
 
 ### Health
 
@@ -182,10 +192,25 @@ orqlaude list                   # every plan in this project
 orqlaude status <plan_id>       # refreshed status of one plan
 orqlaude show <plan_id>         # raw plan JSON
 orqlaude history --limit 50     # tail audit log
+orqlaude where                  # show resolved state dir
 orqlaude help
 ```
 
 Read-only. For active orchestration, use the MCP from inside Claude Code.
+
+### Branding & colors (v0.5+)
+
+CLI output uses the Anthropic palette via ANSI truecolor:
+
+| Color | Hex | Purpose |
+|---|---|---|
+| Claude Coral | `#DA7756` | Headings, brand accents, running tasks, Agnet names |
+| Cream | `#F5F4EE` | Secondary emphasis, token counts |
+| Crimson | `#BB5944` | Errors, failed/cancelled tasks |
+| Charcoal | `#2A2926` | Body text (terminal default usually) |
+| Sand | `#B9B6AB` | Captions, separators, hints |
+
+Colors disable automatically when stdout isn't a TTY, when `NO_COLOR` is set ([no-color.org](https://no-color.org/)), or when `TERM=dumb`. Force-enable with `FORCE_COLOR=1`.
 
 ## Repo layout
 

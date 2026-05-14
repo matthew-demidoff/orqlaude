@@ -10,6 +10,8 @@ import { loadConfig, saveConfig, CONFIG_PATH } from "./telegram/config.js";
 import { TelegramApi } from "./telegram/api.js";
 import { runBot } from "./telegram/bot.js";
 import { resolveStateDir } from "./lib/state_dir.js";
+import { style, styleStatus, banner } from "./lib/style.js";
+import { agnetLabel } from "./lib/agnet.js";
 
 /**
  * orqlaude CLI — read-only inspection of state + audit log + Telegram setup
@@ -53,25 +55,25 @@ async function main(): Promise<number> {
 }
 
 function printHelp(): void {
-  console.log(`orqlaude — multi-agent orchestrator for Claude Code
-
-Inspection:
-  orqlaude list                   List every plan in this project
-  orqlaude status <plan_id>       Refreshed status of one plan
-  orqlaude show <plan_id>         Raw plan JSON
-  orqlaude history [--limit N]    Tail the audit log (default 30)
-  orqlaude where                  Show resolved state dir (debug)
-
-Telegram:
-  orqlaude tg setup               Configure bot token (interactive)
-  orqlaude tg whitelist <id> [--owner] [--label NAME]
-  orqlaude tg unwhitelist <id>
-  orqlaude tg show                Show current Telegram config
-  orqlaude tg test <chat_id>      Send a test message
-  orqlaude tg start               Run the bot (foreground, monitors this project)
-  orqlaude tg help                Telegram-specific help
-
-State dir: ${STATE_DIR}`);
+  console.log(banner());
+  console.log("");
+  console.log(style.bold(style.cream("Inspection")));
+  console.log(`  ${style.coral("orqlaude list")}                   List every plan in this project`);
+  console.log(`  ${style.coral("orqlaude status")} ${style.sand("<plan_id>")}       Refreshed status of one plan`);
+  console.log(`  ${style.coral("orqlaude show")} ${style.sand("<plan_id>")}         Raw plan JSON`);
+  console.log(`  ${style.coral("orqlaude history")} ${style.sand("[--limit N]")}    Tail the audit log (default 30)`);
+  console.log(`  ${style.coral("orqlaude where")}                  Show resolved state dir (debug)`);
+  console.log("");
+  console.log(style.bold(style.cream("Telegram")));
+  console.log(`  ${style.coral("orqlaude tg setup")}               Configure bot token (interactive)`);
+  console.log(`  ${style.coral("orqlaude tg whitelist")} ${style.sand("<id> [--owner] [--label NAME]")}`);
+  console.log(`  ${style.coral("orqlaude tg unwhitelist")} ${style.sand("<id>")}`);
+  console.log(`  ${style.coral("orqlaude tg show")}                Show current Telegram config`);
+  console.log(`  ${style.coral("orqlaude tg test")} ${style.sand("<chat_id>")}      Send a test message`);
+  console.log(`  ${style.coral("orqlaude tg start")}               Run the bot (foreground, monitors this project)`);
+  console.log(`  ${style.coral("orqlaude tg help")}                Telegram-specific help`);
+  console.log("");
+  console.log(style.dim(`State dir: ${STATE_DIR}`));
 }
 
 // ---- read-only inspection -------------------------------------------------
@@ -80,13 +82,20 @@ async function cmdList(): Promise<number> {
   const store = new StateStore(STATE_DIR);
   const plans = await store.read((s) => Object.values(s.plans).sort((a, b) => b.createdAt - a.createdAt));
   if (plans.length === 0) {
-    console.log("No plans yet in this project.");
+    console.log(style.sand("No plans yet in this project."));
     return 0;
   }
+  console.log(banner());
+  console.log("");
   for (const p of plans) {
     const done = p.tasks.filter((t) => t.status === "done").length;
     const running = p.tasks.filter((t) => t.status === "running" || t.status === "dispatched").length;
-    console.log(`${p.id}  ${p.status.padEnd(22)}  ${done}/${p.tasks.length} done${running ? `, ${running} running` : ""}  — ${truncate(p.rootTask, 60)}`);
+    const colored = styleStatus(p.status);
+    const status = colored(p.status.padEnd(22));
+    const progress = running
+      ? `${done}/${p.tasks.length} done, ${style.coral(`${running} running`)}`
+      : `${done}/${p.tasks.length} done`;
+    console.log(`${style.dim(p.id.slice(0, 8))}…  ${status}  ${progress}  ${style.sand("—")} ${truncate(p.rootTask, 60)}`);
   }
   return 0;
 }
@@ -104,27 +113,33 @@ async function cmdStatus(planId: string | undefined): Promise<number> {
     console.error((err as Error).message);
     return 1;
   }
-  console.log(`Plan ${plan.id}`);
-  console.log(`  status:     ${plan.status}`);
-  console.log(`  root_task:  ${plan.rootTask}`);
-  console.log(`  budget:     ${plan.budgetCapTokens.toLocaleString()} tokens (${Math.round(plan.budgetCapTokens / 1000)}k)`);
-  console.log(`  created:    ${new Date(plan.createdAt).toISOString()}`);
-  if (plan.approvedAt) console.log(`  approved:   ${new Date(plan.approvedAt).toISOString()}`);
-  console.log(`  tasks:`);
+  console.log(banner());
+  console.log("");
+  console.log(`${style.bold(style.coral("Plan"))} ${style.dim(plan.id)}`);
+  console.log(`  ${style.sand("status:")}     ${styleStatus(plan.status)(plan.status)}`);
+  console.log(`  ${style.sand("root_task:")}  ${plan.rootTask}`);
+  console.log(`  ${style.sand("budget:")}     ${style.cream(plan.budgetCapTokens.toLocaleString())} tokens ${style.dim(`(${Math.round(plan.budgetCapTokens / 1000)}k)`)}`);
+  console.log(`  ${style.sand("created:")}    ${style.dim(new Date(plan.createdAt).toISOString())}`);
+  if (plan.approvedAt) console.log(`  ${style.sand("approved:")}   ${style.dim(new Date(plan.approvedAt).toISOString())}`);
+  console.log(`  ${style.sand("tasks:")}`);
   let totalTokens = 0;
   for (const t of plan.tasks) {
+    const agnet = style.coral(agnetLabel(t.agnetName).padEnd(16));
+    const tStatus = styleStatus(t.status)(`[${t.status.padEnd(10)}]`);
     let extra = "";
     if (t.spawnedSessionId) {
       const snap = await snapshotSession(process.cwd(), t.spawnedSessionId);
       totalTokens += snap.totalEffectiveTokens;
-      extra = `  ${snap.totalEffectiveTokens.toLocaleString()}t  ${snap.terminated ? "✓" : snap.lastToolUse?.name ?? snap.lastEventType ?? ""}`;
+      const tokens = style.dim(`${snap.totalEffectiveTokens.toLocaleString()}t`);
+      const activity = snap.terminated ? style.coral("✓") : style.sand(snap.lastToolUse?.name ?? snap.lastEventType ?? "");
+      extra = `  ${tokens}  ${activity}`;
     }
-    console.log(`    [${t.status.padEnd(10)}] ${t.title.padEnd(50)}${extra}`);
-    if (t.prUrl) console.log(`        PR: ${t.prUrl}`);
+    console.log(`    ${tStatus} ${agnet} ${truncate(t.title, 40).padEnd(40)}${extra}`);
+    if (t.prUrl) console.log(`        ${style.sand("PR:")} ${style.cream(t.prUrl)}`);
   }
-  console.log(`  used:       ${totalTokens.toLocaleString()} tokens`);
-  if (plan.notes.length > 0) console.log(`  notes:      ${plan.notes.length}`);
-  if (plan.claims.length > 0) console.log(`  claims:     ${plan.claims.length}`);
+  console.log(`  ${style.sand("used:")}       ${style.cream(totalTokens.toLocaleString())} tokens`);
+  if (plan.notes.length > 0) console.log(`  ${style.sand("notes:")}      ${plan.notes.length}`);
+  if (plan.claims.length > 0) console.log(`  ${style.sand("claims:")}     ${plan.claims.length}`);
   return 0;
 }
 
@@ -145,11 +160,13 @@ async function cmdShow(planId: string | undefined): Promise<number> {
 }
 
 function cmdWhere(): number {
-  console.log(`cwd:        ${STATE_DIR_RESOLUTION.cwd}`);
-  console.log(`state dir:  ${STATE_DIR_RESOLUTION.path}`);
-  console.log(`source:     ${STATE_DIR_RESOLUTION.source}`);
+  console.log(banner());
+  console.log("");
+  console.log(`  ${style.sand("cwd:")}        ${STATE_DIR_RESOLUTION.cwd}`);
+  console.log(`  ${style.sand("state dir:")}  ${style.cream(STATE_DIR_RESOLUTION.path)}`);
+  console.log(`  ${style.sand("source:")}     ${style.coral(STATE_DIR_RESOLUTION.source)}`);
   console.log(``);
-  console.log(`Resolution order: ORQLAUDE_STATE_DIR env > git worktree > project root > ~/.orqlaude/projects/<hash>`);
+  console.log(style.dim(`Resolution order: ORQLAUDE_STATE_DIR env > git worktree > project root > ~/.orqlaude/projects/<hash>`));
   return 0;
 }
 
@@ -161,10 +178,16 @@ async function cmdHistory(limit: number): Promise<number> {
     return 0;
   }
   for (const e of events) {
-    const ts = new Date(e.ts).toISOString().slice(11, 19);
-    const ok = e.ok ? "  ok" : "ERR ";
-    const id = e.planId ? ` plan=${e.planId.slice(0, 8)}` : e.sessionId ? ` sess=${e.sessionId.slice(0, 8)}` : "";
-    console.log(`${ts}  ${ok}  ${e.tool.padEnd(18)} ${e.durationMs.toString().padStart(4)}ms${id}  ${e.resultSummary ? truncate(e.resultSummary, 80) : e.error ?? ""}`);
+    const ts = style.dim(new Date(e.ts).toISOString().slice(11, 19));
+    const ok = e.ok ? style.coral("  ok") : style.crimson("ERR ");
+    const id = e.planId
+      ? style.sand(` plan=${e.planId.slice(0, 8)}`)
+      : e.sessionId
+      ? style.sand(` sess=${e.sessionId.slice(0, 8)}`)
+      : "";
+    const tool = style.cream(e.tool.padEnd(22));
+    const dur = style.dim(`${e.durationMs.toString().padStart(4)}ms`);
+    console.log(`${ts}  ${ok}  ${tool} ${dur}${id}  ${e.resultSummary ? truncate(e.resultSummary, 80) : e.error ?? ""}`);
   }
   return 0;
 }
