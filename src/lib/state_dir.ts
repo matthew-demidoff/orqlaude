@@ -1,4 +1,4 @@
-import { promises as fs, statSync, readFileSync, accessSync, constants } from "node:fs";
+import { promises as fs, statSync, readFileSync, accessSync, realpathSync, existsSync, constants } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
@@ -158,4 +158,58 @@ export async function resolveAndEnsureStateDir(): Promise<StateDirResolution> {
     );
   }
   return r;
+}
+
+/**
+ * Compare two filesystem paths for equivalence, accounting for:
+ *   • symlinks (resolved via realpath when the path exists)
+ *   • case-insensitive filesystems on macOS / Windows (HFS+/APFS/NTFS default)
+ *   • redundant `./` and `../` segments (path.normalize)
+ *
+ * Returns true if both paths point at the same on-disk location, even when
+ * neither directory has been created yet.
+ *
+ * v0.5.6: used by `orql tg start`'s state-dir mismatch check. The previous
+ * raw string comparison yelled at users whose PWD differed from cwd only
+ * in case (e.g. typing `cd /users/.../documents/crm` against a directory
+ * stored on disk as `Documents/crm`).
+ */
+export function pathsEquivalent(a: string, b: string): boolean {
+  const normA = path.resolve(a);
+  const normB = path.resolve(b);
+  // Fast path: identical after normalization.
+  if (normA === normB) return true;
+  // Try realpath if both (or their nearest existing ancestors) resolve to
+  // the same canonical location.
+  const realA = safeRealpathOfExistingPrefix(normA);
+  const realB = safeRealpathOfExistingPrefix(normB);
+  if (realA && realB && realA === realB) return true;
+  // Case-insensitive fallback on platforms where the filesystem usually is.
+  if (process.platform === "darwin" || process.platform === "win32") {
+    return normA.toLowerCase() === normB.toLowerCase();
+  }
+  return false;
+}
+
+/**
+ * Walk up from `p` until we find an existing ancestor; realpath that, then
+ * re-attach the trailing unresolved segments. Lets us compare paths whose
+ * leaves don't yet exist on disk (e.g. a not-yet-created state dir).
+ */
+function safeRealpathOfExistingPrefix(p: string): string | null {
+  let cur = p;
+  const tail: string[] = [];
+  while (cur && cur !== path.dirname(cur)) {
+    if (existsSync(cur)) {
+      try {
+        const real = realpathSync(cur);
+        return tail.length > 0 ? path.join(real, ...tail.reverse()) : real;
+      } catch {
+        return null;
+      }
+    }
+    tail.push(path.basename(cur));
+    cur = path.dirname(cur);
+  }
+  return null;
 }
