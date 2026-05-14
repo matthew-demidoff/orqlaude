@@ -80,3 +80,12 @@ test("v0.5 schema: newPlan initializes userStreams empty", async () => {
   });
   assert.deepEqual(plan.userStreams, []);
 });
+
+test("TelegramApi.sendMessageDraft rejects draft_id=0 (v0.5.1)", async () => {
+  const { TelegramApi } = await import("../telegram/api.js");
+  const api = new TelegramApi("test:token");
+  await assert.rejects(
+    () => api.sendMessageDraft(123, 0, "hi"),
+    /must be a non-zero integer/
+  );
+});

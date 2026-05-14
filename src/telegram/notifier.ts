@@ -32,9 +32,22 @@ interface NotifierCursor {
   notifiedUserStreamIds: string[];
 }
 
-/** Minimum interval between edits to the same Telegram message (ms). The
- *  Telegram Bot API limits edits to ~1/sec per chat; we use 1.5s for headroom. */
+/** Minimum interval between edits when using the editMessageText fallback
+ *  (the Bot API limits edits to ~1/sec per chat; we use 1.5s for headroom).
+ *  sendMessageDraft is designed for streaming so we use a shorter throttle. */
 const STREAM_EDIT_THROTTLE_MS = 1500;
+const STREAM_DRAFT_THROTTLE_MS = 400;
+
+/**
+ * Derive a stable, non-zero 48-bit integer draft_id from a stream UUID. Same
+ * stream UUID always yields the same draft_id, so a restart of the notifier
+ * can pick up an in-flight stream and continue animating it.
+ */
+function streamDraftId(streamId: string): number {
+  const hex = streamId.replace(/-/g, "").slice(0, 12);  // 48 bits, safely in MAX_SAFE_INTEGER
+  const n = parseInt(hex, 16);
+  return n === 0 ? 1 : n;
+}
 
 const EMPTY_CURSOR: NotifierCursor = {
   initialized: false,
@@ -215,69 +228,104 @@ export class Notifier {
       }
     }
 
-    // ---- v0.5: stream handling ----
-    // For each active stream that's either (a) not yet opened on Telegram,
-    // or (b) has content beyond what we last edited, send/edit. Throttled
-    // to STREAM_EDIT_THROTTLE_MS per stream per chat.
+    // ---- v0.5+ stream handling (draft-first, edit fallback) ----
+    //
+    // For each stream we maintain ONE of two transports per Telegram chat:
+    //   1. "draft" (preferred, v0.5.1+): sendMessageDraft with a stable
+    //      draft_id. Telegram animates updates and shows them as an
+    //      ephemeral preview. When the stream ends we call sendMessage to
+    //      persist the final content.
+    //   2. "edit" (fallback): sendMessage once + editMessageText for each
+    //      update. Used when sendMessageDraft is unavailable on the bot's
+    //      Telegram server.
+    //
+    // We probe draft on first attempt; if it fails (404 / method not found),
+    // we switch the stream's transport to "edit" and stick with it for the
+    // rest of its lifecycle.
     for (const plan of plans) {
       for (const stream of plan.userStreams) {
         const isNew = !cursor.notifiedUserStreamIds.includes(stream.id);
         const hasNewContent = stream.lastDeliveredContent !== stream.content;
-        const isEndedAndNotFinalized = stream.status === "ended" && stream.lastDeliveredContent !== formatStreamEnded(stream);
-        if (!isNew && !hasNewContent && !isEndedAndNotFinalized) continue;
+        const justEnded = stream.status === "ended" && !stream.finalSent;
+        if (!isNew && !hasNewContent && !justEnded) continue;
 
-        if (isNew) {
-          // Open the stream on each whitelisted chat. First chat's
-          // message_id is the canonical "edit target."
-          for (const entry of this.cfg.whitelist) {
-            try {
-              const text = formatStreamMessage(stream);
-              const { message_id } = await this.api.sendMessage(entry.chatId, text, { parseMode: "Markdown" });
-              if (stream.telegramMessageId === undefined) {
-                await store.update((state) => {
-                  for (const p of Object.values(state.plans)) {
-                    const s = p.userStreams.find((x) => x.id === stream.id);
-                    if (s) {
-                      s.telegramMessageId = message_id;
-                      s.telegramChatId = entry.chatId;
-                      s.lastDeliveredContent = stream.content;
-                      s.lastEditedAt = Date.now();
-                    }
-                  }
-                });
-              }
-            } catch (err) {
-              process.stderr.write(`[orqlaude tg stream] open failed: ${(err as Error).message}\n`);
-            }
-          }
-          cursor.notifiedUserStreamIds.push(stream.id);
+        // Throttle: drafts are designed for streaming, so we tick faster.
+        const throttle = stream.transport === "edit" ? STREAM_EDIT_THROTTLE_MS : STREAM_DRAFT_THROTTLE_MS;
+        const now = Date.now();
+        if (!isNew && !justEnded && stream.lastEditedAt && now - stream.lastEditedAt < throttle) {
           continue;
         }
 
-        // Edit-on-update path — throttled.
-        const now = Date.now();
-        if (stream.lastEditedAt && now - stream.lastEditedAt < STREAM_EDIT_THROTTLE_MS && stream.status !== "ended") {
-          continue; // not yet time
-        }
-        if (!stream.telegramMessageId || !stream.telegramChatId) continue;
-        try {
-          const text =
-            stream.status === "ended" ? formatStreamEnded(stream) : formatStreamMessage(stream);
-          await this.api.editMessageText(stream.telegramChatId, stream.telegramMessageId, text, {
-            parseMode: "Markdown",
-          });
+        const draftId = stream.draftId ?? streamDraftId(stream.id);
+        if (!stream.draftId) {
+          // First touch — record draft id.
           await store.update((state) => {
             for (const p of Object.values(state.plans)) {
               const s = p.userStreams.find((x) => x.id === stream.id);
-              if (s) {
-                s.lastDeliveredContent = text;
-                s.lastEditedAt = Date.now();
-              }
+              if (s) s.draftId = draftId;
             }
           });
-        } catch (err) {
-          process.stderr.write(`[orqlaude tg stream] edit failed: ${(err as Error).message}\n`);
         }
+
+        for (const entry of this.cfg.whitelist) {
+          // Effective transport: explicit, else default to "draft" and let
+          // the first call probe.
+          const transport = stream.transport ?? "draft";
+
+          if (transport === "draft") {
+            // Draft path. text="" on initial empty content gives the
+            // Telegram "Thinking…" placeholder.
+            const text = formatStreamMessage(stream);
+            const result = await this.api.sendMessageDraft(entry.chatId, draftId, text, { parseMode: "Markdown" });
+            if (!result.ok) {
+              // Server doesn't support drafts (or other failure). Switch to
+              // edit fallback for the rest of this stream's life.
+              process.stderr.write(
+                `[orqlaude tg stream] sendMessageDraft failed (${result.status}); falling back to edit. body=${result.body.slice(0, 200)}\n`
+              );
+              await store.update((state) => {
+                for (const p of Object.values(state.plans)) {
+                  const s = p.userStreams.find((x) => x.id === stream.id);
+                  if (s) s.transport = "edit";
+                }
+              });
+              // Now do the edit-path open in this same tick.
+              await openOrEditEditMode(this.api, store, stream, entry.chatId, justEnded);
+            } else {
+              // Draft sent. Record delivery state.
+              await store.update((state) => {
+                for (const p of Object.values(state.plans)) {
+                  const s = p.userStreams.find((x) => x.id === stream.id);
+                  if (s) {
+                    s.transport = "draft";
+                    s.telegramChatId = s.telegramChatId ?? entry.chatId;
+                    s.lastDeliveredContent = text;
+                    s.lastEditedAt = Date.now();
+                  }
+                }
+              });
+              // On end: persist the final message via sendMessage and mark.
+              if (justEnded) {
+                try {
+                  await this.api.sendMessage(entry.chatId, formatStreamEnded(stream), { parseMode: "Markdown" });
+                  await store.update((state) => {
+                    for (const p of Object.values(state.plans)) {
+                      const s = p.userStreams.find((x) => x.id === stream.id);
+                      if (s) s.finalSent = true;
+                    }
+                  });
+                } catch (err) {
+                  process.stderr.write(`[orqlaude tg stream] final persist failed: ${(err as Error).message}\n`);
+                }
+              }
+            }
+          } else {
+            // Edit path.
+            await openOrEditEditMode(this.api, store, stream, entry.chatId, justEnded);
+          }
+        }
+
+        if (isNew) cursor.notifiedUserStreamIds.push(stream.id);
       }
     }
 
@@ -322,6 +370,72 @@ function formatStreamMessage(stream: UserStream): string {
 function formatStreamEnded(stream: UserStream): string {
   const body = stream.content ? `\n${stream.content}` : "";
   return `*${escapeMd(stream.title)}* ✓${body}`;
+}
+
+/**
+ * Edit-mode fallback: maintain a single persistent Telegram message via
+ * sendMessage + editMessageText. Used when sendMessageDraft is unavailable.
+ */
+async function openOrEditEditMode(
+  api: TelegramApi,
+  store: StateStore,
+  stream: UserStream,
+  chatId: number,
+  justEnded: boolean
+): Promise<void> {
+  if (!stream.telegramMessageId) {
+    // First time on this chat — send the message.
+    try {
+      const { message_id } = await api.sendMessage(chatId, formatStreamMessage(stream), { parseMode: "Markdown" });
+      await store.update((state) => {
+        for (const p of Object.values(state.plans)) {
+          const s = p.userStreams.find((x) => x.id === stream.id);
+          if (s) {
+            s.transport = "edit";
+            s.telegramMessageId = message_id;
+            s.telegramChatId = chatId;
+            s.lastDeliveredContent = stream.content;
+            s.lastEditedAt = Date.now();
+          }
+        }
+      });
+      // If the stream is already ended, do one more edit to mark complete.
+      if (justEnded) {
+        try {
+          await api.editMessageText(chatId, message_id, formatStreamEnded(stream), { parseMode: "Markdown" });
+          await store.update((state) => {
+            for (const p of Object.values(state.plans)) {
+              const s = p.userStreams.find((x) => x.id === stream.id);
+              if (s) s.finalSent = true;
+            }
+          });
+        } catch (err) {
+          process.stderr.write(`[orqlaude tg stream] edit-mode final edit failed: ${(err as Error).message}\n`);
+        }
+      }
+    } catch (err) {
+      process.stderr.write(`[orqlaude tg stream] edit-mode open failed: ${(err as Error).message}\n`);
+    }
+    return;
+  }
+
+  // Subsequent updates — edit in place.
+  try {
+    const text = justEnded ? formatStreamEnded(stream) : formatStreamMessage(stream);
+    await api.editMessageText(stream.telegramChatId!, stream.telegramMessageId, text, { parseMode: "Markdown" });
+    await store.update((state) => {
+      for (const p of Object.values(state.plans)) {
+        const s = p.userStreams.find((x) => x.id === stream.id);
+        if (s) {
+          s.lastDeliveredContent = text;
+          s.lastEditedAt = Date.now();
+          if (justEnded) s.finalSent = true;
+        }
+      }
+    });
+  } catch (err) {
+    process.stderr.write(`[orqlaude tg stream] edit-mode update failed: ${(err as Error).message}\n`);
+  }
 }
 
 function buildInlineKeyboard(shortId: string, options: string[]): InlineKeyboardButton[][] {

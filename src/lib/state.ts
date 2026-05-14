@@ -135,9 +135,18 @@ export interface UserStream {
   status: "active" | "ended";
   createdAt: number;
   endedAt?: number;
-  /** Per-chat persistence so the notifier knows which message to edit. */
+  /** v0.5.1+: deterministic non-zero integer for Telegram's sendMessageDraft.
+   *  Derived from the stream UUID so it's stable across restarts. */
+  draftId?: number;
+  /** v0.5.1+: which transport path is active.
+   *   "draft"  → sendMessageDraft for each update, sendMessage to persist on end.
+   *   "edit"   → fallback: sendMessage once + editMessageText for updates (v0.5 default). */
+  transport?: "draft" | "edit";
+  /** Per-chat persistence so the notifier knows which message to edit (edit path) or persist (draft path). */
   telegramChatId?: number;
   telegramMessageId?: number;
+  /** v0.5.1+: whether the stream's final persisted message has been sent. */
+  finalSent?: boolean;
   /** Last delivered content snapshot (so notifier knows what to send / edit). */
   lastDeliveredContent?: string;
   lastEditedAt?: number;
