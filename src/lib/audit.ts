@@ -110,26 +110,61 @@ export class AuditLog {
   }
 }
 
+// Sensitive field names — redacted in BOTH args and result text.
+const SECRET_FIELDS = new Set([
+  "approval_token",
+  "botToken",
+  "bot_token",
+  "token",
+  "apiKey",
+  "api_key",
+  "password",
+  "secret",
+]);
+
 function summarize(result: unknown): string {
   // MCP tool results are typically { content: [{ type: "text", text: "..." }] }.
-  // Extract the first text and truncate.
+  // Extract the first text, scrub known secret fields, then truncate.
   try {
     const r = result as any;
     const text = r?.content?.[0]?.text;
-    if (typeof text === "string") return text.slice(0, 200);
-    return JSON.stringify(result).slice(0, 200);
+    const raw = typeof text === "string" ? text : JSON.stringify(result);
+    return scrubSecretsInText(raw).slice(0, 200);
   } catch {
     return String(result).slice(0, 200);
   }
 }
 
+/**
+ * Strip values of known secret fields out of a JSON-like text blob. We can't
+ * rely on a proper parse (the text may already be truncated), so we operate on
+ * the textual representation with regex. This is best-effort defense in depth
+ * — the canonical fix is to never put secrets in the user-facing content.text.
+ */
+function scrubSecretsInText(s: string): string {
+  let out = s;
+  for (const k of SECRET_FIELDS) {
+    // JSON-shaped: "key": "value"  →  "key": "<redacted>"
+    out = out.replace(new RegExp(`("${k}"\\s*:\\s*)"[^"]*"`, "g"), `$1"<redacted>"`);
+    // YAML-ish (rare in our outputs but cheap to include): key: value
+    out = out.replace(new RegExp(`(\\b${k}\\s*[:=]\\s*)\\S+`, "g"), `$1<redacted>`);
+  }
+  return out;
+}
+
 function redactSecrets(args: unknown): unknown {
-  // Approval tokens are single-use, but we still don't want them sitting in
-  // the audit log forever.
-  if (args && typeof args === "object") {
-    const clone: Record<string, unknown> = { ...(args as Record<string, unknown>) };
-    if ("approval_token" in clone) clone.approval_token = "<redacted>";
+  // Deep redaction: walk nested objects/arrays. Mutates a shallow copy.
+  return walk(args);
+}
+
+function walk(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(walk);
+  if (value && typeof value === "object") {
+    const clone: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      clone[k] = SECRET_FIELDS.has(k) ? "<redacted>" : walk(v);
+    }
     return clone;
   }
-  return args;
+  return value;
 }

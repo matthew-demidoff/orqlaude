@@ -2,7 +2,7 @@
   "mcpServers": {
     "orqlaude": {
       "command": "npx",
-      "args": ["-y", "@synaplink/orqlaude"]
+      "args": ["-y", "-p", "@synaplink/orqlaude", "orqlaude-mcp"]
     }
   }
 }

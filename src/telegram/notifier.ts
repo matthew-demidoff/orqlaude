@@ -5,31 +5,29 @@ import { TelegramApi } from "./api.js";
 import type { TelegramConfig } from "./config.js";
 
 /**
- * Notifier: polls state files for changes and pushes diffs to whitelisted
- * Telegram chats.
+ * Notifier: polls state for changes and pushes diffs to whitelisted chats.
  *
- * Tracks a per-project cursor (`<project>/.orqlaude/telegram-cursor.json`)
- * recording the last note id and per-task status seen. On each tick we read
- * the state and emit messages for:
- *   • newly created plans (status === "draft" first seen)
- *   • plans transitioning to "approved" or "running"
- *   • tasks transitioning to "done", "failed", or "cancelled"
- *   • new notes (only those with id > last seen)
- *   • severe hallucination alerts (when seen for the first time)
- *   • fleet collected (status → "collected")
- *
- * Idempotency: we save the cursor BEFORE sending, so a failed send won't
- * spam. The cost is occasionally missing a notification; that's acceptable.
+ * v0.3.1 fixes:
+ *   • Markdown escaping (`escapeMd`) so a `_` or `*` in a task title/note
+ *     doesn't make sendMessage 400, swallow the error, and lose the message.
+ *   • First-tick seed: on initial run with an empty cursor, snapshot the
+ *     current task/plan statuses and last note id into the cursor WITHOUT
+ *     emitting messages. This prevents replaying every previously-completed
+ *     plan as "just happened" on bot startup.
+ *   • Cursor write retains atomic mode-600 just for symmetry with the
+ *     token file; the cursor itself is non-secret.
  */
 
 interface NotifierCursor {
+  initialized: boolean;
   lastNoteId: string | null;
-  taskStatus: Record<string, string>; // task_id → last seen status
-  planStatus: Record<string, string>; // plan_id → last seen status
-  alertedHallucinations: string[];    // task_ids that were already alerted
+  taskStatus: Record<string, string>;
+  planStatus: Record<string, string>;
+  alertedHallucinations: string[];
 }
 
 const EMPTY_CURSOR: NotifierCursor = {
+  initialized: false,
   lastNoteId: null,
   taskStatus: {},
   planStatus: {},
@@ -59,7 +57,7 @@ export class Notifier {
   private async saveCursor(): Promise<void> {
     if (!this.cursor) return;
     await fs.mkdir(path.dirname(this.cursorPath), { recursive: true });
-    const tmp = `${this.cursorPath}.${process.pid}.tmp`;
+    const tmp = `${this.cursorPath}.${process.pid}.${Date.now()}.tmp`;
     await fs.writeFile(tmp, JSON.stringify(this.cursor, null, 2));
     await fs.rename(tmp, this.cursorPath);
   }
@@ -71,14 +69,25 @@ export class Notifier {
     const store = new StateStore(path.join(this.projectDir, ".orqlaude"));
     const plans: Plan[] = await store.read((s) => Object.values(s.plans));
 
+    // First-tick seed: silently snapshot current state, no messages.
+    if (!cursor.initialized) {
+      for (const plan of plans) {
+        cursor.planStatus[plan.id] = plan.status;
+        for (const task of plan.tasks) cursor.taskStatus[task.id] = task.status;
+        if (plan.notes.length > 0) cursor.lastNoteId = plan.notes[plan.notes.length - 1].id;
+      }
+      cursor.initialized = true;
+      await this.saveCursor();
+      return;
+    }
+
     const messages: string[] = [];
 
     for (const plan of plans) {
       const prevStatus = cursor.planStatus[plan.id];
-      // Plan status transitions we care about
       if (prevStatus !== plan.status) {
         if (!prevStatus && plan.status === "draft") {
-          messages.push(`📋 *New plan* \`${plan.id.slice(0, 8)}\` — ${plan.tasks.length} task(s)\n${truncate(plan.rootTask, 100)}`);
+          messages.push(`📋 *New plan* \`${plan.id.slice(0, 8)}\` — ${plan.tasks.length} task(s)\n${escapeMd(truncate(plan.rootTask, 100))}`);
         } else if (plan.status === "approved" && prevStatus !== "approved") {
           messages.push(`✅ *Approved* \`${plan.id.slice(0, 8)}\` — spawning ${plan.tasks.length} agents`);
         } else if (plan.status === "collected") {
@@ -93,23 +102,22 @@ export class Notifier {
         cursor.planStatus[plan.id] = plan.status;
       }
 
-      // Per-task status transitions
       for (const task of plan.tasks) {
         const prev = cursor.taskStatus[task.id];
         if (prev !== task.status) {
           if (task.status === "done") {
             const prSuffix = task.prUrl ? `\n${task.prUrl}` : "";
-            messages.push(`✓ *${truncate(task.title, 60)}* — done${prSuffix}`);
+            messages.push(`✓ *${escapeMd(truncate(task.title, 60))}* — done${prSuffix}`);
           } else if (task.status === "failed") {
-            messages.push(`❌ *${truncate(task.title, 60)}* — failed${task.exitReason ? `\n${task.exitReason}` : ""}`);
+            messages.push(`❌ *${escapeMd(truncate(task.title, 60))}* — failed${task.exitReason ? `\n${escapeMd(task.exitReason)}` : ""}`);
           } else if (task.status === "cancelled") {
-            messages.push(`🛑 *${truncate(task.title, 60)}* — cancelled`);
+            messages.push(`🛑 *${escapeMd(truncate(task.title, 60))}* — cancelled`);
           }
           cursor.taskStatus[task.id] = task.status;
         }
       }
 
-      // New notes (only after the last-seen note id)
+      // New notes after the last-seen id.
       let foundLast = cursor.lastNoteId === null;
       for (const note of plan.notes) {
         if (!foundLast) {
@@ -118,25 +126,16 @@ export class Notifier {
         }
         const taskTitle = plan.tasks.find((t) => t.id === note.taskId)?.title ?? note.taskId.slice(0, 8);
         const blocking = note.blocking ? " 🟡 blocking" : "";
-        messages.push(`📝 *${truncate(taskTitle, 50)}*${blocking}\n${truncate(note.text, 300)}${note.prUrl ? `\n${note.prUrl}` : ""}`);
+        messages.push(
+          `📝 *${escapeMd(truncate(taskTitle, 50))}*${blocking}\n${escapeMd(truncate(note.text, 300))}${note.prUrl ? `\n${note.prUrl}` : ""}`
+        );
         cursor.lastNoteId = note.id;
       }
-      // If we never had a cursor, seed it to the last note so we don't blast history.
-      if (cursor.lastNoteId === null && plan.notes.length > 0) {
-        cursor.lastNoteId = plan.notes[plan.notes.length - 1].id;
-      }
     }
 
-    if (messages.length === 0) {
-      // still save cursor in case statuses changed but no message produced
-      await this.saveCursor();
-      return;
-    }
-
-    // Save cursor BEFORE sending, to avoid resends on partial failures.
+    // Save cursor BEFORE sending so a failed send won't re-spam on retry.
     await this.saveCursor();
 
-    // Push.
     for (const entry of this.cfg.whitelist) {
       for (const msg of messages) {
         try {
@@ -147,6 +146,23 @@ export class Notifier {
       }
     }
   }
+}
+
+/**
+ * Escape characters that Telegram MarkdownV1 treats as syntax.
+ *
+ * Per https://core.telegram.org/bots/api#markdown-style, V1's reserved set is
+ * `_ * ` ` [`. Without escaping these in user-supplied strings, an innocuous
+ * branch name like `feature/foo_bar` or a note containing a single `*` makes
+ * sendMessage 400 → notifier swallows the error → cursor already advanced →
+ * notification permanently lost.
+ *
+ * URL text (e.g. PR links) is appended raw and not run through this escaper,
+ * because backslashing chars in URLs breaks them. Keep URL fragments out of
+ * this function's input.
+ */
+export function escapeMd(s: string): string {
+  return s.replace(/([_*`\[])/g, "\\$1");
 }
 
 function truncate(s: string, n: number): string {
