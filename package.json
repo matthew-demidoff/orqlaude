@@ -1,18 +1,44 @@
 {
   "name": "@synaplink/orqlaude",
   "version": "0.2.0",
-  "description": "Multi-agent orchestrator for Claude Code. Lets a primary session spawn N parallel agents, each in its own worktree, with budget caps, broker messaging, and PR creation.",
+  "description": "Multi-agent orchestrator for Claude Code. One primary session decomposes a complex task, gets a single budget approval, then dispatches N parallel agents via the Desktop app's native spawn_task. Tracks cost/status via JSONL tails; brokers messages between agents; detects hallucination; manages PRs.",
   "type": "module",
   "bin": {
     "orqlaude": "./dist/cli.js"
   },
   "main": "./dist/server.js",
+  "files": [
+    "dist",
+    "README.md",
+    ".mcp.json.template"
+  ],
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
     "start": "node dist/server.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "tsc && node --test dist/__tests__/*.test.js",
+    "prepublishOnly": "npm run build"
   },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "mcp",
+    "orchestrator",
+    "multi-agent",
+    "agents",
+    "anthropic"
+  ],
+  "author": "SynapLink",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SynapLink/orqlaude.git"
+  },
+  "bugs": {
+    "url": "https://github.com/SynapLink/orqlaude/issues"
+  },
+  "homepage": "https://github.com/SynapLink/orqlaude#readme",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
     "zod": "^3.23.8"
@@ -22,6 +48,9 @@
     "typescript": "^5.6.3"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
