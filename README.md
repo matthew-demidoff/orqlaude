@@ -1,142 +1,201 @@
-# orqlaude
+# @synaplink/orqlaude
 
-Multi-agent orchestrator for Claude Code. Lets one primary Claude session decompose a complex task into N parallel sub-tasks, get a budget approval from the user once, spawn N child agents (each in its own session and worktree), broker messages between them, and aggregate the resulting PRs.
+Multi-agent orchestrator for Claude Code. One primary Claude session decomposes a complex task into N parallel sub-tasks, gets a single user approval, then dispatches N child agents (each in its own session and worktree) via the Claude Desktop app's native `mcp__ccd_session__spawn_task`. Tracks cost/tokens via JSONL tails, brokers messages between agents, detects hallucination, manages PRs, and can spawn a reviewer agent per PR at the end.
 
-The name is a portmanteau of **orq**hestrator + **Claude**.
+The name is **orq**hestrator + **Claude**.
 
-> Status: **v0.1.0** — first working version. State store, planning flow, dispatch flow, and broker are all in place. The actual session spawning uses the Claude Desktop app's native `mcp__ccd_session__spawn_task` (one chip-click per agent), which means each spawned agent is a real Code-section session with normal sidebar, history, and resumability.
+> Status: **v0.2.0** — 19 tools, 11 tests passing, CI green. Token-first budgets (Max-friendly), self-registering child agents, hallucination detection, file-claim broker, audit log, resumability, and an auto-review pipeline. Telegram bot is on the roadmap (v0.3).
+
+## Why orqlaude exists
+
+A single Claude agent is great at focused work but slow at multi-region refactors. You can manually spawn parallel sessions via `spawn_task`, but you lose budget oversight, cross-agent coordination, and a single place to see "what's the fleet doing right now?"
+
+orqlaude is the thin layer that adds those things. It never spawns processes itself — the Desktop app's `spawn_task` does that — but it owns the *plan*, the *budget*, the *broker*, and the *aggregation*.
 
 ## How it fits together
 
 ```
                           ┌──────────────────────┐
                           │   PRIMARY CLAUDE     │
-                          │  (this session)      │
                           └─────────┬────────────┘
-                                    │
    ┌─── orqlaude.create_plan ──────►│
    │   orqlaude.request_approval ──►│  (relays via AskUserQuestion)
    │   orqlaude.confirm        ────►│
    │   orqlaude.next_task      ────►│
-   │   ccd_session.spawn_task  ────►├─── chip ───► ┌──────────┐
-   │   orqlaude.register_spawn ────►│              │ child #1 │
-   │                                │              │ session  │
-   │   orqlaude.next_task      ────►│              └────┬─────┘
-   │   ccd_session.spawn_task  ────►├─── chip ───►      │
-   │   orqlaude.register_spawn ────►│              ┌────▼─────┐
-   │                                │              │ child #2 │
-   │   orqlaude.status         ────►│              │ session  │
-   │   orqlaude.poll_notes     ────►│              └────┬─────┘
-   │   orqlaude.send_message   ────►│                   │
-   │   orqlaude.collect        ────►│        post_note  │
-   │                                │◄──────────────────┘
+   │   ccd_session.spawn_task  ────►├─── chip ─► ┌──────────┐
+   │                                │            │ child #1 │ ─► auto-registers via checkin
+   │                                │            │ session  │
+   │   orqlaude.next_task      ────►│            └────┬─────┘
+   │   ccd_session.spawn_task  ────►├─── chip ─►      │
+   │                                │            ┌────▼─────┐
+   │                                │            │ child #2 │
+   │   orqlaude.status         ────►│ ◄────── claim_files, post_note
+   │   orqlaude.poll_notes     ────►│ ◄────── PR url via post_note
+   │   orqlaude.send_message   ────►│
+   │   orqlaude.collect        ────►│
+   │   orqlaude.review_prs     ────►├─── chip ─► reviewer #1
+   │                                ├─── chip ─► reviewer #2
    └────────────────────────────────┘
 ```
 
-orqlaude itself never spawns processes. It maintains a JSON ledger of plans, tasks, notes, and queued messages. The primary Claude is the dispatcher; the Desktop app's `ccd_session__spawn_task` is the spawner; spawned agents call back into orqlaude (loaded as an MCP in their worktree) for broker messaging.
-
-## Quick start
+## Install
 
 ```sh
-# One-time: build the MCP server
-cd /path/to/orqlaude
-npm install
-npm run build
+npm install -g @synaplink/orqlaude   # CLI + MCP server
 ```
 
-The repo's `.mcp.json` already wires orqlaude into Claude Code at `node /Users/matthew/Documents/orqlaude/dist/server.js`. Reopen any session in this folder and you'll see the `mcp__orqlaude__*` tools.
+In your project, add to `.mcp.json` (or copy `.mcp.json.template`):
 
-If you want orqlaude available in other projects too, copy the `mcpServers` entry from `.mcp.json` into that project's `.mcp.json`, or add it globally via `claude mcp add`.
+```json
+{
+  "mcpServers": {
+    "orqlaude": {
+      "command": "npx",
+      "args": ["-y", "@synaplink/orqlaude"]
+    }
+  }
+}
+```
+
+Restart your Claude Code session. The `mcp__orqlaude__*` tools will appear.
 
 ## Tool reference
 
-### Planning flow (primary Claude)
+### Planning (primary Claude)
 
-| Tool | What it does |
+| Tool | Purpose |
 |---|---|
-| `create_plan(root_task, tasks[], budget_cap_usd?, effort_multiplier?)` | Register a fleet. `tasks` is your decomposition — each entry has `title` (≤60 chars, chip label), `prompt` (full self-contained instructions), `tldr` (tooltip), optional `scope` and `branchHint`. Returns `plan_id`. |
-| `estimate(plan_id, model?, effort_multiplier?)` | Recompute cost/duration estimate. |
-| `request_approval(plan_id)` | Returns an `approval_token` + a prebuilt `ask_user_question` payload. Show it to the user via `AskUserQuestion`. |
+| `create_plan(root_task, tasks[], budget_cap_tokens?, model_for_estimate?, effort_multiplier?)` | Register a fleet. Returns `plan_id`. Budget is in TOKENS (Max-plan friendly); USD is informational. |
+| `estimate(plan_id, model?, effort_multiplier?)` | Recompute cost/duration estimates. |
+| `request_approval(plan_id)` | Returns `approval_token` and a prebuilt `ask_user_question` payload. Surfaces your daily token usage from the Desktop app's `buddy-tokens.json`. |
 | `confirm(plan_id, approval_token)` | Lock the plan after user approves. |
 
-### Dispatch flow (primary Claude)
+### Dispatch (primary Claude)
 
-| Tool | What it does |
+| Tool | Purpose |
 |---|---|
-| `next_task(plan_id)` | Pull the next pending task. The returned `prompt` is wrapped with broker scaffolding (instructions to post PR URL, periodic check-ins). Feed it directly into `mcp__ccd_session__spawn_task`. |
-| `register_spawn(plan_id, task_id, session_id)` | After the user clicks the chip, look up the new session id (via `mcp__ccd_session_mgmt__list_sessions`) and tell orqlaude. |
-| `status(plan_id)` | Live snapshot: per-agent cost, last activity, current tool, terminated yes/no. Reads each spawned session's JSONL tail. |
-| `collect(plan_id)` | Final aggregation: PR URLs, summaries, total cost, exit reasons. |
+| `next_task(plan_id)` | Pull the next pending task. Returned `prompt` embeds `plan_id` + `task_id` and instructs the agent to self-register via `checkin` on its first turn. |
+| `status(plan_id)` | Per-agent live snapshot: cost, tokens, last activity, current tool, terminated yes/no, **hallucination report**. Auto-cancels and STOPs all agents if total tokens exceed the cap. |
+| `collect(plan_id)` | Aggregated PR URLs, summaries, costs, exit reasons. |
+| `review_prs(plan_id, auto_approve?, budget_cap_tokens?)` | Spawn a reviewer agent against each PR produced by `plan_id`. Creates a new "review plan" auto-approved by default. |
+| `register_spawn(plan_id, task_id, session_id)` | Manual fallback if a child fails to self-register. Rarely needed. |
 
 ### Broker
 
-| Tool | Caller | What it does |
+| Tool | Caller | Purpose |
 |---|---|---|
-| `checkin(session_id)` | child agent | Pull queued messages, see which of your blocking notes have been acked. |
-| `post_note(session_id, text, blocking?, pr_url?)` | child agent | Share a finding with the fleet. Set `pr_url` on completion. |
-| `poll_notes(plan_id, since_ts?, mark_acked?)` | primary Claude | Read all notes; optionally ack blocking ones. |
-| `send_message(plan_id, to_session_id, text, from_task_id?)` | primary Claude | Queue a directed message for a child. Delivered on its next `checkin`. |
+| `checkin(session_id, task_id?)` | child agent | **First call**: pass `task_id` to self-register. Subsequent calls: pull queued messages, see STOP signals, ack state of blocking notes. |
+| `post_note(session_id, text, blocking?, pr_url?)` | child agent | Share findings or report a PR URL. `blocking: true` pauses until acked. |
+| `claim_files(session_id, paths[], reason?)` | child agent | Register intent to edit specific files. Conflicting claims by other agents surface to the caller. |
+| `release_files(session_id, paths[])` | child agent | Release claims after finishing. |
+| `poll_notes(plan_id, since_ts?, mark_acked?)` | primary Claude | Read agent notes; ack blocking ones to unblock posters. |
+| `send_message(plan_id, to_session_id, text, from_task_id?, kind?)` | primary Claude | Queue a directed message. `kind: "stop"` triggers child commit-and-exit. |
+
+### Lifecycle
+
+| Tool | Purpose |
+|---|---|
+| `kill_task(plan_id, task_id, reason)` | Queue STOP broker message; returns session_id ready for `archive_session`. Use for hallucinating/looping agents. |
+| `resume_plan(plan_id)` | Pick up an in-flight plan after a Desktop-app restart or new session. Refreshes per-task status from JSONL, returns a "do this next" hint. |
+| `list_plans(include_collected?)` | All plans known to orqlaude in this project, active first. |
 
 ### Health
 
-| Tool | What it does |
+| Tool | Purpose |
 |---|---|
-| `ping(echo?)` | Returns version, cwd, node version, pid. Use once after install. |
+| `ping(echo?)` | Returns version, cwd, node, pid. |
 
 ## End-to-end walkthrough
 
-Imagine the user says: *"Refactor the auth system — move from password-based to magic-link login, update the docs, and add new tests."* You judge this as parallelizable across three regions.
+User says: *"Refactor the auth system — magic-link login, update the docs, add tests."* You judge it as parallelizable.
 
-1. You call `orqlaude.create_plan` with three subtasks (auth-core changes, docs, tests).
-2. You call `orqlaude.request_approval`, which returns an `approval_token` and a ready-made `ask_user_question` payload.
+1. `orqlaude.create_plan` with 3 subtasks (auth-core, docs, tests), `budget_cap_tokens: 600000`.
+2. `orqlaude.request_approval` → returns `approval_token` and a prebuilt question payload showing your remaining daily quota.
 3. You call `AskUserQuestion` with that payload. User picks "Approve and spawn".
-4. You call `orqlaude.confirm` with the token.
+4. `orqlaude.confirm`.
 5. Loop three times:
-   - `orqlaude.next_task` → returns a task with wrapped prompt
-   - `mcp__ccd_session__spawn_task` with that title/prompt/tldr → chip appears
-   - User clicks the chip → new session created
-   - You call `mcp__ccd_session_mgmt__list_sessions` to find the new session id (matches by title)
-   - `orqlaude.register_spawn` to tell orqlaude
-6. Periodically: `orqlaude.status` and `orqlaude.poll_notes` to see what's happening. Forward cross-cutting info via `orqlaude.send_message`.
-7. When all agents are done, `orqlaude.collect` returns the three PR URLs and a summary you can present to the user.
+   - `orqlaude.next_task` → returns a task with the wrapped prompt
+   - `mcp__ccd_session__spawn_task` with the title/prompt/tldr → user clicks the chip
+   - The spawned agent calls `orqlaude.checkin(session_id, task_id)` on first turn → self-registers
+6. Periodically: `orqlaude.status` (shows hallucination scores) + `orqlaude.poll_notes`. Forward cross-cutting info via `send_message`. If an agent goes off the rails, `kill_task`.
+7. Agents call `orqlaude.post_note(..., pr_url=...)` when their PR is open.
+8. `orqlaude.collect` → three PR URLs and summaries.
+9. **NEW**: `orqlaude.review_prs(plan_id)` → spawns three reviewer agents, one per PR. Each reviews, runs tests, posts findings. You aggregate the second-round notes.
 
 ## State
 
-State lives in `<project>/.orqlaude/orqlaude-state.json` (overridable via `ORQLAUDE_STATE_DIR`). Atomic-write via temp+rename. The file is human-readable and inspectable. It's `.gitignore`d.
+State lives in `<project>/.orqlaude/`:
 
-## Pricing assumptions
+- `orqlaude-state.json` — plans, tasks, notes, messages, claims. Atomic write via temp+rename.
+- `audit.jsonl` — append-only log of every tool call: `{ ts, tool, args (redacted), ok, durationMs, plan/session ids, summary }`. Inspect with `orqlaude history` or `tail -f .orqlaude/audit.jsonl | jq`.
 
-`src/lib/pricing.ts` has a per-model pricing table and a `estimateAgentCost` baseline. The baselines (~30k cache-creation, ~4k output, etc.) are tuned to a real Haiku run we observed (~$0.038). Tweak with `effort_multiplier` per plan; refine the baselines as we collect more real-run data.
+Both human-readable. Both `.gitignore`d.
 
-## Limits and known gaps
+## Hallucination detection
 
-- **No automatic session-id discovery yet.** After `spawn_task`, primary Claude has to call `list_sessions` to find the new session id and pass it to `register_spawn`. A future iteration will try to embed a "report-in" hook in the spawned prompt so the agent registers itself via `checkin` on first turn.
-- **Child agents need orqlaude as an MCP** to use broker tools. The `.mcp.json` in the project root works if the spawned worktree includes it (committing this file ensures that).
-- **N chips means N clicks.** Anthropic's `spawn_task` is intentionally a per-click confirmation. Aggregate batch-spawn isn't yet possible through that API.
-- **No kill/cancel tool yet.** Cancellation requires using `mcp__ccd_session_mgmt__archive_session` directly.
-- **Per-agent budget caps aren't enforced at the agent level** because chip-spawned sessions don't accept `--max-budget-usd`. orqlaude tracks costs after the fact and surfaces overages, but doesn't automatically kill.
+`status()` runs two deterministic checks per agent:
+
+1. **Path-existence**: every `file_path` referenced in `Read/Edit/Write/Grep` tool calls is checked against the worktree. >30% missing or ≥3 missing = `moderate`/`severe` flag.
+2. **Tool-pattern sanity**:
+   - Edit on a file that wasn't read first
+   - Same tool call repeated ≥3 times (loop)
+   - `git commit` without any prior `npm test`/`tsc`/`pytest`/etc.
+
+Each agent gets a `hallucination_score` (0–1) and `concerns: string[]`. The aggregated `hallucination_alerts` list surfaces to the primary Claude so it can `send_message` a nudge or `kill_task`. False positives are acceptable here — we surface concerns, we don't auto-kill.
+
+A future v0.3 can add a Check 3: periodic Haiku cross-validation of recent activity (costs tokens, opt-in).
+
+## CLI
+
+```sh
+orqlaude list                   # every plan in this project
+orqlaude status <plan_id>       # refreshed status of one plan
+orqlaude show <plan_id>         # raw plan JSON
+orqlaude history --limit 50     # tail audit log
+orqlaude help
+```
+
+Read-only. For active orchestration, use the MCP from inside Claude Code.
 
 ## Repo layout
 
 ```
 orqlaude/
-├── package.json
+├── package.json                # @synaplink/orqlaude
 ├── tsconfig.json
-├── .mcp.json                  # auto-loads orqlaude in this project
+├── .mcp.json                   # local dev wiring
+├── .mcp.json.template          # production wiring (npx-based)
+├── .github/workflows/ci.yml    # typecheck + build + test
 ├── src/
-│   ├── server.ts              # MCP stdio entry
+│   ├── server.ts               # MCP stdio entry
+│   ├── cli.ts                  # `orqlaude` CLI binary
 │   ├── lib/
-│   │   ├── state.ts           # JSON-backed ledger
-│   │   ├── pricing.ts         # model pricing + cost estimator
-│   │   └── jsonl_tail.ts      # snapshot a session's JSONL for status
-│   └── tools/
-│       ├── ping.ts
-│       ├── planning.ts        # create_plan, estimate, request_approval, confirm
-│       ├── dispatch.ts        # next_task, register_spawn, status, collect
-│       └── broker.ts          # checkin, post_note, poll_notes, send_message
-└── dist/                      # tsc output
+│   │   ├── state.ts            # JSON-backed ledger, schema v2
+│   │   ├── budgeting.ts        # token-first budget, daily quota reader
+│   │   ├── pricing.ts          # USD pricing table (informational)
+│   │   ├── hallucination.ts    # deterministic detectors
+│   │   ├── jsonl_tail.ts       # cached byte-offset session tail
+│   │   └── audit.ts            # append-only audit log
+│   ├── tools/
+│   │   ├── ping.ts
+│   │   ├── planning.ts         # create_plan, estimate, request_approval, confirm
+│   │   ├── dispatch.ts         # next_task, register_spawn, status, collect
+│   │   ├── broker.ts           # checkin, post_note, claim_files, release_files, poll_notes, send_message
+│   │   ├── lifecycle.ts        # kill_task, resume_plan, list_plans
+│   │   └── review.ts           # review_prs
+│   └── __tests__/
+│       ├── state.test.ts
+│       └── hallucination.test.ts
+└── dist/                       # tsc output (published to npm)
 ```
+
+## Known gaps (v0.2 → v0.3 roadmap)
+
+- **Telegram bot** — `orqlaude tg setup / start / whitelist` to receive notifications, approve fleets from your phone, query status while away. Designed; not yet shipped.
+- **Cost-learning estimates** — current baselines are tuned to a single Haiku probe. Future: write per-task realized costs to history and use moving averages.
+- **N chips = N clicks** — Anthropic's `spawn_task` is per-click by design. Worth filing as feedback. Until then, batch-spawn isn't possible through that API.
+- **Second-model hallucination check** — periodic Haiku cross-validation is on the v0.3 roadmap, gated by opt-in.
 
 ## License
 
-TBD.
+MIT.
