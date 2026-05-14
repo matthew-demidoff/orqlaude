@@ -42,6 +42,11 @@ export interface Task {
   branchHint?: string;
   status: TaskStatus;
   spawnedSessionId?: string;
+  /** v0.5.3+: filesystem path of the worktree this Agnet is running in.
+   *  Populated when spawned via spawn_via_cli; null for host-spawned. */
+  worktreePath?: string;
+  /** v0.5.3+: feature branch the worktree is on. */
+  worktreeBranch?: string;
   /** v0.5+: Human-friendly Agnet designation (e.g. "Zenith"). Used in CLI
    *  output and Telegram notifications. Stable per task_id. */
   agnetName?: string;
