@@ -42,6 +42,9 @@ export interface Task {
   branchHint?: string;
   status: TaskStatus;
   spawnedSessionId?: string;
+  /** v0.5+: Human-friendly Agnet designation (e.g. "Zenith"). Used in CLI
+   *  output and Telegram notifications. Stable per task_id. */
+  agnetName?: string;
   /** Optional per-task token budget hint. If set, status() surfaces a soft
    *  warning when usage exceeds 70% of this value, separate from the
    *  plan-wide hard cap. */
@@ -108,6 +111,39 @@ export interface UserNotification {
 }
 
 /**
+ * v0.5+: Streamed message from primary Claude to user. A stream is a long-
+ * running message that gets *edited in place* as new chunks arrive — the
+ * Telegram-shaped equivalent of a streamed assistant reply.
+ *
+ * Lifecycle:
+ *   1. stream_to_user_start writes the initial record + first content.
+ *      Notifier sends the message and records telegramMessageId.
+ *   2. stream_to_user_append adds a chunk to `content`. Notifier edits the
+ *      Telegram message on its next tick (throttled to ~1 edit/1.5s by
+ *      Telegram rate limits).
+ *   3. stream_to_user_end finalizes. Notifier does a final edit with an
+ *      "✓ complete" marker.
+ */
+export interface UserStream {
+  id: string;
+  shortId: string;
+  taskId?: string;
+  /** Title shown in bold at the top of the message (e.g. "Agnet Verdant"). */
+  title: string;
+  /** Full accumulated content. */
+  content: string;
+  status: "active" | "ended";
+  createdAt: number;
+  endedAt?: number;
+  /** Per-chat persistence so the notifier knows which message to edit. */
+  telegramChatId?: number;
+  telegramMessageId?: number;
+  /** Last delivered content snapshot (so notifier knows what to send / edit). */
+  lastDeliveredContent?: string;
+  lastEditedAt?: number;
+}
+
+/**
  * Outbound question from primary Claude to the user, with an awaited
  * response. The notifier pushes to Telegram (with an inline keyboard if
  * `options` is set). The bot writes the user's choice/text back here on
@@ -154,6 +190,8 @@ export interface Plan {
   /** v0.4+: outbound notifications / questions from primary Claude to user. */
   userNotifications: UserNotification[];
   userResponseRequests: UserResponseRequest[];
+  /** v0.5+: streaming-message records (edit-in-place Telegram messages). */
+  userStreams: UserStream[];
   reviewPlanId?: string;
 }
 
@@ -323,6 +361,7 @@ function migrate(input: Partial<State> & { schemaVersion?: number }): State {
       claims: p.claims ?? [],
       userNotifications: p.userNotifications ?? [],
       userResponseRequests: p.userResponseRequests ?? [],
+      userStreams: p.userStreams ?? [],
     } as Plan;
   }
   return out;
@@ -353,7 +392,16 @@ export function newPlan(
     claims: [],
     userNotifications: [],
     userResponseRequests: [],
+    userStreams: [],
   };
+}
+
+export function findUserStream(state: State, streamId: string): { plan: Plan; stream: UserStream } | undefined {
+  for (const plan of Object.values(state.plans)) {
+    const stream = plan.userStreams.find((s) => s.id === streamId || s.shortId === streamId);
+    if (stream) return { plan, stream };
+  }
+  return undefined;
 }
 
 export function findUserResponseRequest(

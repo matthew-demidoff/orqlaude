@@ -3,6 +3,7 @@ import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import { StateStore, newPlan, findPlan, type Plan } from "../lib/state.js";
 import { estimateAgent, readDailyTokenUsage } from "../lib/budgeting.js";
+import { pickAgnetName, agnetLabel } from "../lib/agnet.js";
 import type { AuditLog } from "../lib/audit.js";
 
 /**
@@ -53,6 +54,12 @@ export function registerPlanning(server: McpServer, store: StateStore, audit: Au
         try {
           plan = await store.update<Plan>((state) => {
             const p = newPlan(root_task, budget_cap_tokens, tasks);
+            // Assign Agnet names — stable per task_id, unique within plan.
+            const taken = new Set<string>();
+            for (const t of p.tasks) {
+              t.agnetName = pickAgnetName(t.id, taken);
+              taken.add(t.agnetName);
+            }
             const est = estimateAgent(model_for_estimate, effort_multiplier);
             p.estimatedTokens = est.tokens.totalEffective * p.tasks.length;
             p.estimatedCostUsd = est.costUsd * p.tasks.length;
@@ -91,6 +98,7 @@ export function registerPlanning(server: McpServer, store: StateStore, audit: Au
             id: t.id,
             title: t.title,
             tldr: t.tldr,
+            agnet: agnetLabel(t.agnetName),  // v0.5+: human-friendly designation
             scope: t.scope ?? [],
             budget_hint_tokens: t.budgetHintTokens ?? null,
           })),
