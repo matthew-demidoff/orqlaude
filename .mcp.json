@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "orqlaude": {
+      "command": "node",
+      "args": ["/Users/matthew/Documents/orqlaude/dist/server.js"]
+    }
+  }
+}

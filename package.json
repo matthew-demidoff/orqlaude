@@ -1,0 +1,27 @@
+{
+  "name": "orqlaude",
+  "version": "0.1.0",
+  "description": "Multi-agent orchestrator for Claude Code. Lets a primary session spawn N parallel agents, each in its own worktree, with budget caps, broker messaging, and PR creation.",
+  "type": "module",
+  "bin": {
+    "orqlaude": "./dist/cli.js"
+  },
+  "main": "./dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/server.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.5",
+    "typescript": "^5.6.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
