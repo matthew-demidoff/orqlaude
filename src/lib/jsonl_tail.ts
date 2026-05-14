@@ -2,15 +2,34 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 
 /**
- * Read the tail of a Claude Code session JSONL and derive a status snapshot.
+ * Read the tail of a Claude Code session event stream and derive a status
+ * snapshot.
  *
- * Session files live at:
- *   ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl
+ * TWO source files are supported:
+ *   1. ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl
+ *      Written by the Desktop app for sessions it hosts.
+ *   2. <worktree>/.orqlaude.stdout.log
+ *      Written by `spawn_via_cli` when it pipes `claude -p
+ *      --output-format stream-json` to a file inside the spawned Agnet's
+ *      worktree. The event format is identical (one JSON event per line);
+ *      only the storage location differs.
+ *
+ * The caller MAY pass `stdoutPath` as a hint. The resolver prefers the
+ * Desktop JSONL when present (canonical), and falls back to the stdout log
+ * when the JSONL is missing and the stdout log exists. Without the hint,
+ * only the JSONL is consulted - so for `spawn_via_cli` Agnets (which never
+ * produce a JSONL), the caller MUST pass the hint or status reads will
+ * always be empty. See `Task.stdoutPath` in state.ts.
  *
  * v0.2.0 optimization: per-session byte-offset cache. After the first full
  * read we remember where we stopped and only parse new bytes on subsequent
  * snapshots. This matters for long-running fleets where status() is polled
- * frequently against multi-MB JSONLs.
+ * frequently against multi-MB streams.
+ *
+ * v0.9.0: the cache is keyed by RESOLVED path, not session id - so if the
+ * resolver picks JSONL one call and stdout-log the next (e.g. when the
+ * Desktop app starts writing mid-fleet), each path gets its own cache entry
+ * and we don't double-count tokens.
  *
  * The cache lives in-process; on MCP server restart it's rebuilt by re-reading
  * the file once. Cache hit reduces a `status()` call from O(filesize) to
@@ -20,7 +39,16 @@ import path from "node:path";
 export interface SessionSnapshot {
   exists: boolean;
   sessionId: string;
+  /** Canonical Desktop-app JSONL path (whether or not the file exists). */
   jsonlPath: string;
+  /**
+   * Which file we actually read from. Either `jsonlPath` (Desktop app) or
+   * the `<worktree>/.orqlaude.stdout.log` passed in by the caller.
+   * v0.9.0: surfaces the source so the orchestrator can distinguish
+   * "Agnet never produced output" from "we didn't know where to look."
+   */
+  source: "jsonl" | "stdout_log" | "none";
+  resolvedPath: string | null;
   totalCostUsd: number;
   inputTokens: number;
   outputTokens: number;
@@ -57,13 +85,15 @@ export function jsonlPathFor(cwd: string, sessionId: string): string {
   return path.join(HOME, ".claude", "projects", encodeCwdForProjects(cwd), `${sessionId}.jsonl`);
 }
 
-const cache = new Map<string, CacheEntry>(); // keyed by jsonlPath
+const cache = new Map<string, CacheEntry>(); // keyed by RESOLVED path
 
 function emptySnap(sessionId: string, jsonlPath: string): SessionSnapshot {
   return {
     exists: false,
     sessionId,
     jsonlPath,
+    source: "none",
+    resolvedPath: null,
     totalCostUsd: 0,
     inputTokens: 0,
     outputTokens: 0,
@@ -79,18 +109,64 @@ function emptySnap(sessionId: string, jsonlPath: string): SessionSnapshot {
   };
 }
 
-export async function snapshotSession(cwd: string, sessionId: string): Promise<SessionSnapshot> {
+/**
+ * Pick which stream file to tail. Prefer the canonical Desktop JSONL when it
+ * exists; otherwise fall back to the spawn_via_cli stdout log when the
+ * caller has it on hand.
+ */
+async function resolveStreamSource(
+  jsonlPath: string,
+  stdoutPath: string | undefined
+): Promise<{ path: string; source: "jsonl" | "stdout_log" } | null> {
+  try {
+    await fs.access(jsonlPath);
+    return { path: jsonlPath, source: "jsonl" };
+  } catch {
+    /* JSONL missing - try the stdout-log hint. */
+  }
+  if (stdoutPath) {
+    try {
+      await fs.access(stdoutPath);
+      return { path: stdoutPath, source: "stdout_log" };
+    } catch {
+      /* both gone */
+    }
+  }
+  return null;
+}
+
+export async function snapshotSession(
+  cwd: string,
+  sessionId: string,
+  /**
+   * Optional hint pointing at the `<worktree>/.orqlaude.stdout.log` file for
+   * Agnets spawned via spawn_via_cli. When provided AND the canonical
+   * Desktop JSONL does not exist, the resolver tails this file instead.
+   *
+   * v0.9.0: required for spawn_via_cli observability - the prior versions
+   * always returned an empty snapshot for CLI-spawned Agnets because the
+   * JSONL is never written.
+   */
+  stdoutPath?: string
+): Promise<SessionSnapshot> {
   const jsonlPath = jsonlPathFor(cwd, sessionId);
+  const resolved = await resolveStreamSource(jsonlPath, stdoutPath);
+  if (!resolved) {
+    // Neither file exists - empty snapshot.
+    return emptySnap(sessionId, jsonlPath);
+  }
+
+  const { path: streamPath, source } = resolved;
 
   let stat: { size: number; ino: number; mtimeMs: number };
   try {
-    stat = await fs.stat(jsonlPath);
+    stat = await fs.stat(streamPath);
   } catch (err: any) {
     if (err.code === "ENOENT") return emptySnap(sessionId, jsonlPath);
     throw err;
   }
 
-  let entry = cache.get(jsonlPath);
+  let entry = cache.get(streamPath);
 
   // v0.8.0: invalidate on inode change (file was replaced) OR mtime regression
   // (clock rewind or replace) OR file-shrank (truncate). Catches the same-size
@@ -101,7 +177,7 @@ export async function snapshotSession(cwd: string, sessionId: string): Promise<S
       entry.inode !== stat.ino ||
       entry.mtimeMs > stat.mtimeMs)
   ) {
-    cache.delete(jsonlPath);
+    cache.delete(streamPath);
     entry = undefined;
   }
 
@@ -112,9 +188,11 @@ export async function snapshotSession(cwd: string, sessionId: string): Promise<S
   // Read only the new bytes since last visit.
   const startOffset = entry?.byteOffset ?? 0;
   const carry = entry?.carry ?? "";
-  const snap: SessionSnapshot = entry ? { ...entry.snap, exists: true } : { ...emptySnap(sessionId, jsonlPath), exists: true };
+  const snap: SessionSnapshot = entry
+    ? { ...entry.snap, exists: true, source, resolvedPath: streamPath }
+    : { ...emptySnap(sessionId, jsonlPath), exists: true, source, resolvedPath: streamPath };
 
-  const fh = await fs.open(jsonlPath, "r");
+  const fh = await fs.open(streamPath, "r");
   try {
     const buf = Buffer.alloc(stat.size - startOffset);
     if (buf.byteLength > 0) {
@@ -134,7 +212,7 @@ export async function snapshotSession(cwd: string, sessionId: string): Promise<S
       }
       applyEvent(snap, evt);
     }
-    cache.set(jsonlPath, {
+    cache.set(streamPath, {
       byteOffset: stat.size,
       carry: newCarry,
       inode: stat.ino,

@@ -38,6 +38,26 @@ export interface SpawnViaCliResult {
   stdoutPath: string;
   /** v0.7.1+: path to the file we wrote with the --mcp-config payload. */
   mcpConfigPath: string;
+  /**
+   * v0.9.0: path the parent process writes a JSON exit record to when the
+   * child terminates. Shape:
+   *   { exit_code: number|null, signal: string|null, terminated_at: number,
+   *     success: boolean }
+   * Persistent so a restarted orqlaude server can recover terminal state
+   * without waiting for the next status() poll.
+   */
+  exitJsonPath: string;
+}
+
+/**
+ * Shape persisted to `<worktree>/.orqlaude.exit.json` when the child exits.
+ * Read by status() / collect() to short-circuit PID-liveness checks.
+ */
+export interface ChildExitRecord {
+  exit_code: number | null;
+  signal: string | null;
+  terminated_at: number;
+  success: boolean;
 }
 
 export interface SpawnViaCliInput {
@@ -307,6 +327,31 @@ export async function spawnAgnetViaCli(input: SpawnViaCliInput): Promise<SpawnVi
   await stderrFh.close().catch(() => {});
   await stdoutFh.close().catch(() => {});
   const pid = child.pid ?? -1;
+
+  // v0.9.0: write a terminal-state record when the child exits, so
+  // status() / collect() can short-circuit PID-liveness polling.
+  // Registered BEFORE unref() so the listener survives. The orqlaude server
+  // is long-lived, so it WILL receive this event in the same process that
+  // spawned the child. If the server itself restarts before the child
+  // exits, status() falls back to PID-liveness polling - the exit file is
+  // a fast-path optimization, not the source of truth.
+  const exitJsonPath = path.join(wt.path, ".orqlaude.exit.json");
+  child.on("exit", (code, signal) => {
+    const record: ChildExitRecord = {
+      exit_code: code,
+      signal,
+      terminated_at: Date.now(),
+      success: code === 0 && !signal,
+    };
+    // Best-effort write — if the worktree was already cleaned up by the
+    // orchestrator, this silently no-ops. We use the sync API because
+    // 'exit' fires during shutdown and the async fs queue may not flush.
+    try {
+      require("node:fs").writeFileSync(exitJsonPath, JSON.stringify(record, null, 2));
+    } catch {
+      /* worktree gone, or perms issue - status() will fall back to PID poll */
+    }
+  });
   child.unref();
 
   // 7. Healthcheck.
@@ -339,7 +384,25 @@ export async function spawnAgnetViaCli(input: SpawnViaCliInput): Promise<SpawnVi
     stderrPath,
     stdoutPath,
     mcpConfigPath,
+    exitJsonPath,
   };
+}
+
+/**
+ * Read the child-exit record written by the `child.on('exit')` handler in
+ * `spawnAgnetViaCli`. Returns `null` if the file does not exist (child
+ * still running, OR the orqlaude server that owns the listener restarted
+ * before the child exited, OR the worktree was cleaned up).
+ */
+export async function readChildExitRecord(exitJsonPath: string): Promise<ChildExitRecord | null> {
+  try {
+    const content = await fs.readFile(exitJsonPath, "utf8");
+    const parsed = JSON.parse(content) as ChildExitRecord;
+    if (typeof parsed.terminated_at !== "number") return null;
+    return parsed;
+  } catch {
+    return null;
+  }
 }
 
 export async function cleanupPlanWorktrees(projectRoot: string, planId: string): Promise<string[]> {

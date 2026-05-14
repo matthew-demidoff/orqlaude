@@ -28,10 +28,16 @@ export interface TgStatusInfo {
   notes: string[];
 }
 
-const CONFIG_PATH = path.join(os.homedir(), ".orqlaude", "telegram.json");
+// v0.9.0: resolve at call time so tests overriding HOME mid-run see the
+// updated path. The previous module-load-time const captured whatever HOME
+// was at import time, defeating the test's HOME swap.
+function resolveConfigPath(): string {
+  return path.join(os.homedir(), ".orqlaude", "telegram.json");
+}
 
 export async function probeTelegramStatus(stateDir: string): Promise<TgStatusInfo> {
   const notes: string[] = [];
+  const CONFIG_PATH = resolveConfigPath();
   // 1. Config.
   let hasToken = false;
   let whitelistSize = 0;
