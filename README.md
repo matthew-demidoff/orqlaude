@@ -124,12 +124,21 @@ User says: *"Refactor the auth system — magic-link login, update the docs, add
 
 ## State
 
-State lives in `<project>/.orqlaude/`:
+orqlaude resolves its state directory at startup using this order (first match wins):
 
-- `orqlaude-state.json` — plans, tasks, notes, messages, claims. Atomic write via temp+rename.
-- `audit.jsonl` — append-only log of every tool call: `{ ts, tool, args (redacted), ok, durationMs, plan/session ids, summary }`. Inspect with `orqlaude history` or `tail -f .orqlaude/audit.jsonl | jq`.
+1. **`ORQLAUDE_STATE_DIR`** env var — explicit override.
+2. **Git worktree**: if `<cwd>/.git` is a file pointing at `<main>/.git/worktrees/<n>`, use `<main>/.orqlaude` so spawn_task'd children share state with the parent fleet.
+3. **Project root**: if cwd is writable and contains `.git/`, `package.json`, `pyproject.toml`, `Cargo.toml`, or `go.mod`, use `<cwd>/.orqlaude`.
+4. **Home fallback** (covers MCP hosts that launch with `cwd=/`): `~/.orqlaude/projects/<basename>-<sha256hash>/`. orqlaude writes a one-line note to stderr when this kicks in.
 
-Both human-readable. Both `.gitignore`d.
+Check what got resolved: `orqlaude where`, or call `mcp__orqlaude__ping` (returns `state_dir` and `state_dir_source`).
+
+Files inside the dir:
+- `orqlaude-state.json` — plans, tasks, notes, messages, claims. Atomic-write via temp+rename.
+- `audit.jsonl` — append-only log of every tool call. Inspect with `orqlaude history` or `tail -f .orqlaude/audit.jsonl | jq`.
+- `lock` — sidecar file lock used by `update()` for cross-process serialization.
+
+`<project>/.orqlaude/` is `.gitignore`d.
 
 ## Hallucination detection
 

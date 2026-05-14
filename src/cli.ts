@@ -9,6 +9,7 @@ import { snapshotSession } from "./lib/jsonl_tail.js";
 import { loadConfig, saveConfig, CONFIG_PATH } from "./telegram/config.js";
 import { TelegramApi } from "./telegram/api.js";
 import { runBot } from "./telegram/bot.js";
+import { resolveStateDir } from "./lib/state_dir.js";
 
 /**
  * orqlaude CLI — read-only inspection of state + audit log + Telegram setup
@@ -17,9 +18,11 @@ import { runBot } from "./telegram/bot.js";
  * Subcommands:
  *   orqlaude list / status / show / history    — read-only project inspection
  *   orqlaude tg setup / whitelist / start / test / show / help
+ *   orqlaude where                              — show resolved state dir
  */
 
-const STATE_DIR = process.env.ORQLAUDE_STATE_DIR ?? path.join(process.cwd(), ".orqlaude");
+const STATE_DIR_RESOLUTION = resolveStateDir();
+const STATE_DIR = STATE_DIR_RESOLUTION.path;
 
 async function main(): Promise<number> {
   const [cmd, ...rest] = process.argv.slice(2);
@@ -38,6 +41,8 @@ async function main(): Promise<number> {
       return await cmdShow(rest[0]);
     case "history":
       return await cmdHistory(parseLimit(rest));
+    case "where":
+      return cmdWhere();
     case "tg":
       return await cmdTg(rest);
     default:
@@ -55,6 +60,7 @@ Inspection:
   orqlaude status <plan_id>       Refreshed status of one plan
   orqlaude show <plan_id>         Raw plan JSON
   orqlaude history [--limit N]    Tail the audit log (default 30)
+  orqlaude where                  Show resolved state dir (debug)
 
 Telegram:
   orqlaude tg setup               Configure bot token (interactive)
@@ -136,6 +142,15 @@ async function cmdShow(planId: string | undefined): Promise<number> {
     console.error((err as Error).message);
     return 1;
   }
+}
+
+function cmdWhere(): number {
+  console.log(`cwd:        ${STATE_DIR_RESOLUTION.cwd}`);
+  console.log(`state dir:  ${STATE_DIR_RESOLUTION.path}`);
+  console.log(`source:     ${STATE_DIR_RESOLUTION.source}`);
+  console.log(``);
+  console.log(`Resolution order: ORQLAUDE_STATE_DIR env > git worktree > project root > ~/.orqlaude/projects/<hash>`);
+  return 0;
 }
 
 async function cmdHistory(limit: number): Promise<number> {
