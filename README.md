@@ -59,6 +59,22 @@ In your project, add to `.mcp.json` (or copy `.mcp.json.template`):
 
 Restart your Claude Code session. The `mcp__orqlaude__*` tools will appear.
 
+## Spawning Agnets: which tool to use
+
+orqlaude itself doesn't spawn processes — it returns prompts and lets the orchestrator pick a spawn tool. Use them in this priority order:
+
+| Priority | Tool | Isolation | Visibility | When to use |
+|---|---|---|---|---|
+| **1** | `mcp__ccd_session__spawn_task` | git worktree per Agnet | Claude Desktop Code sidebar | **Default.** Worktree-isolated, sandbox-clean, the Agnet shows up as its own session you can switch into. |
+| 2 | Host's `Agent` tool (Claude Code built-in) | none — shares your cwd | tool-use only, not a separate session | Faster, no chip-click. **Loses worktree isolation** — Agnets may race on shared files. `claim_files` from the broker is your only collision signal. |
+| 3 | Shell out `claude -p --worktree …` | explicit `--worktree` flag | JSONL on disk — not in sidebar until Desktop restart | Headless / cron / non-Desktop hosts. |
+
+`next_task` returns a `spawn_strategies[]` array with ready-to-call args for each option, so the orchestrator can pick deliberately. **Picking by habit is the most common way to bypass orqlaude's isolation guarantees** — check the returned strategies and make a conscious choice.
+
+### Orphan detection
+
+If an Agnet is dispatched but doesn't call `mcp__orqlaude__checkin` within 60 s, `status()` flags it in `orphan_alerts[]`. Common cause: the orchestrator used a non-`ccd_session__spawn_task` path and the Agnet skipped (or never reached) the protocol footer that tells it to register.
+
 ## Tool reference
 
 ### Planning (primary Claude)
@@ -191,13 +207,15 @@ False positives are acceptable here — we surface concerns, we don't auto-kill.
 
 ## CLI
 
+Two binaries are installed: `orqlaude` and the short alias `orql`. Use whichever feels right.
+
 ```sh
-orqlaude list                   # every plan in this project
-orqlaude status <plan_id>       # refreshed status of one plan
-orqlaude show <plan_id>         # raw plan JSON
-orqlaude history --limit 50     # tail audit log
-orqlaude where                  # show resolved state dir
-orqlaude help
+orql list                       # every plan in this project
+orql status <plan_id>           # refreshed status of one plan
+orql show <plan_id>             # raw plan JSON
+orql history --limit 50         # tail audit log
+orql where                      # show resolved state dir
+orql help
 ```
 
 Read-only. For active orchestration, use the MCP from inside Claude Code.
