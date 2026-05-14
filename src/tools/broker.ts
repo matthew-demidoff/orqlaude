@@ -1,173 +1,307 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
-import { StateStore, planForSession, findPlan } from "../lib/state.js";
+import {
+  StateStore,
+  planForSession,
+  findPlan,
+  unclaimedTaskById,
+  normalizeClaimPath,
+} from "../lib/state.js";
+import type { AuditLog } from "../lib/audit.js";
 
 /**
- * Broker tools: cross-agent communication, mediated by the primary Claude.
+ * Broker tools.
  *
- *   Child agents call:
- *     - `checkin`     → pull queued messages targeted at them, ack notes they posted
- *     - `post_note`   → share findings with the primary Claude (and indirectly siblings)
- *
- *   Primary Claude calls:
- *     - `poll_notes`     → read all notes posted since last poll
- *     - `send_message`   → queue a directed message for delivery on a child's next checkin
- *
- * The model is pull-based: messages and acks arrive on the child's next
- * `checkin`. Children should call checkin periodically (every few turns).
- * Blocking notes pause the poster until an ack arrives.
+ * v0.2.0:
+ *  • `checkin` accepts an optional `task_id`. If the session is not yet
+ *    registered AND task_id matches a dispatched-but-unclaimed task, the
+ *    session self-registers. This removes the manual register_spawn step.
+ *  • New `claim_files` and `release_files` tools for cross-agent file
+ *    ownership. Conflicting claims are returned to the caller (and surfaced
+ *    to the primary Claude through the next status() call).
  */
 
-export function registerBroker(server: McpServer, store: StateStore): void {
+export function registerBroker(server: McpServer, store: StateStore, audit: AuditLog): void {
   // ---- checkin (child → orqlaude) ------------------------------------------
   server.tool(
     "checkin",
-    "Called BY A SPAWNED AGENT to pull queued messages from the primary Claude and ack any blocking notes you posted. Returns a list of messages (possibly empty) and whether your blocking notes have been acked. Call this every few turns, especially after posting a blocking note.",
+    "Called BY A SPAWNED AGENT. Two purposes: (1) on your FIRST turn, pass your own session_id AND task_id (from the prompt) to self-register. (2) on subsequent turns, pass only session_id to pull queued messages and check ack status. Returns messages (possibly empty), STOP signal status, and ack state of any blocking notes you posted.",
     {
-      session_id: z.string().describe("Your own session id (you can read it from your environment via $CLAUDE_CODE_SESSION_ID, or you were told it when spawned)."),
+      session_id: z.string().describe("Your own session id. Read from $CLAUDE_CODE_SESSION_ID or the prompt."),
+      task_id: z.string().optional().describe("Pass this ONCE on your first checkin to self-register against your task. The prompt you received contains it as `task_id: ...`."),
     },
-    async ({ session_id }) => {
-      const result = await store.update((state) => {
-        const found = planForSession(state, session_id);
-        if (!found) {
+    audit.wrap(
+      "checkin",
+      async ({ session_id, task_id }) => {
+        const result = await store.update((state) => {
+          // Already-registered session?
+          let found = planForSession(state, session_id);
+          let selfRegistered = false;
+          // First-turn self-registration path.
+          if (!found && task_id) {
+            const target = unclaimedTaskById(state, task_id);
+            if (target) {
+              target.task.spawnedSessionId = session_id;
+              target.task.status = "running";
+              found = target;
+              selfRegistered = true;
+            }
+          }
+          if (!found) {
+            return {
+              registered: false,
+              note: task_id
+                ? "task_id provided but no matching unclaimed dispatched task. Either the plan moved on or another spawn claimed it."
+                : "This session is not registered. On your first checkin, pass your task_id too (it's in the prompt under 'task_id:').",
+              messages: [],
+              stop_signal: null,
+              blocking_notes_acked: [],
+            };
+          }
+          const { plan, task } = found;
+          // Deliver queued messages.
+          const pending = plan.messages.filter((m) => m.toSessionId === session_id && !m.delivered);
+          let stopSignal: { reason: string; at: number } | null = null;
+          for (const m of pending) {
+            m.delivered = true;
+            m.deliveredAt = Date.now();
+            if (m.kind === "stop") {
+              stopSignal = { reason: m.text, at: m.queuedAt };
+            }
+          }
+          // Surface STOP from task-level flag too.
+          if (!stopSignal && task.stopRequested) {
+            stopSignal = { reason: task.stopRequested.reason, at: task.stopRequested.requestedAt };
+          }
+          const myBlocking = plan.notes.filter((n) => n.fromSessionId === session_id && n.blocking);
           return {
-            registered: false,
-            note: "This session is not registered with orqlaude. The primary Claude likely hasn't called register_spawn yet. Try again in a moment.",
-            messages: [],
-            blocking_notes_acked: [],
+            registered: true,
+            self_registered: selfRegistered,
+            plan_id: plan.id,
+            task_id: task.id,
+            task_title: task.title,
+            messages: pending
+              .filter((m) => m.kind !== "stop")
+              .map((m) => ({ id: m.id, text: m.text, from_task: m.fromTaskId ?? null, queued_at: m.queuedAt })),
+            stop_signal: stopSignal,
+            blocking_notes_acked: myBlocking.map((n) => ({ id: n.id, acked: n.acked })),
+            guidance: stopSignal
+              ? "STOP received — commit what you have and exit."
+              : selfRegistered
+              ? "Registered with the orchestrator. Now do your task."
+              : "Carry on.",
           };
-        }
-        const { plan, task } = found;
-        // Pull undelivered messages.
-        const pending = plan.messages.filter((m) => m.toSessionId === session_id && !m.delivered);
-        for (const m of pending) {
-          m.delivered = true;
-          m.deliveredAt = Date.now();
-        }
-        // Report ack state of this agent's blocking notes.
-        const myBlockingNotes = plan.notes.filter((n) => n.fromSessionId === session_id && n.blocking);
-        return {
-          registered: true,
-          plan_id: plan.id,
-          task_id: task.id,
-          messages: pending.map((m) => ({
-            id: m.id,
-            text: m.text,
-            from_task: m.fromTaskId ?? null,
-            queued_at: m.queuedAt,
-          })),
-          blocking_notes_acked: myBlockingNotes.map((n) => ({ id: n.id, acked: n.acked })),
-        };
-      });
-      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-    }
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      },
+      ({ session_id }) => ({ sessionId: session_id })
+    )
   );
 
   // ---- post_note (child → orqlaude) ----------------------------------------
   server.tool(
     "post_note",
-    "Called BY A SPAWNED AGENT to share a finding or signal the PR URL on completion. Set `blocking: true` only if you must pause until the primary Claude acks. Use sparingly. If posting a PR URL, set `pr_url` so orqlaude attaches it to your task.",
+    "Called BY A SPAWNED AGENT to share a finding or report a PR URL. Set `blocking: true` only when you must pause until the primary Claude acks. Setting `pr_url` attaches it to your task for `collect`.",
     {
-      session_id: z.string().describe("Your session id."),
-      text: z.string().min(1).describe("The note. Keep concise. Example: 'Found that UserSchema.email is now nullable; agents touching auth should be aware.'"),
-      blocking: z.boolean().default(false).describe("If true, you should pause and call `checkin` until you see this note in `blocking_notes_acked` with acked=true."),
-      pr_url: z.string().url().optional().describe("If posting your completion, include the PR URL here so orqlaude.collect picks it up."),
+      session_id: z.string(),
+      text: z.string().min(1),
+      blocking: z.boolean().default(false),
+      pr_url: z.string().url().optional(),
     },
-    async ({ session_id, text, blocking, pr_url }) => {
-      const result = await store.update((state) => {
-        const found = planForSession(state, session_id);
-        if (!found) {
-          return { posted: false, note: "Session not registered with orqlaude." };
-        }
-        const { plan, task } = found;
-        const note = {
-          id: randomUUID(),
-          fromSessionId: session_id,
-          taskId: task.id,
-          text,
-          blocking,
-          postedAt: Date.now(),
-          acked: false,
-        };
-        plan.notes.push(note);
-        if (pr_url) {
-          task.prUrl = pr_url;
-        }
-        return {
-          posted: true,
-          note_id: note.id,
-          blocking,
-          guidance: blocking
-            ? "Now call `checkin` periodically until your note appears in blocking_notes_acked with acked=true."
-            : "Note delivered to broker queue. Continue your work.",
-        };
-      });
-      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-    }
+    audit.wrap(
+      "post_note",
+      async ({ session_id, text, blocking, pr_url }) => {
+        const result = await store.update((state) => {
+          const found = planForSession(state, session_id);
+          if (!found) return { posted: false, note: "Session not registered. Run checkin with task_id first." };
+          const { plan, task } = found;
+          const note = {
+            id: randomUUID(),
+            fromSessionId: session_id,
+            taskId: task.id,
+            text,
+            blocking,
+            postedAt: Date.now(),
+            acked: false,
+            prUrl: pr_url,
+          };
+          plan.notes.push(note);
+          if (pr_url) task.prUrl = pr_url;
+          return {
+            posted: true,
+            note_id: note.id,
+            blocking,
+            guidance: blocking
+              ? "Now call `checkin` periodically until your note appears in blocking_notes_acked with acked=true."
+              : "Note queued. Continue.",
+          };
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      },
+      ({ session_id }) => ({ sessionId: session_id })
+    )
+  );
+
+  // ---- claim_files (child → orqlaude) --------------------------------------
+  server.tool(
+    "claim_files",
+    "Called BY A SPAWNED AGENT to register intent to edit specific files. Returns existing conflicting claims by other sessions; the caller decides whether to coordinate (via post_note) or proceed anyway. Paths can be absolute or relative; relative paths are resolved against the orqlaude server's cwd (the project root).",
+    {
+      session_id: z.string(),
+      paths: z.array(z.string().min(1)).min(1),
+      reason: z.string().optional().describe("Optional human-readable reason for the claim, surfaced to other agents."),
+    },
+    audit.wrap(
+      "claim_files",
+      async ({ session_id, paths, reason }) => {
+        const result = await store.update((state) => {
+          const found = planForSession(state, session_id);
+          if (!found) return { claimed: [], conflicts: [], note: "Session not registered." };
+          const { plan, task } = found;
+          const cwd = process.cwd();
+          const conflicts: Array<{ path: string; claimedBy: string; taskId: string; reason?: string }> = [];
+          const claimed: string[] = [];
+          for (const raw of paths) {
+            const normalized = normalizeClaimPath(raw, cwd);
+            const existing = plan.claims.find((c) => c.path === normalized && c.claimedBy !== session_id);
+            if (existing) {
+              conflicts.push({
+                path: normalized,
+                claimedBy: existing.claimedBy,
+                taskId: existing.taskId,
+                reason: existing.reason,
+              });
+              continue;
+            }
+            const already = plan.claims.find((c) => c.path === normalized && c.claimedBy === session_id);
+            if (!already) {
+              plan.claims.push({
+                path: normalized,
+                claimedBy: session_id,
+                taskId: task.id,
+                reason,
+                claimedAt: Date.now(),
+              });
+            }
+            claimed.push(normalized);
+          }
+          return {
+            claimed,
+            conflicts,
+            guidance: conflicts.length > 0
+              ? "Conflicts found. Consider post_note(blocking=true) to coordinate, or release_files if you don't actually need these paths."
+              : "Claims registered. Other agents will see them.",
+          };
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      },
+      ({ session_id }) => ({ sessionId: session_id })
+    )
+  );
+
+  // ---- release_files (child → orqlaude) ------------------------------------
+  server.tool(
+    "release_files",
+    "Called BY A SPAWNED AGENT to release file claims after finishing edits (or if you decide not to touch them).",
+    {
+      session_id: z.string(),
+      paths: z.array(z.string().min(1)).min(1),
+    },
+    audit.wrap(
+      "release_files",
+      async ({ session_id, paths }) => {
+        const result = await store.update((state) => {
+          const found = planForSession(state, session_id);
+          if (!found) return { released: 0, note: "Session not registered." };
+          const { plan } = found;
+          const cwd = process.cwd();
+          const normalized = new Set(paths.map((p) => normalizeClaimPath(p, cwd)));
+          const before = plan.claims.length;
+          plan.claims = plan.claims.filter((c) => !(c.claimedBy === session_id && normalized.has(c.path)));
+          return { released: before - plan.claims.length };
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      },
+      ({ session_id }) => ({ sessionId: session_id })
+    )
   );
 
   // ---- poll_notes (primary Claude → orqlaude) ------------------------------
   server.tool(
     "poll_notes",
-    "Called BY PRIMARY CLAUDE to read all notes posted by fleet agents. Returns notes since the last poll (or all if first call). Set `mark_acked: true` to ack blocking notes — that unblocks the posting agent on its next checkin.",
+    "Called BY PRIMARY CLAUDE to read notes posted by fleet agents. Returns notes since `since_ts` (or all). Pass `mark_acked` to ack blocking notes — that unblocks the posting agent on its next checkin.",
     {
       plan_id: z.string(),
-      since_ts: z.number().optional().describe("Optional ms-epoch cutoff. If omitted, returns all unacked notes plus any not-yet-seen ones."),
-      mark_acked: z.array(z.string()).optional().describe("Note ids to mark as acked (unblocks blocking posters)."),
+      since_ts: z.number().optional(),
+      mark_acked: z.array(z.string()).optional(),
     },
-    async ({ plan_id, since_ts, mark_acked }) => {
-      const result = await store.update((state) => {
-        const plan = findPlan(state, plan_id);
-        if (mark_acked && mark_acked.length > 0) {
-          for (const noteId of mark_acked) {
-            const n = plan.notes.find((x) => x.id === noteId);
-            if (n) n.acked = true;
+    audit.wrap(
+      "poll_notes",
+      async ({ plan_id, since_ts, mark_acked }) => {
+        const result = await store.update((state) => {
+          const plan = findPlan(state, plan_id);
+          if (mark_acked) {
+            for (const id of mark_acked) {
+              const n = plan.notes.find((x) => x.id === id);
+              if (n) n.acked = true;
+            }
           }
-        }
-        const cutoff = since_ts ?? 0;
-        const notes = plan.notes
-          .filter((n) => n.postedAt >= cutoff)
-          .map((n) => ({
-            id: n.id,
-            from_task_id: n.taskId,
-            from_session_id: n.fromSessionId,
-            text: n.text,
-            blocking: n.blocking,
-            acked: n.acked,
-            posted_at: n.postedAt,
-          }));
-        return { plan_id, notes };
-      });
-      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-    }
+          const cutoff = since_ts ?? 0;
+          const notes = plan.notes
+            .filter((n) => n.postedAt >= cutoff)
+            .map((n) => ({
+              id: n.id,
+              from_task_id: n.taskId,
+              from_session_id: n.fromSessionId,
+              text: n.text,
+              blocking: n.blocking,
+              acked: n.acked,
+              posted_at: n.postedAt,
+              pr_url: n.prUrl ?? null,
+            }));
+          return { plan_id, notes };
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      },
+      ({ plan_id }) => ({ planId: plan_id })
+    )
   );
 
   // ---- send_message (primary Claude → child) -------------------------------
   server.tool(
     "send_message",
-    "Called BY PRIMARY CLAUDE to queue a directed message for a child agent. Delivered on the child's next `checkin`. Use this for cross-cutting heads-up like 'agent B changed the auth schema; here's the new signature'.",
+    "Called BY PRIMARY CLAUDE to queue a directed message for a child agent. Delivered on its next checkin. Set `kind: 'stop'` to signal that the agent should commit-and-exit.",
     {
       plan_id: z.string(),
-      to_session_id: z.string().describe("Target child session id."),
+      to_session_id: z.string(),
       text: z.string().min(1),
-      from_task_id: z.string().optional().describe("Optional: which sibling this message is about (for attribution)."),
+      from_task_id: z.string().optional(),
+      kind: z.enum(["directed", "stop"]).default("directed"),
     },
-    async ({ plan_id, to_session_id, text, from_task_id }) => {
-      const result = await store.update((state) => {
-        const plan = findPlan(state, plan_id);
-        const msg = {
-          id: randomUUID(),
-          toSessionId: to_session_id,
-          fromTaskId: from_task_id,
-          text,
-          queuedAt: Date.now(),
-          delivered: false,
-        };
-        plan.messages.push(msg);
-        return { plan_id, message_id: msg.id, queued: true };
-      });
-      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-    }
+    audit.wrap(
+      "send_message",
+      async ({ plan_id, to_session_id, text, from_task_id, kind }) => {
+        const result = await store.update((state) => {
+          const plan = findPlan(state, plan_id);
+          plan.messages.push({
+            id: randomUUID(),
+            toSessionId: to_session_id,
+            fromTaskId: from_task_id,
+            text,
+            queuedAt: Date.now(),
+            delivered: false,
+            kind,
+          });
+          if (kind === "stop") {
+            const task = plan.tasks.find((t) => t.spawnedSessionId === to_session_id);
+            if (task) task.stopRequested = { reason: text, requestedAt: Date.now() };
+          }
+          return { plan_id, queued: true, kind };
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      },
+      ({ plan_id }) => ({ planId: plan_id })
+    )
   );
 }

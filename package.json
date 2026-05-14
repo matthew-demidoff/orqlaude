@@ -1,6 +1,6 @@
 {
-  "name": "orqlaude",
-  "version": "0.1.0",
+  "name": "@synaplink/orqlaude",
+  "version": "0.2.0",
   "description": "Multi-agent orchestrator for Claude Code. Lets a primary session spawn N parallel agents, each in its own worktree, with budget caps, broker messaging, and PR creation.",
   "type": "module",
   "bin": {
