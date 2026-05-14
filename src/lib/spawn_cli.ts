@@ -1,4 +1,4 @@
-import { execSync, spawn } from "node:child_process";
+import { execSync, spawn, spawnSync } from "node:child_process";
 import { promises as fs, existsSync, readdirSync, statSync, readFileSync, accessSync, constants } from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -102,6 +102,23 @@ export function findGitRoot(start: string): string {
   }
 }
 
+/**
+ * Git branch names have to satisfy git-check-ref-format. Most plain ASCII is
+ * OK; rejected: spaces, ASCII control chars, `:`, `?`, `*`, `[`, `\`, `~`,
+ * `^`, two consecutive dots, leading slash, trailing slash, trailing `.lock`,
+ * and `@{`. We strip anything not in a safe whitelist instead of trying to
+ * match git's rules exactly.
+ */
+function sanitizeBranchName(name: string, fallback: string): string {
+  const cleaned = name
+    .replace(/[^A-Za-z0-9._/-]/g, "-")
+    .replace(/\.\./g, ".")
+    .replace(/^[./-]+/, "")
+    .replace(/[./-]+$/, "")
+    .replace(/-+/g, "-");
+  return cleaned || fallback;
+}
+
 export async function createWorktreeForTask(input: {
   projectRoot: string;
   planId: string;
@@ -118,18 +135,38 @@ export async function createWorktreeForTask(input: {
   const worktreeBase = path.join(input.projectRoot, ".orqlaude-worktrees");
   await fs.mkdir(worktreeBase, { recursive: true });
   const wtPath = path.join(worktreeBase, `${planShort}-${agnetSlug}`);
-  const branch = input.branchHint ? input.branchHint : `fleet/${planShort}/${agnetSlug}`;
+  const rawBranch = input.branchHint ? input.branchHint : `fleet/${planShort}/${agnetSlug}`;
+  // v0.8.0: defense-in-depth even though we spawn without a shell. A
+  // pathological branchHint can still break git itself if it contains
+  // characters git refuses. Sanitize aggressively.
+  const branch = sanitizeBranchName(rawBranch, `fleet/${planShort}/${agnetSlug}`);
   if (existsSync(wtPath)) {
     return { path: wtPath, branch };
   }
-  try {
-    execSync(`git worktree add "${wtPath}" -b "${branch}"`, { cwd: input.projectRoot, stdio: "pipe" });
-  } catch (err: any) {
-    const msg = (err.stderr?.toString?.() ?? err.message ?? "").toLowerCase();
+  // v0.8.0: use spawnSync with shell:false to defeat shell-injection via
+  // crafted branchHint or projectRoot paths. The previous code spliced both
+  // into a template string passed to execSync, which was vulnerable.
+  const result = spawnSync("git", ["worktree", "add", wtPath, "-b", branch], {
+    cwd: input.projectRoot,
+    stdio: "pipe",
+  });
+  if (result.status !== 0) {
+    const msg = (result.stderr?.toString() ?? "").toLowerCase();
     if (msg.includes("already exists")) {
-      execSync(`git worktree add "${wtPath}" "${branch}"`, { cwd: input.projectRoot, stdio: "pipe" });
+      // Branch exists already — check it out into the worktree without -b.
+      const retry = spawnSync("git", ["worktree", "add", wtPath, branch], {
+        cwd: input.projectRoot,
+        stdio: "pipe",
+      });
+      if (retry.status !== 0) {
+        throw new Error(
+          `git worktree add failed (status ${retry.status}): ${retry.stderr?.toString() ?? "(no stderr)"}`
+        );
+      }
     } else {
-      throw err;
+      throw new Error(
+        `git worktree add failed (status ${result.status}): ${result.stderr?.toString() ?? "(no stderr)"}`
+      );
     }
   }
   return { path: wtPath, branch };
@@ -255,14 +292,16 @@ export async function spawnAgnetViaCli(input: SpawnViaCliInput): Promise<SpawnVi
   const commandLine = `${quoteArg(claudeBin)} ${args.map(quoteArg).join(" ")}`;
 
   // 6. Spawn detached with stdio piped to our log files.
+  // v0.8.0: sanitize the env first. orqlaude runs inside the Claude Desktop
+  // app, which sets a long list of CLAUDE_CODE_* vars (entrypoint, session
+  // id, provider-managed-by-host) intended for that hosted runtime. If those
+  // bleed into a spawned standalone `claude -p`, the child either fails to
+  // authenticate or behaves like a sub-session of a host that isn't there.
   const child = spawn(claudeBin, args, {
     cwd: wt.path,
     detached: true,
     stdio: ["ignore", stdoutFh.fd, stderrFh.fd],
-    env: {
-      ...process.env,
-      ORQLAUDE_STATE_DIR: input.stateDir,
-    },
+    env: sanitizeChildEnv({ ORQLAUDE_STATE_DIR: input.stateDir }),
   });
   // Close our FDs — the child holds its own dup'd copies via stdio.
   await stderrFh.close().catch(() => {});
@@ -338,6 +377,46 @@ async function readSafe(p: string, maxBytes: number): Promise<string> {
   } catch {
     return "";
   }
+}
+
+/**
+ * Env vars to STRIP when spawning a standalone `claude -p` child.
+ *
+ * These come from orqlaude running inside the Claude Desktop app's
+ * embedded runtime. The Desktop app talks to its hosted CLI via stdio +
+ * these env-var hints. When we spawn a fresh detached claude process, those
+ * hints make the child think it's still attached to the host — typical
+ * symptom is "Not logged in" because CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1
+ * tells the child to defer authentication to the host's IPC channel, which
+ * doesn't exist for our detached spawn.
+ *
+ * We keep HOME, USER, PATH, LANG, LC_*, TERM, SHELL, and the user's own
+ * Anthropic auth env vars (unless they're empty, which signals the host was
+ * managing them).
+ */
+const HOST_ENV_STRIP_PREFIXES = ["CLAUDE_CODE_", "CLAUDE_AGENT_"];
+const HOST_ENV_STRIP_KEYS = new Set([
+  "CLAUDECODE",
+  "CLAUDE_EFFORT",
+  "AI_AGENT",
+  "BAGGAGE",
+]);
+
+export function sanitizeChildEnv(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v === undefined) continue;
+    if (HOST_ENV_STRIP_KEYS.has(k)) continue;
+    if (HOST_ENV_STRIP_PREFIXES.some((p) => k.startsWith(p))) continue;
+    // Drop empty Anthropic auth env vars — they're placeholders the host
+    // sets when it manages auth itself. Real values are kept.
+    if ((k === "ANTHROPIC_API_KEY" || k === "ANTHROPIC_AUTH_TOKEN") && v.trim() === "") continue;
+    out[k] = v;
+  }
+  for (const [k, v] of Object.entries(overrides)) {
+    out[k] = v;
+  }
+  return out;
 }
 
 // Re-export for callers who used to import these from spawn_cli.

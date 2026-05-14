@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { isProcessAlive, sleep } from "./process_lib.js";
 
 /**
  * orqlaude state store — single JSON file per project, atomically written
@@ -320,14 +321,27 @@ export class StateStore {
     }
   }
 
+  /**
+   * v0.8.0: every acquisition mints a fresh per-instance UUID and writes it
+   * into the lock file alongside the PID. Release uses that UUID to confirm
+   * we still own the lock before deleting; if another process reclaimed
+   * the lock as "stale" while we were working, we leave it alone instead of
+   * deleting THEIR lock and exposing a race window to a third process.
+   */
+  private currentLockToken: string | null = null;
+
   private async acquireFileLock(): Promise<void> {
     await fs.mkdir(path.dirname(this.lockPath), { recursive: true });
     const start = Date.now();
+    const token = randomUUID();
     while (Date.now() - start < LOCK_TIMEOUT_MS) {
       try {
         const fh = await fs.open(this.lockPath, "wx", 0o600);
-        await fh.write(`${process.pid}\n${Date.now()}\n`);
+        // PID on line 1 (for stale-PID reclaim), token on line 2 (for
+        // ownership verification on release), timestamp on line 3.
+        await fh.write(`${process.pid}\n${token}\n${Date.now()}\n`);
         await fh.close();
+        this.currentLockToken = token;
         return;
       } catch (err: any) {
         if (err.code !== "EEXIST") throw err;
@@ -336,11 +350,21 @@ export class StateStore {
           const held = (await fs.readFile(this.lockPath, "utf8")).split("\n")[0]?.trim();
           const heldPid = parseInt(held ?? "", 10);
           if (Number.isFinite(heldPid) && !isProcessAlive(heldPid)) {
-            await fs.unlink(this.lockPath).catch(() => {});
+            // Race-safe stale-lock reclaim: only delete if the file STILL
+            // contains the same PID (in case the legitimate holder rewrote
+            // it between our reads).
+            try {
+              const recheck = (await fs.readFile(this.lockPath, "utf8")).split("\n")[0]?.trim();
+              if (recheck === String(heldPid)) {
+                await fs.unlink(this.lockPath).catch(() => {});
+              }
+            } catch {
+              /* race: file gone; retry will succeed */
+            }
             continue;
           }
         } catch {
-          /* race: someone deleted it before we read. retry. */
+          /* race: someone deleted/rewrote the file before we read. retry. */
         }
         await sleep(LOCK_RETRY_BASE_MS + Math.random() * LOCK_RETRY_BASE_MS);
       }
@@ -349,9 +373,25 @@ export class StateStore {
   }
 
   private async releaseFileLock(): Promise<void> {
-    await fs.unlink(this.lockPath).catch(() => {
+    const myToken = this.currentLockToken;
+    this.currentLockToken = null;
+    if (!myToken) {
+      await fs.unlink(this.lockPath).catch(() => {});
+      return;
+    }
+    try {
+      const content = await fs.readFile(this.lockPath, "utf8");
+      const heldToken = content.split("\n")[1]?.trim();
+      if (heldToken !== myToken) {
+        // The lock was reclaimed by another process (or our entry was
+        // overwritten). Don't unlink — we'd nuke their lock and let a third
+        // process race in.
+        return;
+      }
+      await fs.unlink(this.lockPath);
+    } catch {
       /* already gone; not fatal */
-    });
+    }
   }
 
   private async persist(state: State): Promise<void> {
@@ -361,19 +401,6 @@ export class StateStore {
     await fs.rename(tmp, this.filePath);
     this.cache = state;
   }
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((res) => setTimeout(res, ms));
 }
 
 /** Forward-compatible migration from earlier schemas. v1 → v3 in one pass. */
