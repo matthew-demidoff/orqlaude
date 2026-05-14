@@ -42,6 +42,10 @@ export interface Task {
   branchHint?: string;
   status: TaskStatus;
   spawnedSessionId?: string;
+  /** Optional per-task token budget hint. If set, status() surfaces a soft
+   *  warning when usage exceeds 70% of this value, separate from the
+   *  plan-wide hard cap. */
+  budgetHintTokens?: number;
   costUsd?: number;
   tokensUsed?: number;
   startedAt?: number;
@@ -49,7 +53,7 @@ export interface Task {
   prUrl?: string;
   summary?: string;
   exitReason?: string;
-  stopRequested?: { reason: string; requestedAt: number };
+  stopRequested?: { reason: string; requestedAt: number; kind: "hard" | "soft" };
 }
 
 export interface Note {
@@ -71,7 +75,13 @@ export interface Message {
   queuedAt: number;
   delivered: boolean;
   deliveredAt?: number;
-  kind?: "directed" | "stop";
+  /**
+   * - `directed`: informational message; agent reads and continues.
+   * - `stop`: hard stop; agent must commit what it has and exit immediately.
+   * - `soft_stop`: polite request to wind down; agent should finish the
+   *   current operation, commit, push, then exit. Used by request_stop.
+   */
+  kind?: "directed" | "stop" | "soft_stop";
 }
 
 export interface FileClaim {

@@ -60,19 +60,21 @@ export function registerBroker(server: McpServer, store: StateStore, audit: Audi
             };
           }
           const { plan, task } = found;
-          // Deliver queued messages.
+          // Deliver queued messages, partitioning by kind.
           const pending = plan.messages.filter((m) => m.toSessionId === session_id && !m.delivered);
-          let stopSignal: { reason: string; at: number } | null = null;
+          let hardStop: { reason: string; at: number } | null = null;
+          let softStop: { reason: string; at: number } | null = null;
           for (const m of pending) {
             m.delivered = true;
             m.deliveredAt = Date.now();
-            if (m.kind === "stop") {
-              stopSignal = { reason: m.text, at: m.queuedAt };
-            }
+            if (m.kind === "stop") hardStop = { reason: m.text, at: m.queuedAt };
+            else if (m.kind === "soft_stop") softStop = { reason: m.text, at: m.queuedAt };
           }
-          // Surface STOP from task-level flag too.
-          if (!stopSignal && task.stopRequested) {
-            stopSignal = { reason: task.stopRequested.reason, at: task.stopRequested.requestedAt };
+          // Task-level flag is the source of truth if no message yet picked up.
+          if (!hardStop && !softStop && task.stopRequested) {
+            const where = { reason: task.stopRequested.reason, at: task.stopRequested.requestedAt };
+            if (task.stopRequested.kind === "soft") softStop = where;
+            else hardStop = where;
           }
           const myBlocking = plan.notes.filter((n) => n.fromSessionId === session_id && n.blocking);
           return {
@@ -82,12 +84,16 @@ export function registerBroker(server: McpServer, store: StateStore, audit: Audi
             task_id: task.id,
             task_title: task.title,
             messages: pending
-              .filter((m) => m.kind !== "stop")
+              .filter((m) => m.kind !== "stop" && m.kind !== "soft_stop")
               .map((m) => ({ id: m.id, text: m.text, from_task: m.fromTaskId ?? null, queued_at: m.queuedAt })),
-            stop_signal: stopSignal,
+            stop_signal: hardStop,        // legacy field; was the only one in v0.3.x
+            hard_stop: hardStop,
+            soft_stop: softStop,
             blocking_notes_acked: myBlocking.map((n) => ({ id: n.id, acked: n.acked })),
-            guidance: stopSignal
-              ? "STOP received — commit what you have and exit."
+            guidance: hardStop
+              ? "HARD STOP received — commit what you have and exit immediately."
+              : softStop
+              ? "Soft stop received — finish your current operation, commit, push, open PR, then exit."
               : selfRegistered
               ? "Registered with the orchestrator. Now do your task."
               : "Carry on.",
@@ -295,7 +301,7 @@ export function registerBroker(server: McpServer, store: StateStore, audit: Audi
           });
           if (kind === "stop") {
             const task = plan.tasks.find((t) => t.spawnedSessionId === to_session_id);
-            if (task) task.stopRequested = { reason: text, requestedAt: Date.now() };
+            if (task) task.stopRequested = { reason: text, requestedAt: Date.now(), kind: "hard" };
           }
           return { plan_id, queued: true, kind };
         });

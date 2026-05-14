@@ -157,7 +157,7 @@ export async function handleCommand(
         if (!task.spawnedSessionId) {
           task.status = "cancelled";
         } else {
-          task.stopRequested = { reason, requestedAt: Date.now() };
+          task.stopRequested = { reason, requestedAt: Date.now(), kind: "hard" };
           plan.messages.push({
             id: crypto.randomUUID(),
             toSessionId: task.spawnedSessionId,

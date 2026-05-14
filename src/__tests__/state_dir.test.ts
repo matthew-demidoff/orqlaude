@@ -20,14 +20,19 @@ async function mkdtempReal(prefix: string): Promise<string> {
 
 const ORIGINAL_CWD = process.cwd();
 const ORIGINAL_STATE_DIR_ENV = process.env.ORQLAUDE_STATE_DIR;
+const ORIGINAL_PWD = process.env.PWD;
 
 function clearEnv() {
   delete process.env.ORQLAUDE_STATE_DIR;
+  // v0.3.3: resolver also consults PWD; clear it so tests are deterministic.
+  delete process.env.PWD;
 }
 
 function restoreEnv() {
   if (ORIGINAL_STATE_DIR_ENV) process.env.ORQLAUDE_STATE_DIR = ORIGINAL_STATE_DIR_ENV;
   else delete process.env.ORQLAUDE_STATE_DIR;
+  if (ORIGINAL_PWD) process.env.PWD = ORIGINAL_PWD;
+  else delete process.env.PWD;
 }
 
 test("ORQLAUDE_STATE_DIR env var wins over everything", () => {
@@ -47,7 +52,7 @@ test("cwd=/ → falls back to ~/.orqlaude/projects/<hash>", async () => {
     assert.ok(r.path.startsWith(path.join(os.homedir(), ".orqlaude", "projects")), `unexpected path: ${r.path}`);
     assert.ok(/-[a-f0-9]{12}$/.test(r.path), `expected 12-char hash suffix: ${r.path}`);
   } finally {
-    process.chdir(ORIGINAL_CWD);
+    process.chdir(ORIGINAL_CWD); restoreEnv();
   }
 });
 
@@ -59,7 +64,7 @@ test("cwd in /tmp/some-empty-dir → home fallback", async () => {
     const r = resolveStateDir();
     assert.equal(r.source, "home-fallback", `non-project dir should fall back, got: ${JSON.stringify(r)}`);
   } finally {
-    process.chdir(ORIGINAL_CWD);
+    process.chdir(ORIGINAL_CWD); restoreEnv();
   }
 });
 
@@ -73,7 +78,7 @@ test("cwd with package.json → uses <cwd>/.orqlaude", async () => {
     assert.equal(r.source, "project-root", `should detect project, got: ${JSON.stringify(r)}`);
     assert.equal(r.path, path.join(proj, ".orqlaude"));
   } finally {
-    process.chdir(ORIGINAL_CWD);
+    process.chdir(ORIGINAL_CWD); restoreEnv();
   }
 });
 
@@ -87,7 +92,7 @@ test("cwd with .git directory → uses <cwd>/.orqlaude (project-root, not worktr
     assert.equal(r.source, "project-root");
     assert.equal(r.path, path.join(proj, ".orqlaude"));
   } finally {
-    process.chdir(ORIGINAL_CWD);
+    process.chdir(ORIGINAL_CWD); restoreEnv();
   }
 });
 
@@ -109,7 +114,7 @@ test("cwd in a git worktree (.git is a file) → resolves to parent checkout's .
     assert.equal(r.source, "worktree", `worktree resolution failed: ${JSON.stringify(r)}`);
     assert.equal(r.path, path.join(main, ".orqlaude"));
   } finally {
-    process.chdir(ORIGINAL_CWD);
+    process.chdir(ORIGINAL_CWD); restoreEnv();
   }
 });
 
@@ -123,6 +128,6 @@ test("home-fallback path is deterministic across calls for the same cwd", async 
     assert.equal(r1.path, r2.path);
     assert.equal(r1.source, "home-fallback");
   } finally {
-    process.chdir(ORIGINAL_CWD);
+    process.chdir(ORIGINAL_CWD); restoreEnv();
   }
 });

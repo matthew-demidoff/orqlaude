@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
-import { StateStore, newPlan, findPlan } from "../lib/state.js";
+import { StateStore, newPlan, findPlan, type Plan } from "../lib/state.js";
 import { estimateAgent, readDailyTokenUsage } from "../lib/budgeting.js";
 import type { AuditLog } from "../lib/audit.js";
 
@@ -17,8 +17,9 @@ const TaskInputSchema = z.object({
   title: z.string().min(1).max(60).describe("Imperative action phrase, <60 chars. Becomes the spawned session's chip label."),
   prompt: z.string().min(1).describe("Self-contained prompt for the spawned agent. Must include file paths, scope, and the directive to commit + open a PR. The agent has no memory of this conversation."),
   tldr: z.string().min(1).describe("1-2 sentence plain-English summary shown to the user as a tooltip."),
-  scope: z.array(z.string()).optional().describe("Optional list of files/dirs this task touches. Informational only; if you want enforcement use claim_files from the broker."),
+  scope: z.array(z.string()).optional().describe("Optional list of files/dirs this task touches. Used (1) to detect overlap with other tasks at plan creation, and (2) as a hint to the spawned agent for which files to claim_files. If two tasks declare the same path, create_plan returns a `scope_overlaps` warning (and rejects with `strict_scope: true`)."),
   branchHint: z.string().optional().describe("Optional suggested branch name. The spawned agent decides the actual name."),
+  budgetHintTokens: z.number().int().positive().optional().describe("Optional per-task token budget hint. status() will surface a soft warning when this task's usage exceeds 70% of this value. The plan-wide budget_cap_tokens still hard-stops everything at 100%."),
 });
 
 const DEFAULT_BUDGET_TOKENS = 500_000;
@@ -31,48 +32,81 @@ export function registerPlanning(server: McpServer, store: StateStore, audit: Au
     {
       root_task: z.string().min(1).describe("The user's original task description, for audit and history."),
       tasks: z.array(TaskInputSchema).min(1).max(12).describe("The decomposed subtasks. Each becomes one spawned agent. Keep under ~6 unless you've discussed a larger fleet."),
-      budget_cap_tokens: z.number().int().positive().default(DEFAULT_BUDGET_TOKENS).describe("Hard ceiling for the whole fleet in tokens. Per-agent cap is derived as budget_cap_tokens / tasks.length. Default 500k tokens (~5 agents × 100k each)."),
+      budget_cap_tokens: z.number().int().positive().default(DEFAULT_BUDGET_TOKENS).describe("Hard ceiling for the whole fleet in tokens. Per-agent cap is derived as budget_cap_tokens / tasks.length unless tasks have individual budgetHintTokens. Default 500k tokens (~5 agents × 100k each)."),
       model_for_estimate: z.string().default("claude-sonnet-4-6").describe("Model assumed for cost estimation (informational USD only; doesn't control what spawn_task uses)."),
       effort_multiplier: z.number().positive().default(1.0).describe("Rough difficulty multiplier. 0.5 trivial, 1 moderate, 2+ heavy refactors."),
+      strict_scope: z.boolean().default(false).describe("If true, reject the plan when two tasks declare overlapping `scope` paths. Default false (warn but allow)."),
     },
     audit.wrap(
       "create_plan",
-      async ({ root_task, tasks, budget_cap_tokens, model_for_estimate, effort_multiplier }) => {
-        const plan = await store.update((state) => {
-          const p = newPlan(root_task, budget_cap_tokens, tasks);
-          const est = estimateAgent(model_for_estimate, effort_multiplier);
-          p.estimatedTokens = est.tokens.totalEffective * p.tasks.length;
-          p.estimatedCostUsd = est.costUsd * p.tasks.length;
-          p.budgetCapUsd = p.budgetCapTokens / 25_000; // rough USD shadow
-          p.perAgentCapUsd = p.budgetCapUsd / p.tasks.length;
-          p.modelForEstimate = model_for_estimate;
-          p.effortMultiplier = effort_multiplier;
-          p.estimatedDurationSec = 60 * Math.max(2, Math.ceil(4 * effort_multiplier));
-          state.plans[p.id] = p;
-          return p;
-        });
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                {
-                  plan_id: plan.id,
-                  task_count: plan.tasks.length,
-                  budget_cap_tokens: plan.budgetCapTokens,
-                  per_agent_cap_tokens: plan.perAgentCapTokens,
-                  estimated_tokens: plan.estimatedTokens,
-                  estimated_cost_usd: plan.estimatedCostUsd,
-                  estimated_duration_sec: plan.estimatedDurationSec,
-                  tasks: plan.tasks.map((t) => ({ id: t.id, title: t.title, tldr: t.tldr })),
-                  next_step: "Call `request_approval` to build the user prompt.",
-                },
-                null,
-                2
-              ),
-            },
-          ],
+      async ({ root_task, tasks, budget_cap_tokens, model_for_estimate, effort_multiplier, strict_scope }) => {
+        // Pre-check: scope overlap. Surface as warning, or reject if strict.
+        const overlaps = detectScopeOverlaps(tasks);
+        if (overlaps.length > 0 && strict_scope) {
+          throw new Error(
+            `strict_scope: scope overlap between tasks. ${overlaps
+              .map((o) => `"${o.path}" claimed by ${o.tasks.join(" + ")}`)
+              .join("; ")}`
+          );
+        }
+        let plan: Plan;
+        try {
+          plan = await store.update<Plan>((state) => {
+            const p = newPlan(root_task, budget_cap_tokens, tasks);
+            const est = estimateAgent(model_for_estimate, effort_multiplier);
+            p.estimatedTokens = est.tokens.totalEffective * p.tasks.length;
+            p.estimatedCostUsd = est.costUsd * p.tasks.length;
+            p.budgetCapUsd = p.budgetCapTokens / 25_000;
+            p.perAgentCapUsd = p.budgetCapUsd / p.tasks.length;
+            p.modelForEstimate = model_for_estimate;
+            p.effortMultiplier = effort_multiplier;
+            p.estimatedDurationSec = 60 * Math.max(2, Math.ceil(4 * effort_multiplier));
+            state.plans[p.id] = p;
+            return p;
+          });
+        } catch (err: any) {
+          // Diagnose common launch-config failures with a self-describing
+          // message rather than the raw fs error.
+          if (err && (err.code === "EACCES" || err.code === "EPERM" || err.code === "EROFS")) {
+            throw new Error(
+              `orqlaude can't write its state directory (${err.code}). The MCP host probably launched the server from an unwritable cwd. Fix: set ORQLAUDE_STATE_DIR in your .mcp.json env block to a path orqlaude can write to (e.g. \"$HOME/.orqlaude/myproject\"). Original error: ${err.message}`
+            );
+          }
+          if (err && err.code === "ENOENT" && err.path) {
+            throw new Error(
+              `orqlaude can't reach its state directory: ${err.path} (ENOENT). Likely the parent directory doesn't exist or the cwd is invalid. Set ORQLAUDE_STATE_DIR explicitly. Original error: ${err.message}`
+            );
+          }
+          throw err;
+        }
+        const responsePayload: Record<string, unknown> = {
+          plan_id: plan.id,
+          task_count: plan.tasks.length,
+          budget_cap_tokens: plan.budgetCapTokens,
+          per_agent_cap_tokens: plan.perAgentCapTokens,
+          estimated_tokens: plan.estimatedTokens,
+          estimated_cost_usd: plan.estimatedCostUsd,
+          estimated_duration_sec: plan.estimatedDurationSec,
+          tasks: plan.tasks.map((t) => ({
+            id: t.id,
+            title: t.title,
+            tldr: t.tldr,
+            scope: t.scope ?? [],
+            budget_hint_tokens: t.budgetHintTokens ?? null,
+          })),
+          workflow_hint: {
+            phase: "planned",
+            next: "request_approval",
+            full_flow:
+              "create_plan → request_approval (returns ask_user_question for AskUserQuestion) → confirm → loop[next_task → mcp__ccd_session__spawn_task → child self-registers via checkin] → status / poll_notes / send_message → collect → optional review_prs.",
+          },
         };
+        if (overlaps.length > 0) {
+          responsePayload.scope_overlaps = overlaps;
+          responsePayload.scope_overlap_advice =
+            "Tasks declare overlapping scope. They may collide at merge time. Either revise the decomposition, or instruct the agents to use claim_files for serialization. Pass strict_scope=true to fail loudly instead of warning.";
+        }
+        return { content: [{ type: "text", text: JSON.stringify(responsePayload, null, 2) }] };
       },
       (_args, result: any) => ({ planId: tryGetPlanId(result) })
     )
@@ -207,4 +241,31 @@ function tryGetPlanId(result: any): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Detect scope overlaps between tasks. Returns one entry per overlapping
+ * normalized path with the list of titles that claim it. Normalization is
+ * intentionally simple (lowercase + trim) — false positives are fine here
+ * because we only warn, and false negatives are caught by claim_files at
+ * runtime.
+ */
+function detectScopeOverlaps(
+  tasks: Array<{ title: string; scope?: string[] }>
+): Array<{ path: string; tasks: string[] }> {
+  const map = new Map<string, Set<string>>();
+  for (const t of tasks) {
+    if (!t.scope) continue;
+    for (const raw of t.scope) {
+      const norm = raw.trim().toLowerCase();
+      if (!norm) continue;
+      if (!map.has(norm)) map.set(norm, new Set());
+      map.get(norm)!.add(t.title);
+    }
+  }
+  const out: Array<{ path: string; tasks: string[] }> = [];
+  for (const [norm, titles] of map.entries()) {
+    if (titles.size > 1) out.push({ path: norm, tasks: [...titles] });
+  }
+  return out;
 }
