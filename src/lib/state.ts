@@ -10,70 +10,105 @@ import { randomUUID } from "node:crypto";
  * sufficient for the concurrency we expect (handful of MCP calls per second).
  * If contention becomes a problem, swap to node:sqlite without changing the
  * external API of this module.
+ *
+ * Schema version 2 (v0.2.0): tokens-first budget, file claims, audit
+ * resumability hooks.
  */
 
 export type TaskStatus = "pending" | "dispatched" | "running" | "done" | "failed" | "cancelled";
-export type PlanStatus = "draft" | "estimating" | "awaiting_approval" | "approved" | "dispatching" | "running" | "collected" | "cancelled";
+export type PlanStatus =
+  | "draft"
+  | "estimating"
+  | "awaiting_approval"
+  | "approved"
+  | "dispatching"
+  | "running"
+  | "collected"
+  | "cancelled"
+  | "cancelled_overbudget";
 
 export interface Task {
   id: string;
-  title: string;        // <60 chars; passed to spawn_task as `title`
-  prompt: string;       // the full prompt fed to the spawned agent
-  tldr: string;         // 1-2 sentence summary; passed to spawn_task as `tldr`
-  scope?: string[];     // optional: files/dirs this task touches (informational)
-  branchHint?: string;  // optional: suggested branch name
+  title: string;
+  prompt: string;
+  tldr: string;
+  scope?: string[];
+  branchHint?: string;
   status: TaskStatus;
-  spawnedSessionId?: string;  // populated once register_spawn is called
-  costUsd?: number;     // populated from JSONL tail
-  startedAt?: number;   // ms epoch
+  spawnedSessionId?: string;
+  // Cost / token tracking — populated from JSONL tail.
+  costUsd?: number;
+  tokensUsed?: number;
+  startedAt?: number;
   finishedAt?: number;
-  prUrl?: string;       // populated when agent reports PR opened
-  summary?: string;     // populated on completion (child's final message or human-written)
+  prUrl?: string;
+  summary?: string;
   exitReason?: string;
+  // STOP signal for kill_task. Delivered on next checkin.
+  stopRequested?: { reason: string; requestedAt: number };
 }
 
 export interface Note {
   id: string;
-  fromSessionId: string;     // child session that posted
-  taskId: string;            // which task it belongs to
+  fromSessionId: string;
+  taskId: string;
   text: string;
-  blocking: boolean;         // if true, agent expects an ack before continuing
+  blocking: boolean;
   postedAt: number;
   acked: boolean;
+  prUrl?: string; // optional: PR url attached via post_note (mirrored to task)
 }
 
 export interface Message {
   id: string;
-  toSessionId: string;       // queued for this child session
-  fromTaskId?: string;       // optional: from another agent (via broker)
+  toSessionId: string;
+  fromTaskId?: string;
   text: string;
   queuedAt: number;
   delivered: boolean;
   deliveredAt?: number;
+  kind?: "directed" | "stop"; // "stop" → child agent must terminate
+}
+
+export interface FileClaim {
+  path: string;          // canonical path (absolute, normalized)
+  claimedBy: string;     // session id of the claiming agent
+  taskId: string;
+  reason?: string;
+  claimedAt: number;
 }
 
 export interface Plan {
   id: string;
   createdAt: number;
-  rootTask: string;          // user's original task description
-  budgetCapUsd: number;      // total cap; per-agent cap is budgetCapUsd / tasks.length
-  perAgentCapUsd: number;
+  rootTask: string;
+  // Token budget (Max-friendly). USD remains tracked but isn't the gate.
+  budgetCapTokens: number;
+  perAgentCapTokens: number;
+  estimatedTokens?: number;
+  // USD informational fields (carried for legacy / non-Max users).
+  budgetCapUsd?: number;
+  perAgentCapUsd?: number;
   estimatedCostUsd?: number;
   estimatedDurationSec?: number;
+  modelForEstimate?: string;
+  effortMultiplier?: number;
   status: PlanStatus;
-  approvalToken?: string;    // generated at request_approval, consumed at confirm
+  approvalToken?: string;
   approvedAt?: number;
   tasks: Task[];
   notes: Note[];
   messages: Message[];
+  claims: FileClaim[];
+  reviewPlanId?: string; // populated when review_prs spawns a review fleet
 }
 
 export interface State {
-  schemaVersion: 1;
-  plans: Record<string, Plan>;  // keyed by plan id
+  schemaVersion: 2;
+  plans: Record<string, Plan>;
 }
 
-const EMPTY_STATE: State = { schemaVersion: 1, plans: {} };
+const EMPTY_STATE: State = { schemaVersion: 2, plans: {} };
 
 export class StateStore {
   private filePath: string;
@@ -88,7 +123,8 @@ export class StateStore {
     if (this.cache) return this.cache;
     try {
       const raw = await fs.readFile(this.filePath, "utf8");
-      this.cache = JSON.parse(raw) as State;
+      const parsed = JSON.parse(raw) as Partial<State>;
+      this.cache = migrate(parsed);
     } catch (err: any) {
       if (err.code === "ENOENT") {
         this.cache = structuredClone(EMPTY_STATE);
@@ -99,7 +135,6 @@ export class StateStore {
     return this.cache!;
   }
 
-  /** Read-modify-write under a serial lock so concurrent MCP calls don't race. */
   async update<T>(mutator: (state: State) => T | Promise<T>): Promise<T> {
     let release: () => void = () => {};
     const next = new Promise<void>((res) => (release = res));
@@ -130,9 +165,31 @@ export class StateStore {
   }
 }
 
+/** Forward-compatible migration from earlier schemas. */
+function migrate(input: Partial<State> & { schemaVersion?: number }): State {
+  const v = input.schemaVersion ?? 1;
+  if (v === 2 && input.plans) return input as State;
+  // v1 → v2: synthesize token fields from USD if missing.
+  const out: State = { schemaVersion: 2, plans: {} };
+  for (const [id, plan] of Object.entries(input.plans ?? {})) {
+    const p = plan as Plan & { budgetCapUsd?: number; perAgentCapUsd?: number };
+    out.plans[id] = {
+      ...p,
+      budgetCapTokens: p.budgetCapTokens ?? Math.round((p.budgetCapUsd ?? 5) * 25_000), // rough $0.04/k
+      perAgentCapTokens: p.perAgentCapTokens ?? Math.round((p.perAgentCapUsd ?? 1) * 25_000),
+      claims: p.claims ?? [],
+    } as Plan;
+  }
+  return out;
+}
+
 // ---- Plan helpers (pure functions; mutator-friendly) ----
 
-export function newPlan(rootTask: string, budgetCapUsd: number, tasksInput: Array<Omit<Task, "id" | "status">>): Plan {
+export function newPlan(
+  rootTask: string,
+  budgetCapTokens: number,
+  tasksInput: Array<Omit<Task, "id" | "status">>
+): Plan {
   const tasks: Task[] = tasksInput.map((t) => ({
     ...t,
     id: randomUUID(),
@@ -142,12 +199,13 @@ export function newPlan(rootTask: string, budgetCapUsd: number, tasksInput: Arra
     id: randomUUID(),
     createdAt: Date.now(),
     rootTask,
-    budgetCapUsd,
-    perAgentCapUsd: tasks.length > 0 ? budgetCapUsd / tasks.length : budgetCapUsd,
+    budgetCapTokens,
+    perAgentCapTokens: tasks.length > 0 ? Math.floor(budgetCapTokens / tasks.length) : budgetCapTokens,
     status: "draft",
     tasks,
     notes: [],
     messages: [],
+    claims: [],
   };
 }
 
@@ -167,10 +225,30 @@ export function findTaskBySession(plan: Plan, sessionId: string): Task | undefin
   return plan.tasks.find((t) => t.spawnedSessionId === sessionId);
 }
 
+/** Locate the plan+task a given child session belongs to. */
 export function planForSession(state: State, sessionId: string): { plan: Plan; task: Task } | undefined {
   for (const plan of Object.values(state.plans)) {
     const task = findTaskBySession(plan, sessionId);
     if (task) return { plan, task };
   }
   return undefined;
+}
+
+/**
+ * Find a dispatched-but-unclaimed task by task_id. Used for self-registration:
+ * when a freshly-spawned child agent calls `checkin` with its task_id (which we
+ * embed in the spawn prompt), we can adopt it.
+ */
+export function unclaimedTaskById(state: State, taskId: string): { plan: Plan; task: Task } | undefined {
+  for (const plan of Object.values(state.plans)) {
+    const task = plan.tasks.find((t) => t.id === taskId && !t.spawnedSessionId);
+    if (task) return { plan, task };
+  }
+  return undefined;
+}
+
+/** Normalize a path for claim comparison (handle . , .. , trailing slash, case). */
+export function normalizeClaimPath(p: string, cwd: string): string {
+  const abs = path.isAbsolute(p) ? p : path.resolve(cwd, p);
+  return path.normalize(abs);
 }
