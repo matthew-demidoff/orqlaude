@@ -164,6 +164,33 @@ test("v0.7.1: --mcp-config is a PATH (written to worktree), not inline JSON", as
   assert.ok(parsed.mcpServers.orqlaude.args?.length >= 1, "should have args[]");
 });
 
+test("v0.7.3: --verbose is paired with --output-format=stream-json", async () => {
+  const falseBin = existsSync("/bin/false") ? "/bin/false" : "/usr/bin/false";
+  if (!existsSync(falseBin)) return;
+  const dir = await mkTempGitRepo();
+  let captured: string | null = null;
+  try {
+    await spawnAgnetViaCli({
+      projectRoot: dir,
+      stateDir: path.join(dir, ".orqlaude"),
+      planId: "8badf00d-aaaa-bbbb-cccc-dddddddddddd",
+      taskId: "66666666-7777-8888-9999-aaaaaaaaaaaa",
+      agnetName: "Verbose",
+      prompt: "P",
+      claudeBin: falseBin,
+      healthCheckDelayMs: 500,
+    });
+  } catch (err) {
+    captured = (err as Error).message;
+  }
+  assert.ok(captured, "expected the spawn to fail and surface the command line");
+  const cmd = captured!.match(/Command line:\n\s*(.+)/)![1];
+  // The claude CLI requires --verbose whenever --output-format=stream-json
+  // is used (otherwise it bails with a pairing error).
+  assert.match(cmd, /--verbose/, `expected --verbose in the command line; got:\n${cmd}`);
+  assert.match(cmd, /--output-format\s+stream-json/, `expected --output-format stream-json; got:\n${cmd}`);
+});
+
 test("v0.7.2: `--` separator appears between the last flag and the prompt", async () => {
   // claude has multiple variadic flags (--mcp-config, --add-dir,
   // --allowedTools, --betas, --file, --tools, --disallowedTools). Without
