@@ -20,7 +20,7 @@ export function registerPing(server: McpServer): void {
       const payload = {
         ok: warnings.length === 0,
         server: "orqlaude",
-        version: "0.4.0",
+        version: "0.5.0",
         cwd: realCwd,
         cwd_source: stateRes.cwdSource,
         state_dir: stateRes.path,
