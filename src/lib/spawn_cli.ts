@@ -221,6 +221,15 @@ export async function spawnAgnetViaCli(input: SpawnViaCliInput): Promise<SpawnVi
   // 5. Build argv — prompt is the LAST positional. Putting it earlier was
   //    causing claude to interpret natural-language prompts as a [command]
   //    name and exit silently. See v0.7.0 changelog.
+  //
+  //    v0.7.2: insert the standard `--` end-of-options marker before the
+  //    prompt. Multiple claude flags are VARIADIC (--mcp-config, --add-dir,
+  //    --allowedTools, --betas, --file, --tools, --disallowedTools); without
+  //    `--`, commander.js greedily eats the prompt as another value for
+  //    whichever variadic flag came last. The dev caught this when claude
+  //    --mcp-config <path> <prompt> was being parsed as `--mcp-config [path,
+  //    prompt]` and bailing on the prompt-as-a-filepath open(). `--` stops
+  //    that greedy parsing universally.
   const args: string[] = [
     "--print",
     "--session-id",
@@ -235,7 +244,8 @@ export async function spawnAgnetViaCli(input: SpawnViaCliInput): Promise<SpawnVi
   if (input.budgetCapUsd) {
     args.push("--max-budget-usd", String(input.budgetCapUsd));
   }
-  args.push(input.prompt); // positional — must be LAST
+  args.push("--"); // v0.7.2: stop variadic flags from eating the prompt
+  args.push(input.prompt); // positional — must be LAST and after `--`
 
   const commandLine = `${quoteArg(claudeBin)} ${args.map(quoteArg).join(" ")}`;
 

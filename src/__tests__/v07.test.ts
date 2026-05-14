@@ -164,6 +164,41 @@ test("v0.7.1: --mcp-config is a PATH (written to worktree), not inline JSON", as
   assert.ok(parsed.mcpServers.orqlaude.args?.length >= 1, "should have args[]");
 });
 
+test("v0.7.2: `--` separator appears between the last flag and the prompt", async () => {
+  // claude has multiple variadic flags (--mcp-config, --add-dir,
+  // --allowedTools, --betas, --file, --tools, --disallowedTools). Without
+  // an explicit end-of-options marker, the parser greedily eats the prompt
+  // as another value for whichever variadic flag came last.
+  const falseBin = existsSync("/bin/false") ? "/bin/false" : "/usr/bin/false";
+  if (!existsSync(falseBin)) return;
+  const dir = await mkTempGitRepo();
+  let captured: string | null = null;
+  try {
+    await spawnAgnetViaCli({
+      projectRoot: dir,
+      stateDir: path.join(dir, ".orqlaude"),
+      planId: "cafef00d-aaaa-bbbb-cccc-dddddddddddd",
+      taskId: "55555555-6666-7777-8888-999999999999",
+      agnetName: "DashDash",
+      prompt: "QQQ_PROMPT_QQQ",
+      claudeBin: falseBin,
+      healthCheckDelayMs: 500,
+    });
+  } catch (err) {
+    captured = (err as Error).message;
+  }
+  assert.ok(captured, "expected the spawn to fail and surface the command line");
+  const cmd = captured!.match(/Command line:\n\s*(.+)/)![1];
+  // `--` should appear, AND it should appear AFTER --mcp-config <path>
+  // (i.e. after the last variadic flag), AND before the prompt sentinel.
+  const dashDashIdx = cmd.indexOf(" -- ");
+  const promptIdx = cmd.indexOf("QQQ_PROMPT_QQQ");
+  const mcpFlagIdx = cmd.indexOf("--mcp-config");
+  assert.ok(dashDashIdx > 0, `expected \` -- \` in command line; got:\n${cmd}`);
+  assert.ok(dashDashIdx > mcpFlagIdx, `\` -- \` must come after --mcp-config`);
+  assert.ok(promptIdx > dashDashIdx, `prompt must come after \` -- \``);
+});
+
 async function mkTempGitRepo(): Promise<string> {
   const raw = await fs.mkdtemp(path.join(os.tmpdir(), "orqlaude-v07-"));
   const real = await fs.realpath(raw);
