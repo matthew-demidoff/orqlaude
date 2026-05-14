@@ -30,9 +30,22 @@ export interface TelegramMessage {
   text?: string;
 }
 
+export interface TelegramCallbackQuery {
+  id: string;
+  from: TelegramUser;
+  data?: string;
+  message?: TelegramMessage;
+}
+
 export interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
+  callback_query?: TelegramCallbackQuery;
+}
+
+export interface InlineKeyboardButton {
+  text: string;
+  callback_data: string;
 }
 
 export class TelegramApi {
@@ -54,20 +67,67 @@ export class TelegramApi {
     return body.result;
   }
 
-  async sendMessage(chatId: number, text: string, opts: { parseMode?: "Markdown" | "HTML" } = {}): Promise<void> {
+  async sendMessage(
+    chatId: number,
+    text: string,
+    opts: { parseMode?: "Markdown" | "HTML"; inlineKeyboard?: InlineKeyboardButton[][] } = {}
+  ): Promise<{ message_id: number }> {
+    const body: Record<string, unknown> = {
+      chat_id: chatId,
+      text,
+      parse_mode: opts.parseMode,
+      disable_web_page_preview: true,
+    };
+    if (opts.inlineKeyboard) {
+      body.reply_markup = { inline_keyboard: opts.inlineKeyboard };
+    }
     const res = await fetch(this.endpoint("sendMessage"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`sendMessage ${res.status}: ${text}`);
+    }
+    const parsed = (await res.json()) as { ok: boolean; result: { message_id: number } };
+    return { message_id: parsed.result.message_id };
+  }
+
+  /** Acknowledge a callback_query so the Telegram client stops the spinner. */
+  async answerCallbackQuery(callbackQueryId: string, text?: string): Promise<void> {
+    const res = await fetch(this.endpoint("answerCallbackQuery"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ callback_query_id: callbackQueryId, text }),
+    });
+    if (!res.ok) {
+      // Non-fatal: log but don't throw. Telegram will eventually time out the
+      // spinner on the client side.
+      process.stderr.write(`[orqlaude tg] answerCallbackQuery ${res.status}: ${await res.text()}\n`);
+    }
+  }
+
+  /** Edit a previously-sent message — used to mark questions as answered. */
+  async editMessageText(
+    chatId: number,
+    messageId: number,
+    text: string,
+    opts: { parseMode?: "Markdown" | "HTML" } = {}
+  ): Promise<void> {
+    const res = await fetch(this.endpoint("editMessageText"), {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         chat_id: chatId,
+        message_id: messageId,
         text,
         parse_mode: opts.parseMode,
         disable_web_page_preview: true,
       }),
     });
     if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`sendMessage ${res.status}: ${body}`);
+      process.stderr.write(`[orqlaude tg] editMessageText ${res.status}: ${await res.text()}\n`);
     }
   }
 

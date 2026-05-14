@@ -1,8 +1,9 @@
-import { StateStore, type Plan } from "../lib/state.js";
+import { StateStore, type Plan, findUserResponseRequest } from "../lib/state.js";
 import { snapshotSession } from "../lib/jsonl_tail.js";
 import { TelegramApi } from "./api.js";
 import { loadConfig, saveConfig, isAuthorized } from "./config.js";
-import type { TelegramMessage } from "./api.js";
+import path from "node:path";
+import type { TelegramMessage, TelegramCallbackQuery } from "./api.js";
 
 /**
  * Telegram command handlers.
@@ -96,7 +97,7 @@ export async function handleCommand(
   // /status <plan_id> ---------------------------------------------------------
   if (text.startsWith("/status")) {
     const planId = text.split(/\s+/)[1];
-    if (!planId) return api.sendMessage(chatId, "usage: /status <plan_id>");
+    if (!planId) return void await api.sendMessage(chatId, "usage: /status <plan_id>");
     try {
       const plan = await stateStore.read((s) => requirePlan(s.plans, planId));
       await api.sendMessage(chatId, await renderStatus(plan, projectDir), { parseMode: "Markdown" });
@@ -108,7 +109,7 @@ export async function handleCommand(
 
   if (text.startsWith("/show")) {
     const planId = text.split(/\s+/)[1];
-    if (!planId) return api.sendMessage(chatId, "usage: /show <plan_id>");
+    if (!planId) return void await api.sendMessage(chatId, "usage: /show <plan_id>");
     try {
       const plan = await stateStore.read((s) => requirePlan(s.plans, planId));
       const json = JSON.stringify(plan, null, 2);
@@ -121,7 +122,7 @@ export async function handleCommand(
 
   if (text.startsWith("/notes")) {
     const planId = text.split(/\s+/)[1];
-    if (!planId) return api.sendMessage(chatId, "usage: /notes <plan_id>");
+    if (!planId) return void await api.sendMessage(chatId, "usage: /notes <plan_id>");
     try {
       const plan = await stateStore.read((s) => requirePlan(s.plans, planId));
       const recent = plan.notes.slice(-10);
@@ -148,7 +149,7 @@ export async function handleCommand(
     const parts = text.split(/\s+/);
     const [, planId, taskId, ...reasonParts] = parts;
     const reason = reasonParts.join(" ") || "killed from Telegram";
-    if (!planId || !taskId) return api.sendMessage(chatId, "usage: /kill <plan_id> <task_id> <reason>");
+    if (!planId || !taskId) return void await api.sendMessage(chatId, "usage: /kill <plan_id> <task_id> <reason>");
     try {
       await stateStore.update((s) => {
         const plan = requirePlan(s.plans, planId);
@@ -182,7 +183,7 @@ export async function handleCommand(
     }
     const [, target, ...rest] = text.split(/\s+/);
     const targetId = Number(target);
-    if (!Number.isFinite(targetId)) return api.sendMessage(chatId, "usage: /whitelist <user_id> [label]");
+    if (!Number.isFinite(targetId)) return void await api.sendMessage(chatId, "usage: /whitelist <user_id> [label]");
     const label = rest.join(" ") || undefined;
     if (!cfg.whitelist.some((w) => w.userId === targetId)) {
       cfg.whitelist.push({ userId: targetId, chatId: targetId, label });
@@ -192,10 +193,114 @@ export async function handleCommand(
     return;
   }
 
+  // /respond <short_id> <text> — user replies to a request_user_response
+  if (text.startsWith("/respond")) {
+    const m = text.match(/^\/respond\s+(\S+)\s+([\s\S]+)$/);
+    if (!m) return void await api.sendMessage(chatId, "usage: /respond <short_id> <your answer>");
+    const [, shortId, answer] = m;
+    const store = new StateStore(path.join(projectDir, ".orqlaude"));
+    let edited: { messageId: number; chatId: number } | null = null;
+    const status = await store.update((state) => {
+      const found = findUserResponseRequest(state, shortId);
+      if (!found) return "not_found";
+      const { req } = found;
+      if (req.response !== undefined) return "already_answered";
+      if (req.cancelled) return "cancelled";
+      if (Date.now() > req.timeoutAt) return "timed_out";
+      req.response = answer;
+      req.respondedAt = Date.now();
+      if (req.telegramMessageId && req.telegramChatId) {
+        edited = { messageId: req.telegramMessageId, chatId: req.telegramChatId };
+      }
+      return "ok";
+    });
+    if (status === "ok") {
+      await api.sendMessage(chatId, `✓ Response recorded for ${shortId}.`);
+      if (edited) {
+        await api.editMessageText(
+          (edited as { messageId: number; chatId: number }).chatId,
+          (edited as { messageId: number; chatId: number }).messageId,
+          `✓ Answered (${shortId}): ${truncateForEdit(answer, 150)}`,
+          { parseMode: "Markdown" }
+        );
+      }
+    } else if (status === "not_found") {
+      await api.sendMessage(chatId, `no request with short_id ${shortId}`);
+    } else {
+      await api.sendMessage(chatId, `request ${shortId}: ${status}`);
+    }
+    return;
+  }
+
   // Default: unknown command
   if (text.startsWith("/")) {
     await api.sendMessage(chatId, `unknown command. /help for the list.`);
   }
+}
+
+/**
+ * Inline-keyboard tap handler. callback_data format: `orq:resp:<shortId>:<optionIdx>`.
+ */
+export async function handleCallbackQuery(
+  api: TelegramApi,
+  q: TelegramCallbackQuery,
+  projectDir: string
+): Promise<void> {
+  const cfg = await loadConfig();
+  const userId = q.from?.id;
+  if (!userId || !isAuthorized(cfg, userId)) {
+    await api.answerCallbackQuery(q.id, "Unauthorized.");
+    return;
+  }
+  const data = q.data ?? "";
+  const m = data.match(/^orq:resp:([^:]+):(\d+)$/);
+  if (!m) {
+    await api.answerCallbackQuery(q.id, "unknown action");
+    return;
+  }
+  const [, shortId, idxStr] = m;
+  const idx = Number(idxStr);
+  const store = new StateStore(path.join(projectDir, ".orqlaude"));
+  let answer: string | null = null;
+  let edited: { messageId: number; chatId: number } | null = null;
+  const status = await store.update((state) => {
+    const found = findUserResponseRequest(state, shortId);
+    if (!found) return "not_found";
+    const { req } = found;
+    if (req.response !== undefined) return "already_answered";
+    if (req.cancelled) return "cancelled";
+    if (Date.now() > req.timeoutAt) return "timed_out";
+    if (!req.options || idx >= req.options.length) return "bad_option";
+    answer = req.options[idx];
+    req.response = answer;
+    req.respondedAt = Date.now();
+    if (req.telegramMessageId && req.telegramChatId) {
+      edited = { messageId: req.telegramMessageId, chatId: req.telegramChatId };
+    }
+    return "ok";
+  });
+  if (status === "ok" && answer !== null) {
+    await api.answerCallbackQuery(q.id, `✓ ${answer as string}`);
+    if (edited) {
+      await api.editMessageText(
+        (edited as { messageId: number; chatId: number }).chatId,
+        (edited as { messageId: number; chatId: number }).messageId,
+        `✓ Answered (${shortId}): *${escapeMdLocal(answer as string)}*`,
+        { parseMode: "Markdown" }
+      );
+    }
+  } else {
+    await api.answerCallbackQuery(q.id, status);
+  }
+}
+
+function escapeMdLocal(s: string): string {
+  return s.replace(/([_*`\[])/g, "\\$1");
+}
+
+function truncateForEdit(s: string, n: number): string {
+  if (s.length <= n) return s;
+  return s.slice(0, n - 1) + "…";
 }
 
 function requirePlan(plans: Record<string, Plan>, planId: string): Plan {

@@ -10,6 +10,7 @@ import { registerDispatch } from "./tools/dispatch.js";
 import { registerBroker } from "./tools/broker.js";
 import { registerLifecycle } from "./tools/lifecycle.js";
 import { registerReview } from "./tools/review.js";
+import { registerUserIo } from "./tools/userio.js";
 
 /**
  * orqlaude — multi-agent orchestrator for Claude Code.
@@ -24,7 +25,7 @@ const audit = new AuditLog(stateDir);
 
 const server = new McpServer({
   name: "orqlaude",
-  version: "0.3.3",
+  version: "0.4.0",
 });
 
 registerPing(server);
@@ -33,6 +34,7 @@ registerDispatch(server, store, audit);
 registerBroker(server, store, audit);
 registerLifecycle(server, store, audit);
 registerReview(server, store, audit);
+registerUserIo(server, store, audit);
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
