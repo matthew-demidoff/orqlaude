@@ -21,7 +21,17 @@ import { randomUUID } from "node:crypto";
  * Schema v2: tokens-first budgets, file claims, lifecycle hooks.
  */
 
-export type TaskStatus = "pending" | "dispatched" | "running" | "done" | "failed" | "cancelled";
+export type TaskStatus =
+  | "pending"
+  | "dispatched"
+  | "running"
+  | "done"
+  | "failed"
+  | "cancelled"
+  /** v0.7.0+: spawn_via_cli succeeded the initial process-create but the
+   *  child exited before producing any JSONL. status() flips a task here
+   *  when PID is dead AND last_activity_at is null. */
+  | "died_at_launch";
 export type PlanStatus =
   | "draft"
   | "estimating"
@@ -47,6 +57,15 @@ export interface Task {
   worktreePath?: string;
   /** v0.5.3+: feature branch the worktree is on. */
   worktreeBranch?: string;
+  /** v0.7.0+: detached child PID. status() uses this to detect children
+   *  that died silently. */
+  pid?: number;
+  /** v0.7.0+: shell-quoted command line spawn_via_cli actually ran. Useful
+   *  for the orchestrator to reproduce a failure by hand. */
+  commandLine?: string;
+  /** v0.7.0+: paths to the captured stdout/stderr log files. */
+  stderrPath?: string;
+  stdoutPath?: string;
   /** v0.5+: Human-friendly Agnet designation (e.g. "Zenith"). Used in CLI
    *  output and Telegram notifications. Stable per task_id. */
   agnetName?: string;

@@ -1,25 +1,29 @@
 import { execSync, spawn } from "node:child_process";
-import { promises as fs, existsSync, readdirSync, statSync, readFileSync } from "node:fs";
+import { promises as fs, existsSync, readdirSync, statSync, readFileSync, accessSync, constants } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { isProcessAlive, sleep } from "./process_lib.js";
 
 /**
  * orqlaude-owned spawning path — sidesteps the host's choice of tool.
  *
- * Why this exists: the host's `Agent` tool runs the spawned worker in the
- * SAME worktree as the orchestrator, so concurrent siblings collide on git
- * operations. The host's `mcp__ccd_session__spawn_task` does create a
- * worktree but the orchestrator can pick the wrong tool by habit. Solving
- * this from inside orqlaude means owning the spawn end-to-end: we create
- * a dedicated worktree per task, pre-allocate the session id, and exec
- * `claude -p` directly.
- *
- * The cost is that the spawned session won't appear in the Claude Desktop
- * sidebar until the app restarts (the JSONL lives in ~/.claude/projects/
- * but the in-memory cache doesn't see it). That's an acceptable tradeoff
- * for correctness.
+ * v0.7.0 hardening:
+ *   • Prompt is the LAST positional arg. The Claude CLI parses
+ *     `[options] [command] [prompt]`; putting the prompt mid-list led to
+ *     it being interpreted as a `[command]` name and silently bailing.
+ *   • stderr + stdout captured to `<worktree>/.orqlaude.stderr.log` and
+ *     `<worktree>/.orqlaude.stdout.log` so we have something to autopsy
+ *     when a child dies at launch.
+ *   • Post-spawn healthcheck: sleep ~1.5s, verify the PID is still alive
+ *     and (when possible) that a JSONL file has appeared. If the child
+ *     died, we throw with the stderr contents + the exact command line
+ *     for reproducibility instead of returning a misleading success.
+ *   • The exact command line is recorded on the Task in state so the
+ *     orchestrator can re-run it by hand for debugging.
+ *   • Pre-spawn validation: confirm the resolved `claude` binary is
+ *     executable; confirm the inline --mcp-config JSON parses.
  */
 
 export interface SpawnViaCliResult {
@@ -28,31 +32,29 @@ export interface SpawnViaCliResult {
   sessionId: string;
   pid: number;
   jsonlPath: string;
+  /** The full `claude -p ...` command we ran (argv joined with shell-safe quoting). */
+  commandLine: string;
+  stderrPath: string;
+  stdoutPath: string;
 }
 
 export interface SpawnViaCliInput {
-  projectRoot: string;        // the git checkout we worktree off of
-  stateDir: string;           // orqlaude's resolved state dir (env-passed to child)
+  projectRoot: string;
+  stateDir: string;
   planId: string;
   taskId: string;
   agnetName?: string;
   prompt: string;
   branchHint?: string;
-  /** Per-task token cap. Wired into --max-budget-usd if model pricing is known;
-   *  primarily here for the future when claude exposes --max-budget-tokens. */
   budgetCapUsd?: number;
   permissionMode?: "bypassPermissions" | "acceptEdits" | "default";
-  /** Override which claude binary to invoke. Defaults to discoverClaudeBinary(). */
   claudeBin?: string;
+  /** Override the default 1500 ms healthcheck delay (mainly for tests). */
+  healthCheckDelayMs?: number;
 }
 
-/**
- * Find the `claude` binary in priority order:
- *   1. CLAUDE_BIN env var (explicit override)
- *   2. `which claude` on PATH
- *   3. macOS bundled location:
- *      ~/Library/Application Support/Claude/claude-code/<version>/claude.app/Contents/MacOS/claude
- */
+const DEFAULT_HEALTHCHECK_MS = 1500;
+
 export function discoverClaudeBinary(): string {
   if (process.env.CLAUDE_BIN && existsSync(process.env.CLAUDE_BIN)) {
     return process.env.CLAUDE_BIN;
@@ -63,11 +65,9 @@ export function discoverClaudeBinary(): string {
   } catch {
     /* not on PATH */
   }
-  // macOS bundled path probe.
   const bundleRoot = path.join(os.homedir(), "Library", "Application Support", "Claude", "claude-code");
   try {
     const entries = readdirSync(bundleRoot);
-    // Highest semver-looking dir wins.
     const versions = entries.filter((e: string) => /^\d/.test(e)).sort().reverse();
     for (const v of versions) {
       const candidate = path.join(bundleRoot, v, "claude.app", "Contents", "MacOS", "claude");
@@ -77,16 +77,10 @@ export function discoverClaudeBinary(): string {
     /* no bundle */
   }
   throw new Error(
-    "claude binary not found. Set CLAUDE_BIN env var, install Claude Code globally, or run from a machine with the Desktop app installed."
+    "claude binary not found. Set CLAUDE_BIN env var, install Claude Code globally (`npm i -g @anthropic-ai/claude-cli`), or run from a machine with the Desktop app installed."
   );
 }
 
-/**
- * Find the project's git root. We look upward from `start` for `.git` (dir
- * or file). If `start` is already in a worktree, the worktree's `.git` file
- * points back at the main checkout — for spawning fresh worktrees we want
- * the MAIN checkout, not a sibling.
- */
 export function findGitRoot(start: string): string {
   let dir = path.resolve(start);
   while (true) {
@@ -94,10 +88,9 @@ export function findGitRoot(start: string): string {
     if (existsSync(dotGit)) {
       const stat = statSync(dotGit);
       if (stat.isFile()) {
-        // worktree pointer: gitdir: <main>/.git/worktrees/<n>
         const content = readFileSync(dotGit, "utf8");
         const m = content.match(/^gitdir:\s*(.+?)\/worktrees\/[^\/\s]+\s*$/m);
-        if (m) return path.dirname(m[1]); // strip /.git to get main checkout
+        if (m) return path.dirname(m[1]);
       }
       return dir;
     }
@@ -107,12 +100,6 @@ export function findGitRoot(start: string): string {
   }
 }
 
-/**
- * Create a fresh worktree dedicated to one task. Worktree path:
- *   <project_root>/.orqlaude-worktrees/<plan_short>-<agnet_or_task>
- *
- * Returns the absolute path and the branch name created.
- */
 export async function createWorktreeForTask(input: {
   projectRoot: string;
   planId: string;
@@ -122,21 +109,20 @@ export async function createWorktreeForTask(input: {
 }): Promise<{ path: string; branch: string }> {
   const planShort = input.planId.slice(0, 8);
   const agnetSlug =
-    (input.agnetName ?? input.taskId.slice(0, 8)).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "agnet";
+    (input.agnetName ?? input.taskId.slice(0, 8))
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-|-$/g, "") || "agnet";
   const worktreeBase = path.join(input.projectRoot, ".orqlaude-worktrees");
   await fs.mkdir(worktreeBase, { recursive: true });
   const wtPath = path.join(worktreeBase, `${planShort}-${agnetSlug}`);
-  const branch = input.branchHint
-    ? input.branchHint
-    : `fleet/${planShort}/${agnetSlug}`;
-  // If the worktree already exists, reuse it (idempotent).
+  const branch = input.branchHint ? input.branchHint : `fleet/${planShort}/${agnetSlug}`;
   if (existsSync(wtPath)) {
     return { path: wtPath, branch };
   }
   try {
     execSync(`git worktree add "${wtPath}" -b "${branch}"`, { cwd: input.projectRoot, stdio: "pipe" });
   } catch (err: any) {
-    // Branch might already exist; retry without -b.
     const msg = (err.stderr?.toString?.() ?? err.message ?? "").toLowerCase();
     if (msg.includes("already exists")) {
       execSync(`git worktree add "${wtPath}" "${branch}"`, { cwd: input.projectRoot, stdio: "pipe" });
@@ -147,11 +133,6 @@ export async function createWorktreeForTask(input: {
   return { path: wtPath, branch };
 }
 
-/**
- * Build a `--mcp-config` JSON inline so the spawned claude session loads
- * orqlaude with the parent's state dir. The child's `process.cwd()` will be
- * the worktree, but its ORQLAUDE_STATE_DIR points back at the parent.
- */
 function buildMcpConfig(serverEntryPath: string, stateDir: string): string {
   return JSON.stringify({
     mcpServers: {
@@ -164,12 +145,50 @@ function buildMcpConfig(serverEntryPath: string, stateDir: string): string {
   });
 }
 
+function quoteArg(s: string): string {
+  // Shell-safe single-quote wrapping for the command-line echo. Doesn't
+  // change what we pass via execve — we never actually run a shell — just
+  // makes the echoed line copy-pasteable.
+  if (/^[A-Za-z0-9._/=:-]+$/.test(s)) return s;
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
 /**
- * Spawn a fresh worktree + a `claude -p` process bound to a pre-allocated
- * session id. Returns immediately — the child runs detached.
+ * Spawn `claude -p` for one task. The flow:
+ *   1. Validate claude binary + mcp-config JSON.
+ *   2. Create the worktree.
+ *   3. Allocate session id + paths.
+ *   4. Open stderr/stdout log files inside the worktree.
+ *   5. Spawn detached.
+ *   6. Healthcheck — sleep ~1.5s, verify the process is alive AND the JSONL
+ *      has been touched. If either check fails, kill any stragglers, read
+ *      stderr, throw with full context.
  */
 export async function spawnAgnetViaCli(input: SpawnViaCliInput): Promise<SpawnViaCliResult> {
   const claudeBin = input.claudeBin ?? discoverClaudeBinary();
+  // 1a. Validate the binary is executable.
+  try {
+    accessSync(claudeBin, constants.X_OK);
+  } catch {
+    throw new Error(
+      `claude binary ${claudeBin} is not executable. Check permissions or set CLAUDE_BIN to a working binary.`
+    );
+  }
+  // 1b. Validate mcp-config JSON parses (sanity check; we built it ourselves).
+  const thisFile = fileURLToPath(import.meta.url);
+  const serverEntry = path.resolve(path.dirname(thisFile), "..", "server.js");
+  const mcpConfig = buildMcpConfig(serverEntry, input.stateDir);
+  try {
+    JSON.parse(mcpConfig);
+  } catch (err) {
+    throw new Error(`Internal: built malformed --mcp-config JSON: ${(err as Error).message}`);
+  }
+  // 1c. Validate server entry exists (otherwise the child will fail to load orqlaude).
+  if (!existsSync(serverEntry)) {
+    throw new Error(`orqlaude server entry not found at ${serverEntry}. Reinstall: npm i -g @synaplink/orqlaude`);
+  }
+
+  // 2. Worktree.
   const wt = await createWorktreeForTask({
     projectRoot: input.projectRoot,
     planId: input.planId,
@@ -177,14 +196,23 @@ export async function spawnAgnetViaCli(input: SpawnViaCliInput): Promise<SpawnVi
     agnetName: input.agnetName,
     branchHint: input.branchHint,
   });
+
+  // 3. Session id + JSONL path.
   const sessionId = randomUUID();
-  // Path to orqlaude's server.js — derived from this file's location.
-  const thisFile = fileURLToPath(import.meta.url);
-  const serverEntry = path.resolve(path.dirname(thisFile), "..", "server.js");
-  const mcpConfig = buildMcpConfig(serverEntry, input.stateDir);
-  const args = [
-    "-p",
-    input.prompt,
+  const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
+  const jsonlPath = path.join(home, ".claude", "projects", wt.path.replace(/\//g, "-"), `${sessionId}.jsonl`);
+
+  // 4. Log files.
+  const stderrPath = path.join(wt.path, ".orqlaude.stderr.log");
+  const stdoutPath = path.join(wt.path, ".orqlaude.stdout.log");
+  const stderrFh = await fs.open(stderrPath, "w");
+  const stdoutFh = await fs.open(stdoutPath, "w");
+
+  // 5. Build argv — prompt is the LAST positional. Putting it earlier was
+  //    causing claude to interpret natural-language prompts as a [command]
+  //    name and exit silently. See v0.7.0 changelog.
+  const args: string[] = [
+    "--print",
     "--session-id",
     sessionId,
     "--output-format",
@@ -197,39 +225,58 @@ export async function spawnAgnetViaCli(input: SpawnViaCliInput): Promise<SpawnVi
   if (input.budgetCapUsd) {
     args.push("--max-budget-usd", String(input.budgetCapUsd));
   }
-  // JSONL ends up at ~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl.
-  const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
-  const jsonlPath = path.join(
-    home,
-    ".claude",
-    "projects",
-    wt.path.replace(/\//g, "-"),
-    `${sessionId}.jsonl`
-  );
-  // Spawn detached so it survives the MCP tool call return.
+  args.push(input.prompt); // positional — must be LAST
+
+  const commandLine = `${quoteArg(claudeBin)} ${args.map(quoteArg).join(" ")}`;
+
+  // 6. Spawn detached with stdio piped to our log files.
   const child = spawn(claudeBin, args, {
     cwd: wt.path,
     detached: true,
-    stdio: "ignore",
+    stdio: ["ignore", stdoutFh.fd, stderrFh.fd],
     env: {
       ...process.env,
       ORQLAUDE_STATE_DIR: input.stateDir,
     },
   });
+  // Close our FDs — the child holds its own dup'd copies via stdio.
+  await stderrFh.close().catch(() => {});
+  await stdoutFh.close().catch(() => {});
+  const pid = child.pid ?? -1;
   child.unref();
+
+  // 7. Healthcheck.
+  const delay = input.healthCheckDelayMs ?? DEFAULT_HEALTHCHECK_MS;
+  if (delay > 0) {
+    await sleep(delay);
+    const alive = isProcessAlive(pid);
+    if (!alive) {
+      // The process is gone within the healthcheck window — almost certainly
+      // an immediate exit. Build a useful error message with the autopsy
+      // material so the orchestrator can act on it.
+      const stderrSnippet = await readSafe(stderrPath, 2000);
+      const stdoutSnippet = await readSafe(stdoutPath, 2000);
+      throw new Error(
+        `Spawned child died at launch (pid=${pid}). The process is gone within ${delay}ms of spawn — claude probably exited on a parse / auth / env error. ` +
+          `Command line:\n  ${commandLine}\n\n` +
+          (stderrSnippet ? `stderr (${stderrPath}):\n${stderrSnippet}\n\n` : `stderr (${stderrPath}) is empty.\n\n`) +
+          (stdoutSnippet ? `stdout (${stdoutPath}):\n${stdoutSnippet}` : "")
+      );
+    }
+  }
+
   return {
     worktreePath: wt.path,
     branch: wt.branch,
     sessionId,
-    pid: child.pid ?? -1,
+    pid,
     jsonlPath,
+    commandLine,
+    stderrPath,
+    stdoutPath,
   };
 }
 
-/**
- * Remove all orqlaude-managed worktrees for a plan. Safe-by-default: only
- * touches paths under <project>/.orqlaude-worktrees/<plan_short>-*.
- */
 export async function cleanupPlanWorktrees(projectRoot: string, planId: string): Promise<string[]> {
   const planShort = planId.slice(0, 8);
   const base = path.join(projectRoot, ".orqlaude-worktrees");
@@ -247,7 +294,6 @@ export async function cleanupPlanWorktrees(projectRoot: string, planId: string):
       execSync(`git worktree remove --force "${wt}"`, { cwd: projectRoot, stdio: "pipe" });
       removed.push(wt);
     } catch {
-      // Worktree might be in an inconsistent state. Force-remove the dir.
       try {
         await fs.rm(wt, { recursive: true, force: true });
         removed.push(wt);
@@ -258,3 +304,15 @@ export async function cleanupPlanWorktrees(projectRoot: string, planId: string):
   }
   return removed;
 }
+
+async function readSafe(p: string, maxBytes: number): Promise<string> {
+  try {
+    const content = await fs.readFile(p, "utf8");
+    return content.slice(0, maxBytes);
+  } catch {
+    return "";
+  }
+}
+
+// Re-export for callers who used to import these from spawn_cli.
+export { isProcessAlive } from "./process_lib.js";

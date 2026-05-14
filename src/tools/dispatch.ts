@@ -4,7 +4,9 @@ import { StateStore, findPlan, findTask } from "../lib/state.js";
 import { jsonlPathFor, snapshotSession } from "../lib/jsonl_tail.js";
 import { detectHallucination, extractToolUses } from "../lib/hallucination.js";
 import { spawnAgnetViaCli, findGitRoot, cleanupPlanWorktrees } from "../lib/spawn_cli.js";
+import { isProcessAlive } from "../lib/process_lib.js";
 import { resolveStateDir } from "../lib/state_dir.js";
+import { promises as fs } from "node:fs";
 import type { AuditLog } from "../lib/audit.js";
 
 /**
@@ -135,9 +137,15 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
             claudeBin: claude_bin,
           });
           // Pre-register the session so checkin from the child is idempotent.
+          // v0.7.0: also record pid + command line + log file paths for
+          // post-mortem and PID-liveness checks in status().
           task.spawnedSessionId = spawn.sessionId;
           task.worktreePath = spawn.worktreePath;
           task.worktreeBranch = spawn.branch;
+          task.pid = spawn.pid;
+          task.commandLine = spawn.commandLine;
+          task.stderrPath = spawn.stderrPath;
+          task.stdoutPath = spawn.stdoutPath;
           task.status = "running";
           task.startedAt = Date.now();
           return {
@@ -149,7 +157,11 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
             branch: spawn.branch,
             pid: spawn.pid,
             jsonl_path: spawn.jsonlPath,
-            next_step: "The Agnet is running detached. Poll status(plan_id) for activity, or read the JSONL directly. The child will call checkin on its first turn — but since we pre-registered the session, that call will be idempotent.",
+            command_line: spawn.commandLine,
+            stderr_path: spawn.stderrPath,
+            stdout_path: spawn.stdoutPath,
+            next_step:
+              "The Agnet is running detached. Poll status(plan_id) for activity. If the child dies silently, status() detects it via PID liveness and flips the task to status=`died_at_launch` with a stderr snippet you can use to debug.",
           };
         });
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
@@ -230,10 +242,41 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
             const snap = await snapshotSession(cwd, t.spawnedSessionId);
             const toolUses = await extractToolUses(jsonlPathFor(cwd, t.spawnedSessionId));
             const hallu = await detectHallucination(toolUses, cwd);
+            const taskWarnings: string[] = [];
+
+            // v0.7.0: PID-liveness check. If we have a recorded pid and it's
+            // no longer alive AND there's no JSONL activity, the child died
+            // silently — flip the task to died_at_launch so the orchestrator
+            // stops polling a corpse.
+            let derivedStatus: typeof t.status = snap.terminated ? "done" : t.status;
+            let stderrExcerpt: string | null = null;
+            if (
+              t.pid &&
+              !isProcessAlive(t.pid) &&
+              !snap.exists &&
+              !snap.lastActivityAt &&
+              (t.status === "running" || t.status === "dispatched")
+            ) {
+              derivedStatus = "died_at_launch";
+              if (t.stderrPath) {
+                try {
+                  const buf = await fs.readFile(t.stderrPath, "utf8");
+                  stderrExcerpt = buf.slice(0, 1000);
+                } catch {
+                  /* file missing or unreadable */
+                }
+              }
+              taskWarnings.push(
+                `Child PID ${t.pid} is dead and no JSONL was written. ` +
+                  `Inspect stderr at ${t.stderrPath ?? "(unknown)"} or re-run the command: ${t.commandLine ?? "(unknown)"}`
+              );
+              // Persist the new status so subsequent calls don't redo this.
+              t.status = "died_at_launch";
+            }
+
             // Per-task soft budget warning: if the task has a budgetHintTokens
             // hint and we've blown past 70% of it, surface a yellow flag so the
             // orchestrator can intervene before the plan-wide hard cap fires.
-            const taskWarnings: string[] = [];
             if (t.budgetHintTokens && snap.totalEffectiveTokens > 0.7 * t.budgetHintTokens) {
               const pct = Math.round((snap.totalEffectiveTokens / t.budgetHintTokens) * 100);
               taskWarnings.push(
@@ -243,8 +286,10 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
             return {
               task_id: t.id,
               title: t.title,
-              status: snap.terminated ? "done" : t.status,
+              status: derivedStatus,
               session_id: t.spawnedSessionId,
+              pid: t.pid ?? null,
+              pid_alive: t.pid ? isProcessAlive(t.pid) : null,
               tokens_used: snap.totalEffectiveTokens,
               budget_hint_tokens: t.budgetHintTokens ?? null,
               cost_usd: snap.totalCostUsd,
@@ -257,6 +302,9 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
               hallucination: { score: hallu.score, level: hallu.level, concerns: hallu.concerns },
               warnings: taskWarnings,
               stop_requested: t.stopRequested ?? null,
+              stderr_excerpt: stderrExcerpt,
+              stderr_path: t.stderrPath ?? null,
+              command_line: t.commandLine ?? null,
             };
           })
         );
@@ -318,6 +366,18 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
           .filter((s: any) => s.hallucination && s.hallucination.score >= 0.3)
           .map((s: any) => ({ task_id: s.task_id, title: s.title, level: s.hallucination.level, concerns: s.hallucination.concerns }));
 
+        // ---- aggregated died-at-launch warning ------------------------------
+        const deadAgents = snapshots
+          .filter((s: any) => s.status === "died_at_launch")
+          .map((s: any) => ({
+            task_id: s.task_id,
+            title: s.title,
+            pid: s.pid,
+            stderr_path: s.stderr_path,
+            stderr_excerpt: s.stderr_excerpt,
+            command_line: s.command_line,
+          }));
+
         return {
           content: [
             {
@@ -332,9 +392,12 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
                   total_cost_usd: totalCost,
                   hallucination_alerts: concerningAgents,
                   orphan_alerts: orphans,
+                  died_at_launch_alerts: deadAgents,
                   agents: snapshots,
                   next_step:
-                    orphans.length > 0
+                    deadAgents.length > 0
+                      ? `${deadAgents.length} Agnet(s) died at launch — claude -p exited before writing any JSONL. Each entry has a stderr_excerpt + command_line for debugging. Common causes: auth not configured (run \`claude auth login\`), malformed --mcp-config, or the prompt parsed as a subcommand name.`
+                      : orphans.length > 0
                       ? `${orphans.length} Agnet(s) appear orphaned — dispatched > 60s without self-registering via checkin. Likely cause: spawn used host Agent tool instead of mcp__ccd_session__spawn_task. Check orphan_alerts[].remedy.`
                       : concerningAgents.length > 0
                       ? "One or more agents show hallucination signs. Consider `send_message` to nudge, or `kill_task` if the agent is irrecoverable."
