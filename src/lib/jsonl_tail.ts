@@ -38,6 +38,12 @@ export interface SessionSnapshot {
 interface CacheEntry {
   byteOffset: number;
   carry: string;          // partial last line not yet terminated by \n
+  /** v0.8.0: inode + mtime of the file when we last cached. If either has
+   *  changed since, the cache is invalidated and we re-read from scratch.
+   *  Defeats the same-size-truncation case where the file is rewritten
+   *  with content of identical length but different content. */
+  inode: number;
+  mtimeMs: number;
   snap: SessionSnapshot;
 }
 
@@ -76,7 +82,7 @@ function emptySnap(sessionId: string, jsonlPath: string): SessionSnapshot {
 export async function snapshotSession(cwd: string, sessionId: string): Promise<SessionSnapshot> {
   const jsonlPath = jsonlPathFor(cwd, sessionId);
 
-  let stat: { size: number };
+  let stat: { size: number; ino: number; mtimeMs: number };
   try {
     stat = await fs.stat(jsonlPath);
   } catch (err: any) {
@@ -86,13 +92,20 @@ export async function snapshotSession(cwd: string, sessionId: string): Promise<S
 
   let entry = cache.get(jsonlPath);
 
-  // If the file shrank or rotated, reset.
-  if (entry && entry.byteOffset > stat.size) {
+  // v0.8.0: invalidate on inode change (file was replaced) OR mtime regression
+  // (clock rewind or replace) OR file-shrank (truncate). Catches the same-size
+  // truncation case the v0.2 cache missed.
+  if (
+    entry &&
+    (entry.byteOffset > stat.size ||
+      entry.inode !== stat.ino ||
+      entry.mtimeMs > stat.mtimeMs)
+  ) {
     cache.delete(jsonlPath);
     entry = undefined;
   }
 
-  if (entry && entry.byteOffset === stat.size) {
+  if (entry && entry.byteOffset === stat.size && entry.mtimeMs === stat.mtimeMs) {
     return entry.snap; // no new data
   }
 
@@ -121,7 +134,13 @@ export async function snapshotSession(cwd: string, sessionId: string): Promise<S
       }
       applyEvent(snap, evt);
     }
-    cache.set(jsonlPath, { byteOffset: stat.size, carry: newCarry, snap });
+    cache.set(jsonlPath, {
+      byteOffset: stat.size,
+      carry: newCarry,
+      inode: stat.ino,
+      mtimeMs: stat.mtimeMs,
+      snap,
+    });
   } finally {
     await fh.close();
   }
