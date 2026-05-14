@@ -12,7 +12,7 @@ export function registerPing(server: McpServer): void {
       const payload = {
         ok: true,
         server: "orqlaude",
-        version: "0.1.0",
+        version: "0.3.1",
         cwd: process.cwd(),
         node: process.version,
         pid: process.pid,

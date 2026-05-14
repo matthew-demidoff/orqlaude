@@ -1,23 +1,25 @@
 {
   "name": "@synaplink/orqlaude",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Multi-agent orchestrator for Claude Code. One primary session decomposes a complex task, gets a single budget approval, then dispatches N parallel agents via the Desktop app's native spawn_task. Tracks cost/status via JSONL tails; brokers messages between agents; detects hallucination; manages PRs.",
   "type": "module",
   "bin": {
-    "orqlaude": "./dist/cli.js"
+    "orqlaude": "./dist/cli.js",
+    "orqlaude-mcp": "./dist/server.js"
   },
   "main": "./dist/server.js",
   "files": [
     "dist",
     "README.md",
+    "LICENSE",
     ".mcp.json.template"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && chmod +x dist/cli.js dist/server.js",
     "dev": "tsc --watch",
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
-    "test": "tsc && node --test dist/__tests__/*.test.js",
+    "test": "npm run build && node --test dist/__tests__/*.test.js",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

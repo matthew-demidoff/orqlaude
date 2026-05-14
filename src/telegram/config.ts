@@ -52,11 +52,28 @@ export async function loadConfig(): Promise<TelegramConfig> {
 }
 
 export async function saveConfig(cfg: TelegramConfig): Promise<void> {
-  await fs.mkdir(CONFIG_DIR, { recursive: true });
-  const tmp = `${CONFIG_PATH}.${process.pid}.tmp`;
-  await fs.writeFile(tmp, JSON.stringify(cfg, null, 2));
+  await fs.mkdir(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  // v0.3.1: create the tmp file with mode 0o600 AND O_EXCL ("wx" flag) from
+  // the start. This closes the race window where the token sat at default
+  // umask (0644) between writeFile and the post-rename chmod, and defeats a
+  // symlink-swap attack on the predictable tmp path.
+  // Use a high-entropy suffix instead of just pid to further reduce
+  // predictability.
+  const suffix = `${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 10)}`;
+  const tmp = `${CONFIG_PATH}.${suffix}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(cfg, null, 2), { mode: 0o600, flag: "wx" });
   await fs.rename(tmp, CONFIG_PATH);
-  await fs.chmod(CONFIG_PATH, 0o600);
+}
+
+export async function loadConfigSafe(): Promise<TelegramConfig> {
+  // Wrapper that swallows JSON parse errors with a warning instead of
+  // crashing the bot. Useful when a partially-written config exists.
+  try {
+    return await loadConfig();
+  } catch (err) {
+    process.stderr.write(`[orqlaude tg] config parse failed, falling back to empty: ${(err as Error).message}\n`);
+    return { ...EMPTY };
+  }
 }
 
 export function isAuthorized(cfg: TelegramConfig, userId: number): boolean {
