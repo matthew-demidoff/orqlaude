@@ -160,6 +160,7 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
             command_line: spawn.commandLine,
             stderr_path: spawn.stderrPath,
             stdout_path: spawn.stdoutPath,
+            mcp_config_path: spawn.mcpConfigPath,
             next_step:
               "The Agnet is running detached. Poll status(plan_id) for activity. If the child dies silently, status() detects it via PID liveness and flips the task to status=`died_at_launch` with a stderr snippet you can use to debug.",
           };

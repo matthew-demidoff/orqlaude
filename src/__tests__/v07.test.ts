@@ -130,6 +130,40 @@ test("spawnAgnetViaCli: prompt is the LAST positional argv element", async () =>
   assert.ok(promptIdx > lastFlagIdx, `prompt must appear after the last flag — got cmd=\n${cmd}`);
 });
 
+test("v0.7.1: --mcp-config is a PATH (written to worktree), not inline JSON", async () => {
+  const falseBin = existsSync("/bin/false") ? "/bin/false" : "/usr/bin/false";
+  if (!existsSync(falseBin)) return;
+  const dir = await mkTempGitRepo();
+  let captured: string | null = null;
+  try {
+    await spawnAgnetViaCli({
+      projectRoot: dir,
+      stateDir: path.join(dir, ".orqlaude"),
+      planId: "feedface-aaaa-bbbb-cccc-dddddddddddd",
+      taskId: "44444444-5555-6666-7777-888888888888",
+      agnetName: "McpPath",
+      prompt: "P",
+      claudeBin: falseBin,
+      healthCheckDelayMs: 500,
+    });
+  } catch (err) {
+    captured = (err as Error).message;
+  }
+  assert.ok(captured, "expected the spawn to fail and surface the command line");
+  // The arg passed to --mcp-config should look like a path, not a JSON body.
+  const cmd = captured!.match(/Command line:\n\s*(.+)/)![1];
+  const m = cmd.match(/--mcp-config\s+(\S+)/);
+  assert.ok(m, "expected --mcp-config <arg> in the command line");
+  const mcpArg = m![1].replace(/^'|'$/g, ""); // strip quotes if present
+  assert.ok(!mcpArg.startsWith("{"), `--mcp-config arg should NOT be inline JSON (got: ${mcpArg.slice(0, 50)}...)`);
+  assert.ok(mcpArg.endsWith(".orqlaude.mcp.json"), `--mcp-config arg should be the .orqlaude.mcp.json path (got: ${mcpArg})`);
+  // The file should exist and contain valid JSON with the expected shape.
+  const body = await fs.readFile(mcpArg, "utf8");
+  const parsed = JSON.parse(body);
+  assert.ok(parsed.mcpServers?.orqlaude?.command, "the written config should have mcpServers.orqlaude.command");
+  assert.ok(parsed.mcpServers.orqlaude.args?.length >= 1, "should have args[]");
+});
+
 async function mkTempGitRepo(): Promise<string> {
   const raw = await fs.mkdtemp(path.join(os.tmpdir(), "orqlaude-v07-"));
   const real = await fs.realpath(raw);
