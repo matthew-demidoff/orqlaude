@@ -21,10 +21,10 @@ import type { AuditLog } from "../lib/audit.js";
  */
 
 export function registerLifecycle(server: McpServer, store: StateStore, audit: AuditLog): void {
-  // ---- kill_task ------------------------------------------------------------
+  // ---- kill_task (HARD STOP) ----------------------------------------------
   server.tool(
     "kill_task",
-    "Stop a running task. Queues a STOP broker message that delivers on the agent's next checkin, AND returns the session id you should pass to `mcp__ccd_session_mgmt__archive_session` if the agent doesn't comply. Use this when an agent is hallucinating, looping, or otherwise off the rails.",
+    "HARD STOP a running task. Queues a STOP broker message saying 'commit what you have and exit immediately', and returns the session id ready for `mcp__ccd_session_mgmt__archive_session` if the agent doesn't comply within ~30s. Use this when an agent is hallucinating, looping, or otherwise off the rails. For a polite 'we don't need this anymore, please wind down' alternative, use `request_stop`.",
     {
       plan_id: z.string(),
       task_id: z.string(),
@@ -40,7 +40,7 @@ export function registerLifecycle(server: McpServer, store: StateStore, audit: A
             task.status = "cancelled";
             return { plan_id, task_id, status: "cancelled_before_spawn", session_id: null };
           }
-          task.stopRequested = { reason, requestedAt: Date.now() };
+          task.stopRequested = { reason, requestedAt: Date.now(), kind: "hard" };
           plan.messages.push({
             id: randomUUID(),
             toSessionId: task.spawnedSessionId,
@@ -56,6 +56,49 @@ export function registerLifecycle(server: McpServer, store: StateStore, audit: A
             queued_stop: true,
             next_step:
               "Wait ~30s for the agent to acknowledge via checkin. If it doesn't terminate cleanly, call `mcp__ccd_session_mgmt__archive_session` with the session_id above.",
+          };
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      },
+      ({ plan_id, task_id }) => ({ planId: plan_id })
+    )
+  );
+
+  // ---- request_stop (SOFT, POLITE) ----------------------------------------
+  server.tool(
+    "request_stop",
+    "POLITE SOFT-STOP. Asks the agent to finish what it's currently doing, commit, push, and exit cleanly. Unlike kill_task this doesn't say 'STOP NOW' — it's appropriate when the user has changed their mind mid-fleet or the work is 'good enough' and you don't want to lose progress. The agent receives a soft_stop message on its next checkin.",
+    {
+      plan_id: z.string(),
+      task_id: z.string(),
+      reason: z.string().describe("Why you're winding down. Shown to the agent so it can decide what 'finish what you're doing' means."),
+    },
+    audit.wrap(
+      "request_stop",
+      async ({ plan_id, task_id, reason }) => {
+        const result = await store.update((state) => {
+          const plan = findPlan(state, plan_id);
+          const task = findTask(plan, task_id);
+          if (!task.spawnedSessionId) {
+            task.status = "cancelled";
+            return { plan_id, task_id, status: "cancelled_before_spawn", session_id: null };
+          }
+          task.stopRequested = { reason, requestedAt: Date.now(), kind: "soft" };
+          plan.messages.push({
+            id: randomUUID(),
+            toSessionId: task.spawnedSessionId,
+            text: `Soft stop requested by orchestrator: ${reason}. Please finish the current operation, commit what you have, push, open a PR, then exit. Don't start any new substantive work.`,
+            queuedAt: Date.now(),
+            delivered: false,
+            kind: "soft_stop",
+          });
+          return {
+            plan_id,
+            task_id,
+            session_id: task.spawnedSessionId,
+            queued_soft_stop: true,
+            next_step:
+              "Poll status() periodically. The agent should terminate cleanly within a few turns. If it ignores the soft-stop or you change your mind toward hard cancel, use kill_task.",
           };
         });
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
@@ -153,6 +196,9 @@ export function registerLifecycle(server: McpServer, store: StateStore, audit: A
               tasks_done: p.tasks.filter((t) => t.status === "done").length,
               tasks_running: p.tasks.filter((t) => t.status === "running" || t.status === "dispatched").length,
               budget_cap_tokens: p.budgetCapTokens,
+              // Dedup union of all task scopes — useful for "which plan owns
+              // this file" lookups without a status() round-trip.
+              expected_files: Array.from(new Set(p.tasks.flatMap((t) => t.scope ?? []))),
             }))
             .sort((a, b) => b.created_at - a.created_at);
         });
