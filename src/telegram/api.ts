@@ -108,6 +108,43 @@ export class TelegramApi {
     }
   }
 
+  /**
+   * Stream a partial draft message. Telegram animates updates that share the
+   * same `draft_id`, and the draft is ephemeral (~30s) — so when the stream
+   * is complete, follow up with a real `sendMessage` to persist the final
+   * content in the chat.
+   *
+   * Returns `{ ok: true }` on success, or `{ ok: false, status, body }` so
+   * callers can fall back to `editMessageText` on older Bot API servers that
+   * don't yet support drafts.
+   */
+  async sendMessageDraft(
+    chatId: number,
+    draftId: number,
+    text: string,
+    opts: { parseMode?: "Markdown" | "HTML"; messageThreadId?: number } = {}
+  ): Promise<{ ok: true } | { ok: false; status: number; body: string }> {
+    if (!Number.isInteger(draftId) || draftId === 0) {
+      throw new Error("draftId must be a non-zero integer");
+    }
+    const body: Record<string, unknown> = {
+      chat_id: chatId,
+      draft_id: draftId,
+      text,
+      parse_mode: opts.parseMode,
+    };
+    if (opts.messageThreadId !== undefined) body.message_thread_id = opts.messageThreadId;
+    const res = await fetch(this.endpoint("sendMessageDraft"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      return { ok: false, status: res.status, body: await res.text() };
+    }
+    return { ok: true };
+  }
+
   /** Edit a previously-sent message — used to mark questions as answered. */
   async editMessageText(
     chatId: number,
