@@ -226,16 +226,42 @@ False positives are acceptable here — we surface concerns, we don't auto-kill.
 
 ## CLI
 
-Two binaries are installed: `orqlaude` and the short alias `orql`. Use whichever feels right.
+Two binaries are installed: `orqlaude` and the short alias `orql`. Use whichever feels right. All commands work the same.
+
+### Live (v0.6+)
 
 ```sh
+orql watch <plan_id>            # live-updating dashboard (1Hz, Ctrl-C to exit)
+orql tail [plan_id]             # tail -f the audit log; filter by plan if given
+orql open <plan_id>             # open every PR from a plan in your browser
+orql doctor                     # end-to-end health check
+orql about                      # the easter egg
+```
+
+### Local desktop notifications (macOS)
+
+```sh
+orql notify on                  # enable; the Telegram bot will also fire osascript banners
+orql notify off                 # disable
+orql notify test                # send a test notification
+orql notify status              # is it on?
+```
+
+### Read-only inspection (`--json` on every one)
+
+
+
+```sh
+orql                            # banner + active-plan summary
 orql list                       # every plan in this project
-orql status <plan_id>           # refreshed status of one plan
-orql show <plan_id>             # raw plan JSON
+orql status [plan_id]           # if omitted, picker prompts
+orql show [plan_id]             # raw plan JSON
 orql history --limit 50         # tail audit log
 orql where                      # show resolved state dir
 orql help
 ```
+
+Every read command supports `--json` to emit machine-readable output for scripting.
 
 Read-only. For active orchestration, use the MCP from inside Claude Code.
 
