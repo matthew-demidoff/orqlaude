@@ -45,25 +45,57 @@ const PROJECT_MARKERS = [".git", "package.json", "pyproject.toml", "Cargo.toml",
 
 export interface StateDirResolution {
   path: string;
-  source: "env" | "worktree" | "project-root" | "home-fallback";
+  source: "env" | "worktree" | "project-root" | "pwd-env" | "home-fallback";
   cwd: string;
+  cwdSource: "process.cwd" | "process.env.PWD";
+  warnings: string[];
+}
+
+/**
+ * Resolve "where the user actually meant for us to operate."
+ *
+ * `process.cwd()` is unreliable when the MCP host (Claude Desktop, etc.)
+ * launches us with cwd=/ for sandbox reasons. The shell var `PWD` is often
+ * still set by whatever spawned the host, pointing at the user's actual
+ * working directory — so we prefer it IF it points at a writable project
+ * root. Otherwise we fall back to `process.cwd()` and let downstream
+ * heuristics handle the rest.
+ */
+function resolveCwd(): { cwd: string; source: "process.cwd" | "process.env.PWD" } {
+  const realCwd = process.cwd();
+  const pwd = process.env.PWD;
+  if (pwd && pwd !== realCwd && looksLikeProjectRoot(pwd) && isWritable(pwd)) {
+    return { cwd: pwd, source: "process.env.PWD" };
+  }
+  return { cwd: realCwd, source: "process.cwd" };
 }
 
 export function resolveStateDir(): StateDirResolution {
-  const cwd = process.cwd();
+  const warnings: string[] = [];
+  const { cwd, source: cwdSource } = resolveCwd();
 
   if (process.env.ORQLAUDE_STATE_DIR) {
-    return { path: process.env.ORQLAUDE_STATE_DIR, source: "env", cwd };
+    return { path: process.env.ORQLAUDE_STATE_DIR, source: "env", cwd, cwdSource, warnings };
   }
 
   const worktree = tryWorktreeResolve(cwd);
-  if (worktree) return { path: worktree, source: "worktree", cwd };
+  if (worktree) return { path: worktree, source: "worktree", cwd, cwdSource, warnings };
 
   if (looksLikeProjectRoot(cwd) && isWritable(cwd)) {
-    return { path: path.join(cwd, ".orqlaude"), source: "project-root", cwd };
+    const src = cwdSource === "process.env.PWD" ? "pwd-env" : "project-root";
+    return { path: path.join(cwd, ".orqlaude"), source: src, cwd, cwdSource, warnings };
   }
 
-  return { path: homeFallback(cwd), source: "home-fallback", cwd };
+  // Falling back means we couldn't find a useful project root. Note the
+  // probable cause so callers can surface it.
+  if (SYSTEM_DIRS.has(path.normalize(process.cwd()))) {
+    warnings.push(
+      `MCP host launched orqlaude with cwd=${process.cwd()}. State writes will go to ~/.orqlaude/projects/. Set ORQLAUDE_STATE_DIR or run from a project root for per-project isolation.`
+    );
+  } else if (!isWritable(cwd)) {
+    warnings.push(`cwd=${cwd} is not writable; state writes will go to ~/.orqlaude/projects/.`);
+  }
+  return { path: homeFallback(cwd), source: "home-fallback", cwd, cwdSource, warnings };
 }
 
 function tryWorktreeResolve(cwd: string): string | null {

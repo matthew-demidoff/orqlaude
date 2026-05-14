@@ -57,10 +57,10 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
     )
   );
 
-  // ---- register_spawn (manual fallback) ------------------------------------
+  // ---- register_spawn (MANUAL FALLBACK; rarely needed) ---------------------
   server.tool(
     "register_spawn",
-    "Manually register a spawn (fallback). Normally the spawned agent self-registers on first checkin; only call this if a child fails to do so within ~30s.",
+    "MANUAL FALLBACK ONLY. Normally the spawned agent self-registers on its first `checkin` call (the prompt next_task generates instructs it to). Only call this if a child fails to self-register within ~30s — symptom: status() shows the task as `dispatched` long after spawn_task succeeded.",
     {
       plan_id: z.string(),
       task_id: z.string(),
@@ -110,12 +110,23 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
             const snap = await snapshotSession(cwd, t.spawnedSessionId);
             const toolUses = await extractToolUses(jsonlPathFor(cwd, t.spawnedSessionId));
             const hallu = await detectHallucination(toolUses, cwd);
+            // Per-task soft budget warning: if the task has a budgetHintTokens
+            // hint and we've blown past 70% of it, surface a yellow flag so the
+            // orchestrator can intervene before the plan-wide hard cap fires.
+            const taskWarnings: string[] = [];
+            if (t.budgetHintTokens && snap.totalEffectiveTokens > 0.7 * t.budgetHintTokens) {
+              const pct = Math.round((snap.totalEffectiveTokens / t.budgetHintTokens) * 100);
+              taskWarnings.push(
+                `task at ${pct}% of hint (${snap.totalEffectiveTokens.toLocaleString()} / ${t.budgetHintTokens.toLocaleString()} tokens). Consider request_stop if it's stalling.`
+              );
+            }
             return {
               task_id: t.id,
               title: t.title,
               status: snap.terminated ? "done" : t.status,
               session_id: t.spawnedSessionId,
               tokens_used: snap.totalEffectiveTokens,
+              budget_hint_tokens: t.budgetHintTokens ?? null,
               cost_usd: snap.totalCostUsd,
               last_event_type: snap.lastEventType,
               last_activity_at: snap.lastActivityAt,
@@ -124,6 +135,7 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
               terminated: snap.terminated,
               termination_reason: snap.terminationReason,
               hallucination: { score: hallu.score, level: hallu.level, concerns: hallu.concerns },
+              warnings: taskWarnings,
               stop_requested: t.stopRequested ?? null,
             };
           })
@@ -141,7 +153,7 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
             plan.status = "cancelled_overbudget";
             for (const t of plan.tasks) {
               if (t.spawnedSessionId && !t.stopRequested) {
-                t.stopRequested = { reason: "fleet overbudget", requestedAt: Date.now() };
+                t.stopRequested = { reason: "fleet overbudget", requestedAt: Date.now(), kind: "hard" };
                 plan.messages.push({
                   id: cryptoRandomId(),
                   toSessionId: t.spawnedSessionId,

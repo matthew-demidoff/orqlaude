@@ -11,13 +11,21 @@ export function registerPing(server: McpServer): void {
     },
     async ({ echo }) => {
       const stateRes = resolveStateDir();
+      // Build the warnings array so orchestrators can bail early on bad config.
+      const warnings: string[] = [...stateRes.warnings];
+      const realCwd = process.cwd();
+      if (realCwd === "/" || realCwd === "/private") {
+        warnings.push(`cwd=${realCwd}: MCP host launched orqlaude from filesystem root. Calls that mutate state will still work (home fallback) but consider setting ORQLAUDE_STATE_DIR.`);
+      }
       const payload = {
-        ok: true,
+        ok: warnings.length === 0,
         server: "orqlaude",
-        version: "0.3.2",
-        cwd: process.cwd(),
+        version: "0.3.3",
+        cwd: realCwd,
+        cwd_source: stateRes.cwdSource,
         state_dir: stateRes.path,
         state_dir_source: stateRes.source,
+        warnings,
         node: process.version,
         pid: process.pid,
         echo: echo ?? null,

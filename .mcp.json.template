@@ -2,7 +2,10 @@
   "mcpServers": {
     "orqlaude": {
       "command": "npx",
-      "args": ["-y", "-p", "@synaplink/orqlaude", "orqlaude-mcp"]
+      "args": ["-y", "-p", "@synaplink/orqlaude", "orqlaude-mcp"],
+      "env": {
+        "ORQLAUDE_STATE_DIR": "${PWD}/.orqlaude"
+      }
     }
   }
 }

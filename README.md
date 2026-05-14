@@ -142,17 +142,26 @@ Files inside the dir:
 
 ## Hallucination detection
 
-`status()` runs two deterministic checks per agent:
+When you call `status(plan_id)`, every agent's snapshot includes a `hallucination` object with `score` (0–1), `level` (`clean`/`minor`/`moderate`/`severe`), and `concerns: string[]`. The aggregated `hallucination_alerts` array surfaces only agents at `moderate` or above so an orchestrator can react quickly.
 
-1. **Path-existence**: every `file_path` referenced in `Read/Edit/Write/Grep` tool calls is checked against the worktree. >30% missing or ≥3 missing = `moderate`/`severe` flag.
+**What gets flagged:**
+
+1. **Path-existence** — every `file_path` arg in `Read`/`Edit`/`Write`/`Grep`/`Glob`/`MultiEdit`/`NotebookEdit`/`NotebookRead` is checked against the worktree. >30% missing or ≥3 missing = moderate/severe. Catches "agent is editing a file it imagined."
 2. **Tool-pattern sanity**:
-   - Edit on a file that wasn't read first
-   - Same tool call repeated ≥3 times (loop)
-   - `git commit` without any prior `npm test`/`tsc`/`pytest`/etc.
+   - **Edit-without-prior-Read**: agent edits a file it never read → it's guessing at the content.
+   - **Tight loop**: same tool call (name+args) ≥3× → likely stuck.
+   - **Commit-without-tests**: `git commit` without a prior test/lint Bash call → commit may be broken.
 
-Each agent gets a `hallucination_score` (0–1) and `concerns: string[]`. The aggregated `hallucination_alerts` list surfaces to the primary Claude so it can `send_message` a nudge or `kill_task`. False positives are acceptable here — we surface concerns, we don't auto-kill.
+**How to react** in your orchestrator code:
 
-A future v0.3 can add a Check 3: periodic Haiku cross-validation of recent activity (costs tokens, opt-in).
+| level | suggested response |
+|---|---|
+| `clean` | Nothing. |
+| `minor` | Note but continue. |
+| `moderate` | `send_message` to the agent with a nudge ("re-read X.ts before editing"), or `request_stop` if the work is salvageable. |
+| `severe` | `kill_task` and consider re-spawning with a clearer prompt. |
+
+False positives are acceptable here — we surface concerns, we don't auto-kill. A v0.4 addition is opt-in second-model cross-validation (a cheap Haiku reading the agent's recent turns and rating "is this lost?").
 
 ## CLI
 
@@ -242,6 +251,20 @@ The bot uses raw `fetch` against Telegram's Bot API — zero extra deps. State i
 - **Second-model hallucination check** — periodic Haiku cross-validation of recent activity, opt-in.
 - **Multi-project Telegram bot** — currently the bot watches a single project. Multi-project watching is a small extension to the config schema.
 - **Inline approve buttons in Telegram** — `/approve <plan_id>` and inline keyboards so you can confirm fleets from your phone.
+
+## Troubleshooting
+
+**Symptom: `ENOENT: no such file or directory, mkdir '/.orqlaude'` on `create_plan`.**
+Your MCP host launched orqlaude with `cwd=/`. v0.3.2+ auto-falls back to `~/.orqlaude/projects/...` but the explicit fix is to set `ORQLAUDE_STATE_DIR` in your `.mcp.json` env block (see `.mcp.json.template`). Verify with `mcp__orqlaude__ping` — it now returns `warnings` and `state_dir_source`.
+
+**Symptom: spawn_task chip appeared, agent ran, but `status()` shows the task as `dispatched` forever.**
+The child agent isn't calling `checkin` on its first turn — its prompt didn't get the orqlaude protocol block, or `mcp__orqlaude__checkin` isn't available in the spawned session. Manual unblock: `register_spawn(plan_id, task_id, session_id)` where session_id is the child's session UUID (find via `mcp__ccd_session_mgmt__list_sessions`). For the proper fix, make sure orqlaude is in the spawned worktree's `.mcp.json` (commit `.mcp.json` to the repo so worktrees inherit it).
+
+**Symptom: agents in worktrees can't see the parent fleet's plan.**
+v0.3.1+ resolves `<cwd>/.git` files (worktree pointers) back to the parent checkout's `.orqlaude`. If a child still can't find its plan, run `orqlaude where` inside the worktree — `source` should be `worktree`. If it's `home-fallback`, the worktree pointer is malformed or `.git` isn't where the resolver expected.
+
+**Symptom: Telegram bot stops sending notifications.**
+Check `/tmp/orqlaude-tg.log` (if you used the launchd plist) or wherever the bot is logging. The most likely cause is a Markdown parse error from an unescaped `_`/`*`/`` ` ``/`[` in a task title or note. v0.3.1+ escapes these but anything user-supplied that bypasses our path (e.g. content posted manually via `post_note` to a stale older bot) can still hit it.
 
 ## License
 
