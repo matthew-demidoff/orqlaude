@@ -276,6 +276,15 @@ export class StateStore {
   private filePath: string;
   private lockPath: string;
   private cache: State | null = null;
+  /**
+   * v0.10.8+: mtime of the file when we last loaded into cache. Used by
+   * read() to stat-check before returning cached state — if another
+   * process (Telegram bot, CLI, autopilot daemon) wrote to the file
+   * since our last load, we reload. Defeats the cross-process staleness
+   * bug that made wait_for_user_response loop forever even after the
+   * Telegram bot had recorded the user's answer.
+   */
+  private cacheMtimeMs: number | null = null;
   private writeLock: Promise<void> = Promise.resolve();
 
   constructor(stateDir: string) {
@@ -292,18 +301,44 @@ export class StateStore {
       const parsed = JSON.parse(raw) as Partial<State>;
       const state = migrate(parsed);
       this.cache = state;
+      try {
+        const stat = await fs.stat(this.filePath);
+        this.cacheMtimeMs = stat.mtimeMs;
+      } catch {
+        this.cacheMtimeMs = null;
+      }
       return state;
     } catch (err: any) {
       if (err.code === "ENOENT") {
         this.cache = structuredClone(EMPTY_STATE);
+        this.cacheMtimeMs = null;
         return this.cache;
       }
       throw err;
     }
   }
 
+  /**
+   * v0.10.8+: stat the file and return true if mtime moved since we last
+   * cached. Cheap (~1ms per call). The mtime resolution on macOS / Linux
+   * is nanosecond, which is finer than any plausible burst-write rate
+   * from the bot, so we won't miss writes.
+   */
+  private async cacheIsStale(): Promise<boolean> {
+    if (!this.cache || this.cacheMtimeMs === null) return true;
+    try {
+      const stat = await fs.stat(this.filePath);
+      return stat.mtimeMs !== this.cacheMtimeMs;
+    } catch (err: any) {
+      // File missing → loadFresh() will create EMPTY_STATE.
+      return err.code === "ENOENT";
+    }
+  }
+
   /** Read path: still funneled through the writeLock so we never see torn
-   *  state from a partially-applied mutator in this process. */
+   *  state from a partially-applied mutator in this process. v0.10.8: also
+   *  stat-checks the file on every read to invalidate the cache when
+   *  another process (Telegram bot, autopilot daemon, CLI) has written. */
   async read<T>(reader: (state: State) => T): Promise<T> {
     let release: () => void = () => {};
     const next = new Promise<void>((res) => (release = res));
@@ -311,10 +346,12 @@ export class StateStore {
     this.writeLock = prev.then(() => next);
     await prev;
     try {
-      // Cheap path: if we have a cache, use it. Cache is always written
-      // through after a successful persist, so it reflects the last
-      // committed state.
-      const state = this.cache ?? (await this.loadFresh());
+      // v0.10.8 fix: cross-process staleness. Before this, read() trusted
+      // the in-memory cache forever, missing writes from the Telegram bot
+      // (which runs in a separate process). Now we stat-check; if mtime
+      // moved, reload from disk. Single stat call (~1ms) on the hot path.
+      const stale = await this.cacheIsStale();
+      const state = stale ? await this.loadFresh() : this.cache!;
       return reader(state);
     } finally {
       release();
@@ -435,6 +472,14 @@ export class StateStore {
     await fs.writeFile(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
     await fs.rename(tmp, this.filePath);
     this.cache = state;
+    // v0.10.8: refresh our mtime stamp so the next read() doesn't think
+    // OUR own write was a foreign one and trigger a needless reload.
+    try {
+      const stat = await fs.stat(this.filePath);
+      this.cacheMtimeMs = stat.mtimeMs;
+    } catch {
+      this.cacheMtimeMs = null;
+    }
   }
 }
 
