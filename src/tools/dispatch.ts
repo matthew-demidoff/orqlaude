@@ -158,6 +158,14 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
           task.exitJsonPath = spawn.exitJsonPath;
           task.status = "running";
           task.startedAt = Date.now();
+          // v0.10.7: clear lifecycle leftovers from a prior spawn (e.g. the
+          // stopRequested signal set by kill_task before the spawn lock was
+          // released). Without this, the new agent's first checkin sees a
+          // stale HARD STOP and immediately bails — observed during the
+          // Verdant re-spawn in self-test fleet d47c0448.
+          task.stopRequested = undefined;
+          task.finishedAt = undefined;
+          task.exitReason = undefined;
           return {
             plan_id,
             task_id,
