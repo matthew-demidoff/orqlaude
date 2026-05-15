@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.10.6 — `wait_for_status_change` capped at 45s so the loop pattern actually works
+
+### The bug
+
+`wait_for_status_change` (v0.9.0+) is THE primitive for event-driven
+fleet monitoring — it long-polls and returns the moment any task
+transitions, opens a PR, or hits the budget. The orchestrator was
+supposed to use this instead of `ScheduleWakeup` + `status()` polling.
+
+But: default `timeout_sec: 60`, cap `600`. Same MCP client `-32001`
+timeout problem we hit with `ask_user` in v0.10.1/0.10.4 — the client
+gives up at 60s without `resetTimeoutOnProgress: true` (which Claude
+Desktop / Claude Code don't set). So a default invocation either
+returns just before the client kills it (lucky) or errors out (more
+likely). Either way the loop pattern is broken.
+
+### The fix
+
+Cap `timeout_sec` at **45s** (default 45, max 45). Same bound the v0.10.4
+`ask_user` fix landed on. The tool's existing return shape already
+supports the loop pattern (`changed: false, timed_out: true` →
+caller re-invokes with the same `fingerprint`). Internally it polls
+every 2s, so wake latency is ~2s after the actual event regardless of
+which iteration of the loop we're in.
+
+### How to use it
+
+```ts
+let result = wait_for_status_change(plan_id);  // first call, no fingerprint
+while (!allTerminal(result)) {
+  result = wait_for_status_change(plan_id, since_fingerprint: result.fingerprint);
+  // returns within ~2s of any task transition, OR after 45s with unchanged state
+}
+```
+
+Each call ≤45s, safely under MCP client timeout. Wake within ~2s of the
+event itself. No ScheduleWakeup needed for fleet monitoring ever again.
+
+### Migration
+
+Callers that explicitly passed `timeout_sec > 45` now get capped at 45.
+Their existing loop already re-invokes on `timed_out: true`, so no
+behavior change beyond shorter round-trips.
+
 ## 0.10.5 — spawn_via_cli session-id reconciliation
 
 ### The bug exposed by the orqlaude self-test fleet d47c0448
