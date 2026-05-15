@@ -306,3 +306,24 @@ function applyEvent(snap: SessionSnapshot, evt: any): void {
 export function clearTailCache(): void {
   cache.clear();
 }
+
+/**
+ * v0.10.9+: evict a single cache entry by stream path.
+ *
+ * Used by `spawn_via_cli` to drop any lingering cache entry tied to a
+ * worktree's `.orqlaude.stdout.log` BEFORE the new agent starts writing.
+ * Defends against the case where:
+ *   1. A prior agent in the same MCP-server process snapshot()'d at path P
+ *      and left a CacheEntry behind.
+ *   2. The worktree at P was removed (cleanup) and re-created.
+ *   3. The new spawn's file at P happens to look "unchanged" to the
+ *      inode/mtime/size checks long enough for one snapshot() call to
+ *      return the prior entry's `snap` (which has the OLD agent's
+ *      tokens / lastAssistantText / terminated flag).
+ *
+ * Cheaper than clearTailCache() because it touches one entry not all.
+ * No-op if no entry is cached for that path.
+ */
+export function evictTailCacheEntry(streamPath: string): void {
+  cache.delete(streamPath);
+}

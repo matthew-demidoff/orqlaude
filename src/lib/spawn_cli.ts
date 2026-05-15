@@ -14,6 +14,7 @@ import os from "node:os";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { isProcessAlive, sleep } from "./process_lib.js";
+import { evictTailCacheEntry } from "./jsonl_tail.js";
 
 /**
  * orqlaude-owned spawning path — sidesteps the host's choice of tool.
@@ -297,12 +298,31 @@ export async function spawnAgnetViaCli(input: SpawnViaCliInput): Promise<SpawnVi
   // a stale .orqlaude.exit.json on disk would otherwise make snapshot()
   // report the NEW agent as already terminated. Wipe it BEFORE spawn so
   // a clean child gets a clean filesystem.
+  //
+  // v0.10.9: extend the wipe to .orqlaude.stdout.log and .orqlaude.stderr.log
+  // too. Truncating via `fs.open(path, "w")` below already zeroes them in
+  // the happy case, but observed in the email-hub fleets: a stale
+  // CacheEntry in jsonl_tail keyed by the worktree's stdoutPath survived
+  // a worktree-remove + re-create cycle and `snapshotSession` returned
+  // the PRIOR agent's tokens/lastAssistantText/terminated_at for one or
+  // two ticks before invalidation caught up. Explicit unlink before the
+  // open(write) makes the file genuinely new (fresh inode on macOS APFS
+  // and most Linux fs), maximizing the chance v0.8.0's
+  // entry.inode !== stat.ino check fires immediately.
   const exitJsonPathPre = path.join(wt.path, ".orqlaude.exit.json");
-  try {
-    await fs.unlink(exitJsonPathPre);
-  } catch {
-    /* no prior exit record - normal first-spawn case */
+  for (const stalePath of [exitJsonPathPre, stdoutPath, stderrPath]) {
+    try {
+      await fs.unlink(stalePath);
+    } catch {
+      /* normal first-spawn case - file doesn't exist yet */
+    }
   }
+  // v0.10.9: ALSO evict any in-process snapshot cache entry for this
+  // stdout path. Same MCP-server process that runs multiple fleets back
+  // to back will have a CacheEntry from the prior fleet's agent if the
+  // worktree path collides (which it can across plan_short truncations).
+  // The eviction is a no-op when nothing is cached. Defense in depth.
+  evictTailCacheEntry(stdoutPath);
   await fs.writeFile(mcpConfigPath, mcpConfigBody, { mode: 0o600 });
   const stderrFh = await fs.open(stderrPath, "w");
   const stdoutFh = await fs.open(stdoutPath, "w");

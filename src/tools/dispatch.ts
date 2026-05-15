@@ -615,17 +615,24 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
           // Also includes `stop_kind` so kill_task / request_stop transitions
           // wake the long-poll without waiting for the child to actually
           // terminate - useful when a soft-stop is in flight.
-          // v0.9.2: KB bucket runs off `billed_tokens` (input + output) so
+          // v0.9.2: bucket runs off `billed_tokens` (input + output) so
           // cache-read churn doesn't trip the fingerprint every 2s. The
           // long-poll now fires only when something cost-relevant moves.
+          // v0.10.9: bucket is /256 not /1024. The kb-bucket was too coarse
+          // for the early-mid of an agent's lifecycle - an agent at 1300
+          // billed could climb to 1999 across multiple poll windows
+          // without tripping any fingerprint change (kb=1 the whole way),
+          // so the orchestrator saw "no change" for minutes despite real
+          // progress. /256 still ignores the cache-read noise but wakes
+          // the long-poll roughly 4x more often during meaningful growth.
           const parts: Array<unknown> = [snap.plan_status];
           for (const a of snap.agents) {
-            const kb = Math.floor(a.billed_tokens / 1024);
+            const bucket = Math.floor(a.billed_tokens / 256);
             parts.push([
               a.task_id,
               a.status,
               a.pr_url ?? null,
-              kb,
+              bucket,
               a.exit_record
                 ? { code: a.exit_record.exit_code, sig: a.exit_record.signal }
                 : null,
