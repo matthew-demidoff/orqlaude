@@ -534,11 +534,11 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
   // primary Claude can sleep without waking up to call status() every 90s.
   server.tool(
     "wait_for_status_change",
-    "Long-poll: blocks up to `timeout_sec` (default 60, max 600) and returns as soon as the fleet state changes (task transition, new PR url, exit-record, +1 KB token delta) - OR returns the unchanged state when the timeout elapses. Use this INSTEAD of ScheduleWakeup + status() polling: pass the `fingerprint` from the prior response as `since_fingerprint` and the call returns the moment something useful happens. v0.9.0+.",
+    "Long-poll: blocks up to `timeout_sec` (default 45, max 45 in v0.10.6+) and returns as soon as the fleet state changes (task transition, new PR url, exit-record, +1 KB token delta) - OR returns the unchanged state when the timeout elapses. Use this INSTEAD of ScheduleWakeup + status() polling: pass the `fingerprint` from the prior response as `since_fingerprint` and the call returns the moment something useful happens. Loop pattern: while (!terminal(result)) result = wait_for_status_change(plan_id, result.fingerprint). v0.9.0+. v0.10.6: capped at 45s to stay under MCP client default timeout (60s); when not all tasks have terminated, just call again with same fingerprint — each call wakes within ~2s of any actual event.",
     {
       plan_id: z.string(),
       since_fingerprint: z.string().optional().describe("The `fingerprint` field from the prior wait_for_status_change (or status) response. Omit on first call - the server returns immediately with the current snapshot + the fresh fingerprint to thread through subsequent calls."),
-      timeout_sec: z.number().int().positive().max(600).default(60).describe("Max seconds the call blocks before returning the unchanged state. Default 60. Cap 600 (10 min)."),
+      timeout_sec: z.number().int().positive().max(45).default(45).describe("Max seconds the call blocks before returning the unchanged state. Default 45, cap 45 (v0.10.6: bounded to stay under MCP client's 60s default per-request timeout). Loop the tool to extend the wait."),
     },
     audit.wrap(
       "wait_for_status_change",
