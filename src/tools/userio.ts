@@ -104,7 +104,7 @@ export function registerUserIo(server: McpServer, store: StateStore, audit: Audi
     },
     audit.wrap(
       "ask_user",
-      async ({ prompt, options, timeout_sec, plan_id, task_id, poll_interval_ms }) => {
+      async ({ prompt, options, timeout_sec, plan_id, task_id, poll_interval_ms }, extra) => {
         const id = randomUUID();
         const shortId = id.slice(0, 8);
         const timeoutAt = Date.now() + timeout_sec * 1000;
@@ -127,8 +127,6 @@ export function registerUserIo(server: McpServer, store: StateStore, audit: Audi
             state.orphanResponseRequests.push(req);
           }
         });
-        // Sanity-check Telegram up front. If not reachable, return immediately
-        // rather than block for 15min on a closed channel.
         const tg = await probeTelegramStatus(resolveStateDir().path);
         if (tg.status !== "active") {
           return {
@@ -150,10 +148,72 @@ export function registerUserIo(server: McpServer, store: StateStore, audit: Audi
             ],
           };
         }
-        // Block-poll until answered, cancelled, or timeout.
+
+        // v0.10.2: MCP host has a per-request timeout (often 60s). Send
+        // `notifications/progress` every ~25s so the client resets its
+        // timeout window — keeps the blocking call alive for the full
+        // timeout_sec without the client cutting us off. The progressToken
+        // is taken from the request meta; if the client didn't request
+        // progress, we still send it (no-op, no harm). We also watch the
+        // abort signal — if the client gives up anyway, bail cleanly.
+        const e = extra as
+          | {
+              sendNotification?: (n: { method: string; params: Record<string, unknown> }) => Promise<void>;
+              signal?: AbortSignal;
+              _meta?: { progressToken?: string | number };
+            }
+          | undefined;
+        const progressToken = e?._meta?.progressToken;
+        const sendNotification = e?.sendNotification;
+        const signal = e?.signal;
+        const PROGRESS_INTERVAL_MS = 25_000;
+        let lastProgressAt = Date.now();
+        let progressCounter = 0;
+        const tryProgress = async (): Promise<void> => {
+          if (!sendNotification || progressToken === undefined) return;
+          const now = Date.now();
+          if (now - lastProgressAt < PROGRESS_INTERVAL_MS) return;
+          lastProgressAt = now;
+          progressCounter += 1;
+          try {
+            await sendNotification({
+              method: "notifications/progress",
+              params: {
+                progressToken,
+                progress: Math.min(progressCounter, Math.floor(timeout_sec / 25)),
+                total: Math.floor(timeout_sec / 25),
+                message: `still waiting for user answer (${Math.round((Date.now() - req.createdAt) / 1000)}s / ${timeout_sec}s)`,
+              },
+            });
+          } catch {
+            // Best-effort. If the transport doesn't support progress, swallow.
+          }
+        };
+
         const interval = Math.max(250, Math.min(5000, poll_interval_ms));
         while (Date.now() < timeoutAt) {
+          if (signal?.aborted) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    {
+                      status: "client_aborted",
+                      short_id: shortId,
+                      request_id: id,
+                      blocked_for_ms: Date.now() - req.createdAt,
+                      note: "MCP client cancelled the request. The question is still in state — poll_user_response later to retrieve any answer.",
+                    },
+                    null,
+                    2
+                  ),
+                },
+              ],
+            };
+          }
           await sleep(interval);
+          await tryProgress();
           const result = await store.read((state) => {
             const found = findUserResponseRequest(state, id);
             if (!found) return null;
