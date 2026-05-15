@@ -128,6 +128,12 @@ async function main(): Promise<number> {
         // stop, status, pause, resume.
         exitCode = await (await import("./cli/autopilot.js")).cmdAutopilot(rest);
         break;
+      case "memory":
+        exitCode = await (await import("./cli/memory.js")).cmdMemory(STATE_DIR, rest);
+        break;
+      case "backlog":
+        exitCode = await (await import("./cli/backlog.js")).cmdBacklog(STATE_DIR, rest);
+        break;
       default:
         process.stderr.write(errorLine(`unknown subcommand: ${cmd}`, `try \`orql help\``));
         exitCode = 1;
@@ -196,6 +202,17 @@ function printHelp(): void {
   console.log(`  ${style.coral("orql autopilot stop")}                       SIGTERM the daemon`);
   console.log(`  ${style.coral("orql autopilot status")}                     Daemon + budget burn`);
   console.log(`  ${style.coral("orql autopilot pause|resume")}               Halt new-goal pickup (in-flight fleets continue)`);
+  console.log("");
+  console.log(style.bold(style.cream("Memory & Backlog (v0.10.0+)")));
+  console.log(`  ${style.coral("orql memory list")} ${style.sand("[--category C] [--pinned] [--json]")}   List durable memory entries`);
+  console.log(`  ${style.coral("orql memory show")} ${style.sand("<id>")}                       Full record for one entry`);
+  console.log(`  ${style.coral("orql memory forget")} ${style.sand("<id>")}                     Soft-delete a memory entry`);
+  console.log(`  ${style.coral("orql memory pin|unpin")} ${style.sand("<id>")}                  Toggle pinned status`);
+  console.log(`  ${style.coral("orql backlog list")} ${style.sand("[--status S|all] [--json]")}        List goals (default: queued)`);
+  console.log(`  ${style.coral("orql backlog show")} ${style.sand("<id>")}                      Full record for one goal`);
+  console.log(`  ${style.coral("orql backlog add")} ${style.sand("<title> [--priority N] [--deadline T] [--tag a,b]")}`);
+  console.log(`  ${style.coral("orql backlog done|cancel")} ${style.sand("<id>")}               Mark a goal done or cancelled`);
+  console.log(`  ${style.coral("orql backlog next")}                          Show what autopilot would pick next`);
   console.log("");
   console.log(style.bold(style.cream("Telegram")));
   console.log(`  ${style.coral("orqlaude tg setup")}               Configure bot token (interactive)`);
