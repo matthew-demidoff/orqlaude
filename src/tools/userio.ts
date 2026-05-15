@@ -90,24 +90,26 @@ export function registerUserIo(server: McpServer, store: StateStore, audit: Audi
     )
   );
 
-  // ---- ask_user (v0.10.1+, BLOCKING) ---------------------------------------
+  // ---- ask_user (v0.10.4: bounded-block) -----------------------------------
   server.tool(
     "ask_user",
-    "PRIMARY CLAUDE asks the user a question via Telegram and BLOCKS until the user answers, the timeout hits, or the request is cancelled. Single round-trip — no polling. v0.10.1+. The bot sends the question with Telegram's native reply-UI focused; the user can reply directly to the message, OR tap an inline-keyboard button if `options` were provided. Returns `{status: 'answered'|'timed_out'|'cancelled'|'unreachable', response, responded_at}`. Default timeout 900s (15min); cap 3600 (1h). PLAIN TEXT only — never use Markdown in your prompt; the bot has stopped using parse_mode entirely (v0.10.1) because the parser was eating special chars and silently failing sends.",
+    "PRIMARY CLAUDE asks the user a question via Telegram and BLOCKS up to 45s waiting for the answer. v0.10.4: bounded block — MCP clients have a default 60s per-request timeout and won't extend it on progress notifications unless they explicitly set `resetTimeoutOnProgress: true` (Claude Desktop / Claude Code don't), so we cap internal blocking at 45s. If the user answers in that window → status:'answered'. If they don't → status:'still_pending' with a `short_id` — caller should immediately invoke `wait_for_user_response(short_id)` to keep waiting (each call extends another ≤45s). Inline keyboards still work; reply-to-message is still the primary path. PLAIN TEXT only — no Markdown.",
     {
       prompt: z.string().min(1).max(2000).describe("The question. PLAIN TEXT only — no Markdown. Newlines OK."),
-      options: z.array(z.string().min(1).max(32)).max(8).optional().describe("Optional inline-keyboard quick-pick buttons (≤8, each ≤32 chars). User can tap one OR reply to the message with freeform text — both paths work."),
-      timeout_sec: z.number().int().positive().max(3600).default(900).describe("How long to BLOCK waiting. Default 900s (15 min). Cap 3600 (1h)."),
+      options: z.array(z.string().min(1).max(32)).max(8).optional().describe("Optional inline-keyboard quick-pick buttons (≤8, each ≤32 chars). User can tap one OR reply to the message — both work."),
+      total_timeout_sec: z.number().int().positive().max(3600).default(900).describe("Overall question lifetime (when the request expires in state). Default 900s. After this the question becomes invisible to wait_for_user_response. Cap 3600s."),
+      initial_block_sec: z.number().int().min(1).max(45).default(45).describe("How long ask_user itself blocks. Capped at 45s to stay under typical MCP-client timeouts. If the user hasn't answered in this window, returns status='still_pending' and caller should invoke wait_for_user_response(short_id)."),
       plan_id: z.string().optional().describe("Optional plan id to attach the question to. Omit for session-level questions (v0.9.0+ orphan path)."),
       task_id: z.string().optional(),
       poll_interval_ms: z.number().int().min(250).max(5000).default(750).describe("Internal poll cadence while blocking. Default 750ms."),
     },
     audit.wrap(
       "ask_user",
-      async ({ prompt, options, timeout_sec, plan_id, task_id, poll_interval_ms }, extra) => {
+      async ({ prompt, options, total_timeout_sec, initial_block_sec, plan_id, task_id, poll_interval_ms }, extra) => {
         const id = randomUUID();
         const shortId = id.slice(0, 8);
-        const timeoutAt = Date.now() + timeout_sec * 1000;
+        const timeoutAt = Date.now() + total_timeout_sec * 1000;
+        const blockUntil = Date.now() + Math.min(initial_block_sec, 45) * 1000;
         const req = {
           id,
           shortId,
@@ -180,9 +182,9 @@ export function registerUserIo(server: McpServer, store: StateStore, audit: Audi
               method: "notifications/progress",
               params: {
                 progressToken,
-                progress: Math.min(progressCounter, Math.floor(timeout_sec / 25)),
-                total: Math.floor(timeout_sec / 25),
-                message: `still waiting for user answer (${Math.round((Date.now() - req.createdAt) / 1000)}s / ${timeout_sec}s)`,
+                progress: Math.min(progressCounter, Math.floor(total_timeout_sec / 25)),
+                total: Math.floor(total_timeout_sec / 25),
+                message: `still waiting for user answer (${Math.round((Date.now() - req.createdAt) / 1000)}s / ${total_timeout_sec}s)`,
               },
             });
           } catch {
@@ -191,7 +193,10 @@ export function registerUserIo(server: McpServer, store: StateStore, audit: Audi
         };
 
         const interval = Math.max(250, Math.min(5000, poll_interval_ms));
-        while (Date.now() < timeoutAt) {
+        // Block up to MIN(initial_block_sec, total_timeout_sec). The cap at
+        // 45s keeps us under typical MCP host timeouts.
+        const stopAt = Math.min(blockUntil, timeoutAt);
+        while (Date.now() < stopAt) {
           if (signal?.aborted) {
             return {
               content: [
@@ -203,7 +208,7 @@ export function registerUserIo(server: McpServer, store: StateStore, audit: Audi
                       short_id: shortId,
                       request_id: id,
                       blocked_for_ms: Date.now() - req.createdAt,
-                      note: "MCP client cancelled the request. The question is still in state — poll_user_response later to retrieve any answer.",
+                      note: "MCP client cancelled the request. The question is still in state — use wait_for_user_response or poll_user_response to retrieve any answer.",
                     },
                     null,
                     2
@@ -270,6 +275,30 @@ export function registerUserIo(server: McpServer, store: StateStore, audit: Audi
             };
           }
         }
+        // Differentiate "internal block ended, but the question is still
+        // alive" vs "total_timeout_sec elapsed, question is dead".
+        const stillAlive = Date.now() < timeoutAt;
+        if (stillAlive) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    status: "still_pending",
+                    short_id: shortId,
+                    request_id: id,
+                    blocked_for_ms: Date.now() - req.createdAt,
+                    remaining_sec: Math.max(0, Math.round((timeoutAt - Date.now()) / 1000)),
+                    next_step: `User hasn't answered yet. Call wait_for_user_response('${shortId}') to block another ≤45s. Repeat until status flips to 'answered' or 'timed_out'.`,
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
         return {
           content: [
             {
@@ -279,8 +308,8 @@ export function registerUserIo(server: McpServer, store: StateStore, audit: Audi
                   status: "timed_out",
                   short_id: shortId,
                   request_id: id,
-                  timeout_sec,
-                  note: "User didn't answer within the timeout. The question is still in state — they can still answer, and you can pick it up via poll_user_response.",
+                  total_timeout_sec,
+                  note: "User didn't answer within the total timeout. The question record stays in state for audit but is no longer answerable.",
                 },
                 null,
                 2
@@ -290,6 +319,143 @@ export function registerUserIo(server: McpServer, store: StateStore, audit: Audi
         };
       },
       ({ plan_id }) => ({ planId: plan_id ?? "(ask_user)" })
+    )
+  );
+
+  // ---- wait_for_user_response (v0.10.4+) -----------------------------------
+  // Companion to ask_user — call this repeatedly when ask_user returned
+  // status='still_pending'. Each call blocks up to max_wait_sec (≤45s) before
+  // returning. Designed to stay under the MCP host timeout.
+  server.tool(
+    "wait_for_user_response",
+    "Block waiting for a previously-issued question. v0.10.4+. Companion to ask_user — when ask_user returns status='still_pending', call this with the same short_id to keep waiting. Blocks up to `max_wait_sec` (capped at 45s to stay under MCP host timeout). Returns status='answered'|'still_pending'|'timed_out'|'cancelled'|'unknown'. Loop while status='still_pending'.",
+    {
+      short_id: z.string().describe("The short_id or full UUID from ask_user."),
+      max_wait_sec: z.number().int().min(1).max(45).default(45).describe("Max block duration. Capped at 45s."),
+      poll_interval_ms: z.number().int().min(250).max(5000).default(750),
+    },
+    audit.wrap(
+      "wait_for_user_response",
+      async ({ short_id, max_wait_sec, poll_interval_ms }, extra) => {
+        const interval = Math.max(250, Math.min(5000, poll_interval_ms));
+        const stopAt = Date.now() + Math.min(max_wait_sec, 45) * 1000;
+        const startedAt = Date.now();
+        const e = extra as { signal?: AbortSignal } | undefined;
+        const signal = e?.signal;
+        while (Date.now() < stopAt) {
+          if (signal?.aborted) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    { status: "client_aborted", short_id, blocked_for_ms: Date.now() - startedAt },
+                    null,
+                    2
+                  ),
+                },
+              ],
+            };
+          }
+          await sleep(interval);
+          const result = await store.read((state) => {
+            const found = findUserResponseRequest(state, short_id);
+            if (!found) return { kind: "unknown" as const };
+            const { req: r } = found;
+            if (r.cancelled) return { kind: "cancelled" as const };
+            if (r.response !== undefined) {
+              return {
+                kind: "answered" as const,
+                response: r.response,
+                respondedAt: r.respondedAt,
+                fullId: r.id,
+              };
+            }
+            if (Date.now() > r.timeoutAt) {
+              return { kind: "timed_out" as const, fullId: r.id };
+            }
+            return null;
+          });
+          if (!result) continue;
+          if (result.kind === "answered") {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    {
+                      status: "answered",
+                      short_id,
+                      request_id: result.fullId,
+                      response: result.response,
+                      responded_at: result.respondedAt,
+                      blocked_for_ms: Date.now() - startedAt,
+                    },
+                    null,
+                    2
+                  ),
+                },
+              ],
+            };
+          }
+          if (result.kind === "cancelled") {
+            return {
+              content: [{ type: "text", text: JSON.stringify({ status: "cancelled", short_id }, null, 2) }],
+            };
+          }
+          if (result.kind === "timed_out") {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    {
+                      status: "timed_out",
+                      short_id,
+                      request_id: result.fullId,
+                      note: "Question's total_timeout_sec lifetime expired.",
+                    },
+                    null,
+                    2
+                  ),
+                },
+              ],
+            };
+          }
+          if (result.kind === "unknown") {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    { status: "unknown", short_id, note: "No request with that id/short_id." },
+                    null,
+                    2
+                  ),
+                },
+              ],
+            };
+          }
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  status: "still_pending",
+                  short_id,
+                  blocked_for_ms: Date.now() - startedAt,
+                  next_step: `User hasn't answered yet. Call wait_for_user_response('${short_id}') again to block another ≤45s.`,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      },
+      () => ({})
     )
   );
 

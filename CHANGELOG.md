@@ -1,5 +1,72 @@
 # Changelog
 
+## 0.10.4 — bounded-block `ask_user` + `wait_for_user_response` companion
+
+### Why v0.10.2's progress notifications didn't fix it
+
+Found in the MCP TypeScript SDK source:
+
+```js
+if (timeoutInfo && responseHandler && timeoutInfo.resetTimeoutOnProgress) {
+    this._resetTimeout(messageId);
+}
+```
+
+The MCP client only resets its per-request timeout on `notifications/progress`
+**if `resetTimeoutOnProgress: true` was passed when the request was made**.
+Claude Desktop and Claude Code don't set this flag by default. So my v0.10.2
+progress notifications were arriving at the client and being ignored for
+timeout purposes. There's no way to force this from the server side.
+
+Default `DEFAULT_REQUEST_TIMEOUT_MSEC = 60000` (60s). Hard ceiling.
+
+### The structural fix
+
+Stop trying to outlast the host timeout. Instead:
+
+- **`ask_user` blocks at most 45s** (the new `initial_block_sec`, capped at
+  45). The question's overall lifetime is now `total_timeout_sec` (default
+  900s) — that's how long the question stays answerable in state. The
+  internal block is decoupled from the lifetime.
+- If the user answers within 45s → `status: "answered"`.
+- If they don't → `status: "still_pending"` with `short_id` and
+  `remaining_sec`. **Caller must invoke `wait_for_user_response(short_id)`
+  to keep waiting.**
+- If `total_timeout_sec` passed → `status: "timed_out"`.
+
+**New `wait_for_user_response(short_id, max_wait_sec=45)` tool** — block
+another ≤45s polling state. Designed to be called in a loop:
+
+```
+result = ask_user(prompt, options, total_timeout_sec=1800)
+while result.status === "still_pending":
+    result = wait_for_user_response(result.short_id)
+# now result.status is "answered" / "timed_out" / "cancelled"
+```
+
+Each MCP call is safely under the 60s host timeout. If the user is fast
+(< 45s), one round-trip. If they take 5 minutes, ~7 round-trips. Each is
+a single MCP call, no ScheduleWakeup-and-come-back-in-20-minutes pattern.
+
+### Backwards compatibility
+
+The arg rename `timeout_sec` → `total_timeout_sec` + `initial_block_sec`
+is a breaking change for direct ask_user callers from v0.10.1-0.10.3. The
+old default of 900s now means "the question stays answerable for 900s"
+but ask_user itself returns within 45s. Primary Claude must adopt the new
+loop pattern. Documented in the tool description.
+
+Progress-notification code retained as best-effort — if a future MCP host
+does enable `resetTimeoutOnProgress`, we already send them.
+
+### Tests
+
+All 136 v0.10.3 tests still green. The split architecture is hard to
+unit-test (requires a real MCP transport for timeouts); integration test
+plan: call ask_user, wait 30s without answering, confirm status="still_pending",
+call wait_for_user_response, answer in Telegram during the wait, confirm
+status="answered" returns within the second call.
+
 ## 0.10.3 — `findUserResponseRequest` now searches orphan requests too
 
 The hidden bug that made `ask_user` *seem* broken even though everything
