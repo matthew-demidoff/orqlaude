@@ -28,9 +28,9 @@ export function registerUserIo(server: McpServer, store: StateStore, audit: Audi
   // ---- notify_user ----------------------------------------------------------
   server.tool(
     "notify_user",
-    "PRIMARY CLAUDE → USER (Telegram). One-way push of an arbitrary message to the user's whitelisted Telegram chats. The notifier picks it up on its next 5-second tick. Use for mid-fleet status updates the user might want to know about (e.g. 'reviewer agent flagged 3 BLOCKERs', 'agent 2 finished early', 'budget at 80%'). Doesn't await a response — pair with request_user_response if you need one.",
+    "PRIMARY CLAUDE → USER (Telegram). One-way push of an arbitrary message to the user's whitelisted Telegram chats. The notifier picks it up on its next 5-second tick. v0.9.0: `plan_id` is now optional - omit it for session-startup pings or any standalone notification not tied to a fleet. Use for mid-fleet status updates the user might want to know about ('reviewer agent flagged 3 BLOCKERs', 'agent 2 finished early', 'budget at 80%'). Doesn't await a response - pair with request_user_response if you need one.",
     {
-      plan_id: z.string().describe("Plan id this notification belongs to (for filtering / context)."),
+      plan_id: z.string().optional().describe("Optional plan id this notification belongs to. Omit for standalone session-level pings; v0.9.0+."),
       text: z.string().min(1).max(2000).describe("The message text. Will be Markdown-escaped before send. Keep concise."),
       urgency: URGENCY.default("normal").describe("Affects emoji prefix in the Telegram message. low → 💬, normal → 📢, high → 🚨."),
       task_id: z.string().optional().describe("Optional: attribute the notification to a specific task in the plan."),
@@ -39,7 +39,6 @@ export function registerUserIo(server: McpServer, store: StateStore, audit: Audi
       "notify_user",
       async ({ plan_id, text, urgency, task_id }) => {
         const result = await store.update((state) => {
-          const plan = findPlan(state, plan_id);
           const note = {
             id: randomUUID(),
             taskId: task_id,
@@ -48,8 +47,18 @@ export function registerUserIo(server: McpServer, store: StateStore, audit: Audi
             createdAt: Date.now(),
             delivered: false,
           };
-          plan.userNotifications.push(note);
-          return { plan_id, notification_id: note.id };
+          if (plan_id) {
+            const plan = findPlan(state, plan_id);
+            plan.userNotifications.push(note);
+          } else {
+            state.orphanNotifications = state.orphanNotifications ?? [];
+            state.orphanNotifications.push(note);
+          }
+          return {
+            plan_id: plan_id ?? null,
+            notification_id: note.id,
+            scope: plan_id ? "plan" : "orphan",
+          };
         });
         // v0.5.3+: probe Telegram status so the orchestrator knows whether
         // the notification will actually be delivered.
@@ -76,7 +85,7 @@ export function registerUserIo(server: McpServer, store: StateStore, audit: Audi
           ],
         };
       },
-      ({ plan_id }) => ({ planId: plan_id })
+      ({ plan_id }) => ({ planId: plan_id ?? "(orphan)" })
     )
   );
 

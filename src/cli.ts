@@ -34,8 +34,7 @@ import { tailAudit } from "./cli/tail.js";
 import { openPlan } from "./cli/open.js";
 import { showAbout } from "./cli/about.js";
 import { runEasterEgg } from "./cli/easter_egg.js";
-
-const VERSION = "0.8.0";
+import { VERSION } from "./lib/version.js";
 
 /**
  * orqlaude CLI — read-only inspection of state + audit log + Telegram setup

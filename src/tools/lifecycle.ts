@@ -3,6 +3,8 @@ import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import { StateStore, findPlan, findTask } from "../lib/state.js";
 import { snapshotSession } from "../lib/jsonl_tail.js";
+import { isProcessAlive } from "../lib/process_lib.js";
+import { readChildExitRecord } from "../lib/spawn_cli.js";
 import type { AuditLog } from "../lib/audit.js";
 
 /**
@@ -24,7 +26,7 @@ export function registerLifecycle(server: McpServer, store: StateStore, audit: A
   // ---- kill_task (HARD STOP) ----------------------------------------------
   server.tool(
     "kill_task",
-    "HARD STOP a running task. Queues a STOP broker message saying 'commit what you have and exit immediately', and returns the session id ready for `mcp__ccd_session_mgmt__archive_session` if the agent doesn't comply within ~30s. Use this when an agent is hallucinating, looping, or otherwise off the rails. For a polite 'we don't need this anymore, please wind down' alternative, use `request_stop`.",
+    "HARD STOP a running task. Queues a STOP broker message saying 'commit what you have and exit immediately', and returns the session id ready for `mcp__ccd_session_mgmt__archive_session` if the agent doesn't comply within ~30s. v0.9.0: if the Agnet is already dead (PID gone OR exit record present), the spawn lock is released so the task can be re-spawned without creating a fresh plan. Use this when an agent is hallucinating, looping, or otherwise off the rails. For a polite 'we don't need this anymore, please wind down' alternative, use `request_stop`.",
     {
       plan_id: z.string(),
       task_id: z.string(),
@@ -33,12 +35,53 @@ export function registerLifecycle(server: McpServer, store: StateStore, audit: A
     audit.wrap(
       "kill_task",
       async ({ plan_id, task_id, reason }) => {
+        // v0.9.0: check liveness OUTSIDE store.update (it's IO-bound and
+        // shouldn't be inside the state critical section).
+        let isCorpse = false;
+        const preCheck = await store.read((state) => {
+          const plan = findPlan(state, plan_id);
+          const task = findTask(plan, task_id);
+          return {
+            spawnedSessionId: task.spawnedSessionId,
+            pid: task.pid,
+            exitJsonPath: task.exitJsonPath,
+          };
+        });
+        if (preCheck.spawnedSessionId) {
+          const pidDead = preCheck.pid ? !isProcessAlive(preCheck.pid) : false;
+          const exitRecord = preCheck.exitJsonPath
+            ? await readChildExitRecord(preCheck.exitJsonPath)
+            : null;
+          isCorpse = pidDead || !!exitRecord;
+        }
+
         const result = await store.update((state) => {
           const plan = findPlan(state, plan_id);
           const task = findTask(plan, task_id);
           if (!task.spawnedSessionId) {
             task.status = "cancelled";
             return { plan_id, task_id, status: "cancelled_before_spawn", session_id: null };
+          }
+          // v0.9.0: if the Agnet is already dead, queuing a STOP message
+          // is pointless - the agent will never read it. Release the
+          // spawn lock so a re-spawn doesn't require create_plan churn.
+          if (isCorpse) {
+            const releasedSessionId = task.spawnedSessionId;
+            task.status = "cancelled";
+            task.stopRequested = { reason, requestedAt: Date.now(), kind: "hard" };
+            task.spawnedSessionId = undefined;
+            task.pid = undefined;
+            task.finishedAt = task.finishedAt ?? Date.now();
+            return {
+              plan_id,
+              task_id,
+              session_id: releasedSessionId,
+              released_spawn_lock: true,
+              reason_released:
+                "Agnet was already dead (PID gone or exit-record present); STOP message would not be delivered. Lock cleared so spawn_via_cli can re-fire this task without creating a fresh plan.",
+              next_step:
+                "Call spawn_via_cli with the same plan_id + task_id to re-attempt. If the corpse was a died_at_launch case, fix whatever the stderr surfaced first.",
+            };
           }
           task.stopRequested = { reason, requestedAt: Date.now(), kind: "hard" };
           plan.messages.push({
@@ -119,7 +162,9 @@ export function registerLifecycle(server: McpServer, store: StateStore, audit: A
         const cwd = process.cwd();
         const tasks = await Promise.all(
           plan.tasks.map(async (t) => {
-            const snap = t.spawnedSessionId ? await snapshotSession(cwd, t.spawnedSessionId) : null;
+            const snap = t.spawnedSessionId
+              ? await snapshotSession(cwd, t.spawnedSessionId, t.stdoutPath)
+              : null;
             return {
               task_id: t.id,
               title: t.title,
