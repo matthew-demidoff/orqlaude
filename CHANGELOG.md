@@ -1,5 +1,76 @@
 # Changelog
 
+## 0.10.1 — plain-text Telegram, blocking `ask_user`, reply-to-message answers
+
+User-driven fix for three real problems with v0.10.0's Telegram surface:
+
+### The three bugs
+
+1. **Markdown parser was eating sends.** Telegram's MarkdownV1 parser is fussy
+   about specials inside code-spans, around hyphens, in URLs, etc. When a
+   notifier-built message tripped it, Telegram returned `400 Bad Request:
+   can't parse entities` and the message NEVER ARRIVED. The user reported
+   `delivered: false` on a request that should have been delivered — the
+   notifier had tried to send, gotten a 400, and surfaced nothing actionable.
+
+2. **`request_user_response` + `poll_user_response` was a polling sandwich.**
+   Primary Claude had to call request, then poll on a wakeup-loop, then act
+   on the eventual answer. Long latency, cache misses every 5 min, and
+   awkward primary-Claude logic.
+
+3. **Inline-keyboard callbacks felt fragile.** When a user did tap a button,
+   if anything was off (parseMode, callback routing, store contention) the
+   answer didn't propagate and there was no easy fallback.
+
+### Changes
+
+- **NO MARKDOWN anywhere in Telegram sends.** Every `sendMessage` and
+  `editMessageText` now goes out as plain text. `escapeMd` remains exported
+  as a no-op for back-compat with anything that imports it. Visual richness
+  was never worth the silent-fail tax.
+
+- **New `ask_user` MCP tool (BLOCKING).** Single MCP call that:
+  1. Writes the request,
+  2. Sanity-checks Telegram reachability up front (returns immediately if
+     unreachable rather than blocking on a closed channel),
+  3. Block-polls state.json every 750ms,
+  4. Returns the answer (or `timed_out` / `cancelled`) synchronously.
+  Default timeout 900s (15min); cap 3600s (1h). No more wakeup loops.
+
+- **Reply-to-message is the PRIMARY answer path.** Notifier sends each
+  question with Telegram's `force_reply` enabled, which focuses the chat
+  input pre-targeted at the question. The user just types — their reply
+  carries `reply_to_message.message_id` which `commands.ts` matches back to
+  the `UserResponseRequest` via the `(telegramMessageId, telegramChatId)`
+  tuple. Inline keyboards still work when `options` are provided. Legacy
+  `/respond <short_id> <text>` also still works.
+
+- **Reply-to dispatch is BEFORE slash dispatch.** A reply to a question
+  with body `/respond xxx` (someone confused) gets routed to the question,
+  not parsed as a malformed command.
+
+- **All-paths `delivered` flag is set on send success only.** This was
+  already true but easier to verify now that nothing fails on parser
+  errors.
+
+- **5 new tests** covering: `escapeMd` no-op, orphan request creation,
+  reply-to-message routing by `(message_id, chat_id)` tuple, response
+  write-back, cancelled short-circuit.
+
+134 tests total, all green.
+
+### Migration notes
+
+- `request_user_response` and `poll_user_response` are still exported — old
+  primary-Claude code that uses them keeps working. New code should prefer
+  `ask_user` for any in-loop question.
+- `escapeMd` is now `(s) => s`. If you imported it from `telegram/notifier`,
+  no change needed; if you relied on its escape behavior elsewhere, you're
+  fine because nothing sends Markdown anymore.
+- No state migration. Existing pending requests get the new reply-to
+  routing automatically because the notifier already persisted
+  `telegramMessageId` and `telegramChatId`.
+
 ## 0.10.0 — autopilot daemon, memory, auto-PR-review, retry, Telegram free-form, backlog scheduler
 
 The biggest single release since v0.5. Adds a persistent orchestrator

@@ -110,13 +110,17 @@ test("v1→v2 migration synthesizes tasks/notes/messages/claims when missing (CO
   assert.equal(out.budgetCapTokens, 4 * 25_000);
 });
 
-test("escapeMd backslashes Telegram MarkdownV1 special chars (BLOCKER from Phase 3)", () => {
-  assert.equal(escapeMd("feature/foo_bar"), "feature/foo\\_bar");
-  assert.equal(escapeMd("**bold**"), "\\*\\*bold\\*\\*");
+test("escapeMd is a no-op in v0.10.1+ (we ship plain text now)", () => {
+  // v0.10.1 dropped Markdown from all Telegram sends — the parser was eating
+  // special chars (especially inside backticks, parens, and around hyphens)
+  // and silently failing the send. escapeMd remains exported as a no-op for
+  // back-compat with any third-party plugin that imports it.
+  assert.equal(escapeMd("feature/foo_bar"), "feature/foo_bar");
+  assert.equal(escapeMd("**bold**"), "**bold**");
   assert.equal(escapeMd("plain text"), "plain text");
-  assert.equal(escapeMd("`code`"), "\\`code\\`");
-  assert.equal(escapeMd("[link]"), "\\[link]");
-  assert.equal(escapeMd("a_b*c`d[e"), "a\\_b\\*c\\`d\\[e");
+  assert.equal(escapeMd("`code`"), "`code`");
+  assert.equal(escapeMd("[link]"), "[link]");
+  assert.equal(escapeMd("a_b*c`d[e"), "a_b*c`d[e");
 });
 
 test("Telegram saveConfig writes with mode 0o600 atomically (BLOCKER from Phase 3)", async () => {
