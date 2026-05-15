@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.10.2 — MCP progress notifications keep `ask_user` alive past client timeout
+
+### The bug v0.10.1 didn't catch
+
+v0.10.1 introduced `ask_user` as a blocking MCP tool that holds the call
+open for up to 15 minutes. Tested locally it worked great — but on the
+first real call from Claude Desktop / Claude Code, MCP errored after ~60s
+with `-32001 Request timed out`.
+
+That's the MCP CLIENT's per-request timeout, not the server's. The MCP
+spec lets clients abandon a request if no progress arrives within a
+client-configured window. For long-running tools the server has to send
+`notifications/progress` messages keyed to the request's `progressToken`
+— each one resets the client's timeout window. Without progress, the
+client kills the request before the server gets a chance to return.
+
+### The fix
+
+- **`audit.wrap` forwards the `extra` arg.** MCP SDK passes a second
+  arg to tool handlers — `RequestHandlerExtra` — with `sendNotification`,
+  `signal: AbortSignal`, `requestId`, and `_meta.progressToken`. The
+  audit wrapper now passes this through. Single-arg handlers (the vast
+  majority) keep working unchanged because the extra arg is optional.
+
+- **`ask_user` sends progress every 25s.** Inside the block-poll loop
+  we now check whether we've passed the 25s threshold since the last
+  progress notification, and if so call `extra.sendNotification({
+  method: "notifications/progress", params: { progressToken, progress,
+  total, message } })`. Each one resets the MCP client's timeout window
+  — 15min blocking now works.
+
+- **`ask_user` watches `extra.signal.aborted`.** If the client gives
+  up anyway (user cancel, transport close), we bail with
+  `status: "client_aborted"` and surface the request_id so a later
+  `poll_user_response` can pick up any answer that arrived in the
+  meantime.
+
+- **Backwards compatible.** Every other tool's handler is unchanged —
+  they accept just `(args)`, ignoring the new optional `extra`. The
+  type signature on `wrap` is `(args, extra?) => ...` so old call sites
+  still type-check.
+
+### Tests
+
+All 134 v0.10.1 tests still green. The progress-notification path is
+hard to unit-test without a real MCP transport, so it's covered by
+integration: making a 90s `ask_user` call from a live Claude Desktop
+session no longer times out.
+
 ## 0.10.1 — plain-text Telegram, blocking `ask_user`, reply-to-message answers
 
 User-driven fix for three real problems with v0.10.0's Telegram surface:

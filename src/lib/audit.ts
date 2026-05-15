@@ -52,16 +52,24 @@ export class AuditLog {
   /**
    * Wrap a tool handler so every invocation is audited. Captures duration,
    * success/failure, and a short summary of the result.
+   *
+   * v0.10.2+: the wrapped handler may optionally accept a second `extra`
+   * argument (the MCP SDK's RequestHandlerExtra: abort signal,
+   * sendNotification, requestId, etc.). This is needed by long-running
+   * tools like `ask_user` that send periodic progress notifications to
+   * reset the MCP client's per-request timeout. The wrap forwards `extra`
+   * through transparently. Older single-arg handlers (the vast majority)
+   * remain compatible because their handler simply ignores the second arg.
    */
   wrap<TArgs extends Record<string, unknown>, TResult>(
     toolName: string,
-    handler: (args: TArgs) => Promise<TResult>,
+    handler: (args: TArgs, extra?: unknown) => Promise<TResult>,
     extractIds?: (args: TArgs, result?: TResult) => { planId?: string; sessionId?: string }
-  ): (args: TArgs) => Promise<TResult> {
-    return async (args: TArgs) => {
+  ): (args: TArgs, extra?: unknown) => Promise<TResult> {
+    return async (args: TArgs, extra?: unknown) => {
       const started = Date.now();
       try {
-        const result = await handler(args);
+        const result = await handler(args, extra);
         const ids = extractIds?.(args, result) ?? {};
         await this.append({
           ts: started,
