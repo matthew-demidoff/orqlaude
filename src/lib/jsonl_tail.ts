@@ -171,11 +171,21 @@ export async function snapshotSession(
   // v0.8.0: invalidate on inode change (file was replaced) OR mtime regression
   // (clock rewind or replace) OR file-shrank (truncate). Catches the same-size
   // truncation case the v0.2 cache missed.
+  //
+  // v0.9.3: also invalidate when the cached byteOffset already covers the
+  // current size AND mtime has advanced. This catches the "unlink + recreate
+  // with same size" case on Linux ext4/tmpfs, where the kernel readily
+  // reuses the freed inode number for the immediately-created replacement -
+  // so `entry.inode !== stat.ino` doesn't fire. macOS APFS doesn't reuse
+  // inodes that aggressively, which is why the v0.8.0 test passed locally
+  // on Mac but failed under the Linux CI runner. Append-during-growth is
+  // unaffected because byteOffset < stat.size in that case (the size grew).
   if (
     entry &&
     (entry.byteOffset > stat.size ||
       entry.inode !== stat.ino ||
-      entry.mtimeMs > stat.mtimeMs)
+      entry.mtimeMs > stat.mtimeMs ||
+      (entry.byteOffset === stat.size && entry.mtimeMs !== stat.mtimeMs))
   ) {
     cache.delete(streamPath);
     entry = undefined;
