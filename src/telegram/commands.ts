@@ -8,21 +8,19 @@ import type { TelegramMessage, TelegramCallbackQuery } from "./api.js";
 /**
  * Telegram command handlers.
  *
- * Supported commands (all require whitelisted sender):
- *   /start        — register the sender (one-shot welcome)
- *   /help         — list commands
- *   /plans        — list active plans in the watched project(s)
- *   /status <id>  — refreshed status of one plan
- *   /show <id>    — full plan JSON (truncated)
- *   /notes <id>   — recent notes for a plan
- *   /kill <plan> <task> <reason>  — STOP a task
- *   /whitelist <user_id> [label]  — owner-only: add a user
- *   /approve <plan_id> <token>    — confirm a plan from Telegram (future)
+ * v0.10.1: NO MARKDOWN anywhere. All replies are plain text. Three answer
+ * paths for questions:
+ *   1. Native reply-to-message (PRIMARY) — user replies to the question
+ *      message; we match by reply_to_message.message_id.
+ *   2. Inline-keyboard button — when the question has `options`, callback_query
+ *      resolves the request by shortId.
+ *   3. /respond <short_id> <text> — legacy fallback for power users; never
+ *      removed because it's the only path that works in group chats with
+ *      multiple bots, etc.
  *
- * Each project's state is read via StateStore against that project's path.
- * The single configured set of watchedProjects determines which projects are
- * accessible. For v0.3 we support a single watched project at a time; the
- * config schema is forward-compatible for multi-project later.
+ * Slash commands:
+ *   /start, /help, /whoami, /plans, /status <id>, /show <id>, /notes <id>,
+ *   /kill <plan> <task> <reason>, /whitelist <user_id> [label], /respond
  */
 
 export async function handleCommand(
@@ -36,12 +34,10 @@ export async function handleCommand(
   if (!userId) return;
 
   const cfg = await loadConfig();
-  // /start is open: it just prints the sender's ID so they can be whitelisted later.
   if (text === "/start") {
     await api.sendMessage(
       chatId,
-      `👋 orqlaude bot.\n\nYour Telegram user id: \`${userId}\`\n\nAsk the bot owner to whitelist you with:\n\`orqlaude tg whitelist ${userId}\`\n\nOr if you ARE the owner and haven't set yourself up yet:\n\`orqlaude tg whitelist ${userId} --owner\``,
-      { parseMode: "Markdown" }
+      `👋 orqlaude bot.\n\nYour Telegram user id: ${userId}\n\nAsk the bot owner to whitelist you with:\norqlaude tg whitelist ${userId}\n\nOr if you ARE the owner and haven't set yourself up yet:\norqlaude tg whitelist ${userId} --owner`
     );
     return;
   }
@@ -51,22 +47,35 @@ export async function handleCommand(
     return;
   }
 
+  // v0.10.1: reply-to-message is the primary answer path. Before slash-command
+  // dispatch, check if this message is a reply to a known question. If so,
+  // resolve that request and bail — don't try to parse the body as a command.
+  if (msg.reply_to_message?.message_id && text && !text.startsWith("/")) {
+    const handled = await tryHandleReplyToQuestion(api, msg, projectDir);
+    if (handled) return;
+    // If we didn't find a matching question, fall through to the slash-command
+    // dispatcher so legitimate /respond etc. still works.
+  }
+
   const stateStore = new StateStore(`${projectDir}/.orqlaude`);
 
   if (text === "/help") {
     await api.sendMessage(
       chatId,
       [
-        "*orqlaude commands*",
-        "`/plans` — list active plans",
-        "`/status <plan_id>` — refresh one plan",
-        "`/show <plan_id>` — raw plan JSON",
-        "`/notes <plan_id>` — recent agent notes",
-        "`/kill <plan> <task> <reason>` — STOP a task",
-        "`/whoami` — your user id",
-        "`/help` — this",
-      ].join("\n"),
-      { parseMode: "Markdown" }
+        "orqlaude commands:",
+        "/plans — list active plans",
+        "/status <plan_id> — refresh one plan",
+        "/show <plan_id> — raw plan JSON",
+        "/notes <plan_id> — recent agent notes",
+        "/kill <plan> <task> <reason> — STOP a task",
+        "/whoami — your user id",
+        "/help — this",
+        "",
+        "To answer a question, REPLY TO THE MESSAGE in Telegram with your answer.",
+        "Or tap an inline-keyboard button if the question has options.",
+        "/respond <short_id> <text> still works as a fallback.",
+      ].join("\n")
     );
     return;
   }
@@ -88,19 +97,18 @@ export async function handleCommand(
     }
     const lines = plans.map((p) => {
       const done = p.tasks.filter((t) => t.status === "done").length;
-      return `• \`${p.id.slice(0, 8)}\` ${p.status} ${done}/${p.tasks.length} — ${truncate(p.rootTask, 50)}`;
+      return `• ${p.id.slice(0, 8)} ${p.status} ${done}/${p.tasks.length} — ${truncate(p.rootTask, 50)}`;
     });
-    await api.sendMessage(chatId, `*Active plans:*\n${lines.join("\n")}`, { parseMode: "Markdown" });
+    await api.sendMessage(chatId, `Active plans:\n${lines.join("\n")}`);
     return;
   }
 
-  // /status <plan_id> ---------------------------------------------------------
   if (text.startsWith("/status")) {
     const planId = text.split(/\s+/)[1];
     if (!planId) return void await api.sendMessage(chatId, "usage: /status <plan_id>");
     try {
       const plan = await stateStore.read((s) => requirePlan(s.plans, planId));
-      await api.sendMessage(chatId, await renderStatus(plan, projectDir), { parseMode: "Markdown" });
+      await api.sendMessage(chatId, await renderStatus(plan, projectDir));
     } catch (err) {
       await api.sendMessage(chatId, `error: ${(err as Error).message}`);
     }
@@ -113,7 +121,7 @@ export async function handleCommand(
     try {
       const plan = await stateStore.read((s) => requirePlan(s.plans, planId));
       const json = JSON.stringify(plan, null, 2);
-      await api.sendMessage(chatId, "```json\n" + truncate(json, 3500) + "\n```", { parseMode: "Markdown" });
+      await api.sendMessage(chatId, truncate(json, 3800));
     } catch (err) {
       await api.sendMessage(chatId, `error: ${(err as Error).message}`);
     }
@@ -135,16 +143,13 @@ export async function handleCommand(
         const blocking = n.blocking ? (n.acked ? "✓" : "🟡") : "";
         return `• [${truncate(taskTitle, 30)}]${blocking} ${truncate(n.text, 200)}${n.prUrl ? `\n  ${n.prUrl}` : ""}`;
       });
-      await api.sendMessage(chatId, `*Recent notes for ${planId.slice(0, 8)}:*\n${lines.join("\n\n")}`, {
-        parseMode: "Markdown",
-      });
+      await api.sendMessage(chatId, `Recent notes for ${planId.slice(0, 8)}:\n${lines.join("\n\n")}`);
     } catch (err) {
       await api.sendMessage(chatId, `error: ${(err as Error).message}`);
     }
     return;
   }
 
-  // /kill <plan> <task> <reason...>
   if (text.startsWith("/kill")) {
     const parts = text.split(/\s+/);
     const [, planId, taskId, ...reasonParts] = parts;
@@ -193,49 +198,72 @@ export async function handleCommand(
     return;
   }
 
-  // /respond <short_id> <text> — user replies to a request_user_response
+  // Legacy /respond <short_id> <text>.
   if (text.startsWith("/respond")) {
     const m = text.match(/^\/respond\s+(\S+)\s+([\s\S]+)$/);
     if (!m) return void await api.sendMessage(chatId, "usage: /respond <short_id> <your answer>");
     const [, shortId, answer] = m;
-    const store = new StateStore(path.join(projectDir, ".orqlaude"));
-    let edited: { messageId: number; chatId: number } | null = null;
-    const status = await store.update((state) => {
-      const found = findUserResponseRequest(state, shortId);
-      if (!found) return "not_found";
-      const { req } = found;
-      if (req.response !== undefined) return "already_answered";
-      if (req.cancelled) return "cancelled";
-      if (Date.now() > req.timeoutAt) return "timed_out";
-      req.response = answer;
-      req.respondedAt = Date.now();
-      if (req.telegramMessageId && req.telegramChatId) {
-        edited = { messageId: req.telegramMessageId, chatId: req.telegramChatId };
-      }
-      return "ok";
-    });
-    if (status === "ok") {
-      await api.sendMessage(chatId, `✓ Response recorded for ${shortId}.`);
-      if (edited) {
-        await api.editMessageText(
-          (edited as { messageId: number; chatId: number }).chatId,
-          (edited as { messageId: number; chatId: number }).messageId,
-          `✓ Answered (${shortId}): ${truncateForEdit(answer, 150)}`,
-          { parseMode: "Markdown" }
-        );
-      }
-    } else if (status === "not_found") {
-      await api.sendMessage(chatId, `no request with short_id ${shortId}`);
-    } else {
-      await api.sendMessage(chatId, `request ${shortId}: ${status}`);
-    }
+    await resolveQuestionByShortId(api, chatId, shortId, answer, projectDir);
     return;
   }
 
-  // Default: unknown command
   if (text.startsWith("/")) {
     await api.sendMessage(chatId, `unknown command. /help for the list.`);
   }
+}
+
+/**
+ * v0.10.1: try to match a non-slash message that's a reply-to of a bot
+ * message to a pending UserResponseRequest. Returns true if matched.
+ */
+async function tryHandleReplyToQuestion(
+  api: TelegramApi,
+  msg: TelegramMessage,
+  projectDir: string
+): Promise<boolean> {
+  const repliedToId = msg.reply_to_message?.message_id;
+  if (!repliedToId) return false;
+  const answer = (msg.text ?? "").trim();
+  if (!answer) return false;
+  const chatId = msg.chat.id;
+  const store = new StateStore(path.join(projectDir, ".orqlaude"));
+  let resolvedShortId: string | null = null;
+  let editTarget: { chatId: number; messageId: number } | null = null;
+  const status = await store.update((state) => {
+    const all = [
+      ...Object.values(state.plans).flatMap((p) => p.userResponseRequests),
+      ...(state.orphanResponseRequests ?? []),
+    ];
+    const req = all.find((r) => r.telegramMessageId === repliedToId && r.telegramChatId === chatId);
+    if (!req) return "no_match";
+    if (req.response !== undefined) return "already_answered";
+    if (req.cancelled) return "cancelled";
+    if (Date.now() > req.timeoutAt) return "timed_out";
+    req.response = answer;
+    req.respondedAt = Date.now();
+    resolvedShortId = req.shortId;
+    if (req.telegramMessageId && req.telegramChatId) {
+      editTarget = { chatId: req.telegramChatId, messageId: req.telegramMessageId };
+    }
+    return "ok";
+  });
+  if (status === "no_match") return false;
+  if (status === "ok" && resolvedShortId) {
+    // Acknowledge with a small ✓ message rather than spamming a long confirmation.
+    await api.sendMessage(chatId, `✓ Answer recorded (${resolvedShortId}).`);
+    if (editTarget) {
+      const e = editTarget as { chatId: number; messageId: number };
+      await api.editMessageText(
+        e.chatId,
+        e.messageId,
+        `✓ Answered (${resolvedShortId}): ${truncate(answer, 200)}`
+      );
+    }
+    return true;
+  }
+  // Recognized as a reply-to but not actionable — surface the status.
+  await api.sendMessage(chatId, `reply to question ${repliedToId}: ${status}`);
+  return true;
 }
 
 /**
@@ -262,7 +290,7 @@ export async function handleCallbackQuery(
   const idx = Number(idxStr);
   const store = new StateStore(path.join(projectDir, ".orqlaude"));
   let answer: string | null = null;
-  let edited: { messageId: number; chatId: number } | null = null;
+  let editTarget: { chatId: number; messageId: number } | null = null;
   const status = await store.update((state) => {
     const found = findUserResponseRequest(state, shortId);
     if (!found) return "not_found";
@@ -275,18 +303,18 @@ export async function handleCallbackQuery(
     req.response = answer;
     req.respondedAt = Date.now();
     if (req.telegramMessageId && req.telegramChatId) {
-      edited = { messageId: req.telegramMessageId, chatId: req.telegramChatId };
+      editTarget = { chatId: req.telegramChatId, messageId: req.telegramMessageId };
     }
     return "ok";
   });
   if (status === "ok" && answer !== null) {
     await api.answerCallbackQuery(q.id, `✓ ${answer as string}`);
-    if (edited) {
+    if (editTarget) {
+      const e = editTarget as { chatId: number; messageId: number };
       await api.editMessageText(
-        (edited as { messageId: number; chatId: number }).chatId,
-        (edited as { messageId: number; chatId: number }).messageId,
-        `✓ Answered (${shortId}): *${escapeMdLocal(answer as string)}*`,
-        { parseMode: "Markdown" }
+        e.chatId,
+        e.messageId,
+        `✓ Answered (${shortId}): ${answer as string}`
       );
     }
   } else {
@@ -294,11 +322,51 @@ export async function handleCallbackQuery(
   }
 }
 
-function escapeMdLocal(s: string): string {
-  return s.replace(/([_*`\[])/g, "\\$1");
+/**
+ * Shared resolution: by shortId (used by both /respond and tryHandleReplyToQuestion
+ * fallback). Plain-text everywhere.
+ */
+async function resolveQuestionByShortId(
+  api: TelegramApi,
+  chatId: number,
+  shortId: string,
+  answer: string,
+  projectDir: string
+): Promise<void> {
+  const store = new StateStore(path.join(projectDir, ".orqlaude"));
+  let editTarget: { chatId: number; messageId: number } | null = null;
+  const status = await store.update((state) => {
+    const found = findUserResponseRequest(state, shortId);
+    if (!found) return "not_found";
+    const { req } = found;
+    if (req.response !== undefined) return "already_answered";
+    if (req.cancelled) return "cancelled";
+    if (Date.now() > req.timeoutAt) return "timed_out";
+    req.response = answer;
+    req.respondedAt = Date.now();
+    if (req.telegramMessageId && req.telegramChatId) {
+      editTarget = { chatId: req.telegramChatId, messageId: req.telegramMessageId };
+    }
+    return "ok";
+  });
+  if (status === "ok") {
+    await api.sendMessage(chatId, `✓ Response recorded for ${shortId}.`);
+    if (editTarget) {
+      const e = editTarget as { chatId: number; messageId: number };
+      await api.editMessageText(
+        e.chatId,
+        e.messageId,
+        `✓ Answered (${shortId}): ${truncate(answer, 200)}`
+      );
+    }
+  } else if (status === "not_found") {
+    await api.sendMessage(chatId, `no request with short_id ${shortId}`);
+  } else {
+    await api.sendMessage(chatId, `request ${shortId}: ${status}`);
+  }
 }
 
-function truncateForEdit(s: string, n: number): string {
+function truncate(s: string, n: number): string {
   if (s.length <= n) return s;
   return s.slice(0, n - 1) + "…";
 }
@@ -327,14 +395,9 @@ async function renderStatus(plan: Plan, projectDir: string): Promise<string> {
   const tokK = Math.round(totalTokens / 1000);
   const capK = Math.round(plan.budgetCapTokens / 1000);
   return [
-    `*${plan.id.slice(0, 8)}* — ${plan.status}`,
-    `${truncate(plan.rootTask, 80)}`,
+    `${plan.id.slice(0, 8)} — ${plan.status}`,
+    truncate(plan.rootTask, 80),
     `tokens: ${tokK}k / ${capK}k`,
     ...taskLines,
   ].join("\n");
-}
-
-function truncate(s: string, n: number): string {
-  if (s.length <= n) return s;
-  return s.slice(0, n - 1) + "…";
 }

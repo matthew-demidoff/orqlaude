@@ -10,14 +10,20 @@ import type { TelegramConfig } from "./config.js";
 /**
  * Notifier: polls state for changes and pushes diffs to whitelisted chats.
  *
- * v0.4 adds two new outbound channels:
- *   • `userNotifications` — one-way pushes from primary Claude via notify_user.
- *   • `userResponseRequests` — questions from request_user_response. When
- *     `options` is set, we attach an inline keyboard. Telegram message_id and
- *     chat_id are persisted into the request so the bot can edit the
- *     question on response.
+ * v0.10.1: NO MARKDOWN. The Markdown-V1 parser was eating special chars in
+ * code paths (parens, dots, dashes inside backticks) and silently failing
+ * the send for some messages — users reported phantom "delivered: false"
+ * states. We send everything as plain text now. Inline keyboards still work
+ * fine because they're a separate transport field, and bold/italic visual
+ * styling was never worth the breakage cost. If we ever want rich text
+ * back we'll switch to HTML mode (which is more robust than MD-V1).
  *
- * v0.3.1 fixes (escapeMd, first-tick seed, atomic cursor) retained.
+ * v0.10.1 also moves the primary "answer a question" UX from inline
+ * keyboards to Telegram's native reply-to-message. Notifier sends the
+ * question with `forceReply: true`; the user's reply carries
+ * `reply_to_message.message_id` which `commands.ts` matches back to the
+ * UserResponseRequest. Inline keyboards are still attached when `options`
+ * are provided as a quick-pick shortcut.
  */
 
 interface NotifierCursor {
@@ -26,16 +32,11 @@ interface NotifierCursor {
   taskStatus: Record<string, string>;
   planStatus: Record<string, string>;
   alertedHallucinations: string[];
-  /** v0.4: ids of userNotifications already pushed to Telegram. */
   notifiedUserNotificationIds: string[];
-  /** v0.4: ids of userResponseRequests already pushed. */
   notifiedUserRequestIds: string[];
-  /** v0.5: ids of userStreams already opened on Telegram. */
   notifiedUserStreamIds: string[];
 }
 
-/** Minimum interval between edits to a streaming message (Telegram caps
- *  editMessageText at ~1/sec per chat; we use 1.5s for headroom). */
 const STREAM_EDIT_THROTTLE_MS = 1500;
 
 const EMPTY_CURSOR: NotifierCursor = {
@@ -84,8 +85,6 @@ export class Notifier {
     if (this.cfg.whitelist.length === 0) return;
     const cursor = await this.loadCursor();
     const store = new StateStore(path.join(this.projectDir, ".orqlaude"));
-    // v0.9.0: also pull orphan notification arrays so notify_user without a
-    // plan_id reaches Telegram.
     const { plans, orphanNotifications, orphanResponseRequests } = await store.read((s) => ({
       plans: Object.values(s.plans),
       orphanNotifications: s.orphanNotifications ?? [],
@@ -107,10 +106,7 @@ export class Notifier {
       return;
     }
 
-    // Plain text messages (no inline keyboard).
     const plainMessages: string[] = [];
-    // Response-request messages need persistence of message_id + chat_id.
-    // Format: { req, chatId, text, inlineKeyboard? }
     interface QuestionPush {
       req: UserResponseRequest;
       text: string;
@@ -124,18 +120,18 @@ export class Notifier {
       if (prevStatus !== plan.status) {
         if (!prevStatus && plan.status === "draft") {
           plainMessages.push(
-            `📋 *New plan* \`${plan.id.slice(0, 8)}\` — ${plan.tasks.length} task(s)\n${escapeMd(truncate(plan.rootTask, 100))}`
+            `📋 New plan ${plan.id.slice(0, 8)} — ${plan.tasks.length} task(s)\n${truncate(plan.rootTask, 100)}`
           );
         } else if (plan.status === "approved" && prevStatus !== "approved") {
-          plainMessages.push(`✅ *Approved* \`${plan.id.slice(0, 8)}\` — spawning ${plan.tasks.length} agents`);
+          plainMessages.push(`✅ Approved ${plan.id.slice(0, 8)} — spawning ${plan.tasks.length} agents`);
         } else if (plan.status === "collected") {
           const total = plan.tasks.length;
           const done = plan.tasks.filter((t) => t.status === "done").length;
-          plainMessages.push(`🎉 *Collected* \`${plan.id.slice(0, 8)}\` — ${done}/${total} tasks done`);
+          plainMessages.push(`🎉 Collected ${plan.id.slice(0, 8)} — ${done}/${total} tasks done`);
         } else if (plan.status === "cancelled_overbudget") {
-          plainMessages.push(`💸 *Auto-cancelled* \`${plan.id.slice(0, 8)}\` — fleet exceeded token budget`);
+          plainMessages.push(`💸 Auto-cancelled ${plan.id.slice(0, 8)} — fleet exceeded token budget`);
         } else if (plan.status === "cancelled") {
-          plainMessages.push(`❌ *Cancelled* \`${plan.id.slice(0, 8)}\``);
+          plainMessages.push(`❌ Cancelled ${plan.id.slice(0, 8)}`);
         }
         cursor.planStatus[plan.id] = plan.status;
       }
@@ -143,21 +139,19 @@ export class Notifier {
       for (const task of plan.tasks) {
         const prev = cursor.taskStatus[task.id];
         if (prev !== task.status) {
-          // v0.5: prefix every task-status message with the Agnet designation
-          // so the user sees who's reporting in.
-          const agnet = escapeMd(agnetLabel(task.agnetName));
-          const title = escapeMd(truncate(task.title, 50));
+          const agnet = agnetLabel(task.agnetName);
+          const title = truncate(task.title, 50);
           if (task.status === "done") {
             const prSuffix = task.prUrl ? `\n${task.prUrl}` : "";
-            plainMessages.push(`✓ *${agnet}* finished — _${title}_${prSuffix}`);
+            plainMessages.push(`✓ ${agnet} finished — ${title}${prSuffix}`);
           } else if (task.status === "failed") {
             plainMessages.push(
-              `❌ *${agnet}* failed — _${title}_${task.exitReason ? `\n${escapeMd(task.exitReason)}` : ""}`
+              `❌ ${agnet} failed — ${title}${task.exitReason ? `\n${task.exitReason}` : ""}`
             );
           } else if (task.status === "cancelled") {
-            plainMessages.push(`🛑 *${agnet}* cancelled — _${title}_`);
+            plainMessages.push(`🛑 ${agnet} cancelled — ${title}`);
           } else if (task.status === "running" && prev === "dispatched") {
-            plainMessages.push(`▶ *${agnet}* started — _${title}_`);
+            plainMessages.push(`▶ ${agnet} started — ${title}`);
           }
           cursor.taskStatus[task.id] = task.status;
         }
@@ -171,48 +165,41 @@ export class Notifier {
           continue;
         }
         const task = plan.tasks.find((t) => t.id === note.taskId);
-        const agnet = escapeMd(agnetLabel(task?.agnetName));
+        const agnet = agnetLabel(task?.agnetName);
         const blocking = note.blocking ? " 🟡 blocking" : "";
         plainMessages.push(
-          `📝 *${agnet}*${blocking}\n${escapeMd(truncate(note.text, 300))}${note.prUrl ? `\n${note.prUrl}` : ""}`
+          `📝 ${agnet}${blocking}\n${truncate(note.text, 300)}${note.prUrl ? `\n${note.prUrl}` : ""}`
         );
         cursor.lastNoteId = note.id;
       }
 
-      // ---- v0.4: user notifications ----
+      // ---- user notifications ----
       for (const n of plan.userNotifications) {
         if (cursor.notifiedUserNotificationIds.includes(n.id)) continue;
         const emoji = URGENCY_EMOJI[n.urgency] ?? URGENCY_EMOJI.normal;
-        plainMessages.push(`${emoji} ${escapeMd(n.text)}`);
+        plainMessages.push(`${emoji} ${n.text}`);
         cursor.notifiedUserNotificationIds.push(n.id);
       }
 
-      // ---- v0.4: user response requests ----
+      // ---- user response requests ----
       for (const r of plan.userResponseRequests) {
         if (cursor.notifiedUserRequestIds.includes(r.id)) continue;
         if (r.cancelled || r.response !== undefined) {
-          // Already resolved before we got to it; just record so we don't re-send.
           cursor.notifiedUserRequestIds.push(r.id);
           continue;
         }
-        const headline = `❓ *Question from orqlaude* \\(${r.shortId}\\)\n${escapeMd(r.prompt)}`;
-        const trailer = r.options
-          ? ""
-          : `\n\nReply with: \`/respond ${r.shortId} <your answer>\``;
-        const text = headline + trailer;
-        const inlineKeyboard = r.options
-          ? buildInlineKeyboard(r.shortId, r.options)
-          : undefined;
+        const text = buildQuestionText(r);
+        const inlineKeyboard = r.options ? buildInlineKeyboard(r.shortId, r.options) : undefined;
         questionPushes.push({ req: r, text, inlineKeyboard });
         cursor.notifiedUserRequestIds.push(r.id);
       }
     }
 
-    // ---- v0.9.0: orphan notifications (no plan_id) ----
+    // ---- orphan notifications (no plan_id) ----
     for (const n of orphanNotifications) {
       if (cursor.notifiedUserNotificationIds.includes(n.id)) continue;
       const emoji = URGENCY_EMOJI[n.urgency] ?? URGENCY_EMOJI.normal;
-      plainMessages.push(`${emoji} ${escapeMd(n.text)}`);
+      plainMessages.push(`${emoji} ${n.text}`);
       cursor.notifiedUserNotificationIds.push(n.id);
     }
     for (const r of orphanResponseRequests) {
@@ -221,35 +208,26 @@ export class Notifier {
         cursor.notifiedUserRequestIds.push(r.id);
         continue;
       }
-      const headline = `❓ *Question from orqlaude* \\(${r.shortId}\\)\n${escapeMd(r.prompt)}`;
-      const trailer = r.options
-        ? ""
-        : `\n\nReply with: \`/respond ${r.shortId} <your answer>\``;
-      const text = headline + trailer;
-      const inlineKeyboard = r.options
-        ? buildInlineKeyboard(r.shortId, r.options)
-        : undefined;
+      const text = buildQuestionText(r);
+      const inlineKeyboard = r.options ? buildInlineKeyboard(r.shortId, r.options) : undefined;
       questionPushes.push({ req: r, text, inlineKeyboard });
       cursor.notifiedUserRequestIds.push(r.id);
     }
 
-    // Persist cursor BEFORE we attempt sends — so a failed network call
-    // doesn't cause re-spam on retry.
     await this.saveCursor();
 
-    // Send plain notifications to every whitelisted chat.
+    // Send plain notifications. NO parse_mode — v0.10.1 ships plain text.
     for (const entry of this.cfg.whitelist) {
       for (const msg of plainMessages) {
         try {
-          await this.api.sendMessage(entry.chatId, msg, { parseMode: "Markdown" });
+          await this.api.sendMessage(entry.chatId, msg);
         } catch (err) {
           process.stderr.write(`[orqlaude tg notifier] send to ${entry.chatId} failed: ${(err as Error).message}\n`);
         }
       }
     }
 
-    // v0.6.0: also fire macOS notifications if the user opted in via
-    // `orql notify on`. Best-effort; never blocks Telegram delivery.
+    // Local macOS notifications (opt-in).
     try {
       const prefs = await readPreferences();
       if (prefs.localNotifications && plainMessages.length > 0) {
@@ -259,57 +237,53 @@ export class Notifier {
         }
       }
     } catch {
-      /* swallow — local notifications are best-effort */
+      /* swallow */
     }
 
-    // ---- stream handling (edit-based, v0.5.4+) ----
-    //
-    // sendMessageDraft was tried in v0.5.1 but didn't reliably exist in the
-    // standard Bot API, so we're back to the original v0.5.0 transport:
-    // one sendMessage to open the message, then editMessageText for each
-    // update, with a final edit to add the ✓ marker on stream end.
+    // Streams.
     for (const plan of plans) {
       for (const stream of plan.userStreams) {
         const isNew = !cursor.notifiedUserStreamIds.includes(stream.id);
         const hasNewContent = stream.lastDeliveredContent !== stream.content;
         const justEnded = stream.status === "ended" && !stream.finalSent;
         if (!isNew && !hasNewContent && !justEnded) continue;
-
-        // Throttle to stay under Telegram's edit rate limit (~1/sec).
         const now = Date.now();
         if (!isNew && !justEnded && stream.lastEditedAt && now - stream.lastEditedAt < STREAM_EDIT_THROTTLE_MS) {
           continue;
         }
-
         for (const entry of this.cfg.whitelist) {
           await openOrEditEditMode(this.api, store, stream, entry.chatId, justEnded);
         }
-
         if (isNew) cursor.notifiedUserStreamIds.push(stream.id);
       }
     }
 
-    // Send question pushes. Persist message_id back into state so the bot
-    // can edit on response.
+    // Send question pushes. Plain text + optional inline keyboard.
+    // forceReply pops Telegram's input pre-targeted at this message so the
+    // user can just type without remembering /respond syntax.
     for (const qp of questionPushes) {
       for (const entry of this.cfg.whitelist) {
         try {
+          // If we have inline-keyboard options, those take precedence over
+          // forceReply (Telegram won't let us set both). Otherwise use
+          // forceReply to bias the user toward replying to this message.
+          const useForceReply = !qp.inlineKeyboard;
           const { message_id } = await this.api.sendMessage(entry.chatId, qp.text, {
-            parseMode: "Markdown",
             inlineKeyboard: qp.inlineKeyboard,
+            forceReply: useForceReply,
           });
-          // Save message_id + chat_id of FIRST whitelisted recipient so the
-          // bot can edit the question into a "✓ answered" form on response.
           if (qp.req.telegramMessageId === undefined) {
             await store.update((state) => {
-              for (const plan of Object.values(state.plans)) {
-                const r = plan.userResponseRequests.find((x) => x.id === qp.req.id);
-                if (r) {
-                  r.telegramMessageId = message_id;
-                  r.telegramChatId = entry.chatId;
-                  r.delivered = true;
-                  r.deliveredAt = Date.now();
-                }
+              const all = [
+                ...Object.values(state.plans).flatMap((p) => p.userResponseRequests),
+                ...(state.orphanResponseRequests ?? []),
+              ];
+              const r = all.find((x) => x.id === qp.req.id);
+              if (r) {
+                r.telegramMessageId = message_id;
+                r.telegramChatId = entry.chatId;
+                r.delivered = true;
+                r.deliveredAt = Date.now();
               }
             });
           }
@@ -321,21 +295,39 @@ export class Notifier {
   }
 }
 
+/**
+ * Build the plain-text body of a question message. v0.10.1: tells the user
+ * to REPLY to this message (using Telegram's native reply UI) — that's the
+ * primary path. If `options` are set, an inline keyboard is also attached
+ * as a quick-pick.
+ */
+function buildQuestionText(r: UserResponseRequest): string {
+  const lines: string[] = [];
+  lines.push(`❓ ${r.prompt}`);
+  if (r.options && r.options.length > 0) {
+    lines.push("");
+    lines.push("Tap a button below, OR reply to this message with your answer.");
+  } else {
+    lines.push("");
+    lines.push("Reply to this message with your answer.");
+  }
+  // Show the short id for fallback /respond use, but in plain text.
+  lines.push("");
+  lines.push(`(id: ${r.shortId})`);
+  return lines.join("\n");
+}
+
 function formatStreamMessage(stream: UserStream): string {
-  // Title bold; body plain (caller-escaped if they care).
+  // No Markdown — plain text title + body.
   const body = stream.content ? `\n${stream.content}` : "";
-  return `*${escapeMd(stream.title)}*${body}`;
+  return `${stream.title}${body}`;
 }
 
 function formatStreamEnded(stream: UserStream): string {
   const body = stream.content ? `\n${stream.content}` : "";
-  return `*${escapeMd(stream.title)}* ✓${body}`;
+  return `${stream.title} ✓${body}`;
 }
 
-/**
- * Edit-mode fallback: maintain a single persistent Telegram message via
- * sendMessage + editMessageText. Used when sendMessageDraft is unavailable.
- */
 async function openOrEditEditMode(
   api: TelegramApi,
   store: StateStore,
@@ -344,9 +336,8 @@ async function openOrEditEditMode(
   justEnded: boolean
 ): Promise<void> {
   if (!stream.telegramMessageId) {
-    // First time on this chat — send the message.
     try {
-      const { message_id } = await api.sendMessage(chatId, formatStreamMessage(stream), { parseMode: "Markdown" });
+      const { message_id } = await api.sendMessage(chatId, formatStreamMessage(stream));
       await store.update((state) => {
         for (const p of Object.values(state.plans)) {
           const s = p.userStreams.find((x) => x.id === stream.id);
@@ -359,10 +350,9 @@ async function openOrEditEditMode(
           }
         }
       });
-      // If the stream is already ended, do one more edit to mark complete.
       if (justEnded) {
         try {
-          await api.editMessageText(chatId, message_id, formatStreamEnded(stream), { parseMode: "Markdown" });
+          await api.editMessageText(chatId, message_id, formatStreamEnded(stream));
           await store.update((state) => {
             for (const p of Object.values(state.plans)) {
               const s = p.userStreams.find((x) => x.id === stream.id);
@@ -379,10 +369,9 @@ async function openOrEditEditMode(
     return;
   }
 
-  // Subsequent updates — edit in place.
   try {
     const text = justEnded ? formatStreamEnded(stream) : formatStreamMessage(stream);
-    await api.editMessageText(stream.telegramChatId!, stream.telegramMessageId, text, { parseMode: "Markdown" });
+    await api.editMessageText(stream.telegramChatId!, stream.telegramMessageId, text);
     await store.update((state) => {
       for (const p of Object.values(state.plans)) {
         const s = p.userStreams.find((x) => x.id === stream.id);
@@ -398,14 +387,9 @@ async function openOrEditEditMode(
   }
 }
 
-/**
- * Strip Markdown decoration from a queued Telegram message and split into
- * a short title + remaining body suitable for a desktop notification.
- * Falls back to the whole message as body when there's no clear split.
- */
 function splitForNotification(msg: string): { title: string; body: string } {
-  // Strip markdown bold/italic markers, leading emoji-and-asterisks, etc.
-  const plain = msg.replace(/[*_`]/g, "").replace(/\\([_*`\[])/g, "$1").trim();
+  // No Markdown to strip anymore, but keep the line-split logic.
+  const plain = msg.trim();
   const newlineAt = plain.indexOf("\n");
   if (newlineAt === -1 || newlineAt > 80) {
     return { title: plain.slice(0, 80), body: plain.length > 80 ? plain.slice(80, 280) : "" };
@@ -414,10 +398,6 @@ function splitForNotification(msg: string): { title: string; body: string } {
 }
 
 function buildInlineKeyboard(shortId: string, options: string[]): InlineKeyboardButton[][] {
-  // Two columns max; one row per pair. callback_data format:
-  //   orq:resp:<shortId>:<optionIdx>
-  // Telegram's callback_data is capped at 64 bytes; shortId (8) + prefix (~10)
-  // + index (1-2) is well under.
   const rows: InlineKeyboardButton[][] = [];
   for (let i = 0; i < options.length; i += 2) {
     const row: InlineKeyboardButton[] = [
@@ -432,12 +412,12 @@ function buildInlineKeyboard(shortId: string, options: string[]): InlineKeyboard
 }
 
 /**
- * Escape Telegram MarkdownV1 reserved chars in user-supplied strings:
- * `_ * ` [`. Backslashing parens / hyphens / dots etc. is unnecessary in
- * V1 (those are syntax only in V2 / MarkdownV2).
+ * Retained as an exported no-op for back-compat — older code (and any
+ * third-party plugin we don't know about) imports `escapeMd` from here.
+ * v0.10.1 doesn't ship Markdown anymore so escaping is a pass-through.
  */
 export function escapeMd(s: string): string {
-  return s.replace(/([_*`\[])/g, "\\$1");
+  return s;
 }
 
 function truncate(s: string, n: number): string {
