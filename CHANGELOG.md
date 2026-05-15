@@ -1,5 +1,74 @@
 # Changelog
 
+## 0.10.8 — cross-process staleness fix (StateStore.read())
+
+### The bug user caught
+
+User tapped a button in Telegram. Bot UI confirmed "✓ Answer recorded
+(b96fb626): A. per-deal + websocket". State.json on disk had the
+response. But MCP server's `wait_for_user_response` loop returned
+`still_pending` over and over for 7+ minutes.
+
+User: *"the orql still does not know how to detect if Ive answered
+because when I do on telegram it does not tell him that therefore you
+are not informed and stuck in an infinite loop, we need to find our
+solution to this"*
+
+Right diagnosis. `StateStore.read()` in v0.10.7 and earlier:
+
+```ts
+const state = this.cache ?? (await this.loadFresh());
+return reader(state);
+```
+
+Once the cache was populated (any prior read or update), `read()`
+returned the cached state forever. `update()` always reloaded from
+disk (good — picks up cross-process writes before mutating). But
+`read()` had no invalidation path. The Telegram bot (separate process)
+wrote responses to state.json; our cache stayed stale forever.
+
+This explains why `wait_for_status_change` "worked" earlier — it polls
+fleet state which OUR process mutates (no cross-process write
+involved). But ask_user → bot → response was a true cross-process
+write that read() couldn't see.
+
+### Fix
+
+Stat-check on every read. If the file's mtime moved since we last
+cached, reload from disk.
+
+```ts
+private async cacheIsStale(): Promise<boolean> {
+  if (!this.cache || this.cacheMtimeMs === null) return true;
+  try {
+    const stat = await fs.stat(this.filePath);
+    return stat.mtimeMs !== this.cacheMtimeMs;
+  } catch (err) {
+    return err.code === "ENOENT";
+  }
+}
+```
+
+`persist()` also refreshes `cacheMtimeMs` after its own write, so OUR
+writes don't trip a needless reload on the next read.
+
+Single `fs.stat` per read (~1ms). Worth the cost.
+
+### Tests
+
+4 new tests in `v0108.test.ts`:
+- Cross-process write becomes visible on the very next read()
+- Own writes don't trigger needless reloads
+- Empty state (no file) reads as EMPTY_STATE
+- Tight bot-write + read race sees the new value
+
+**147 total, all green.**
+
+### Migration
+
+No state migration. Existing state files load cleanly. Cache
+invalidation kicks in immediately after upgrade.
+
 ## 0.10.7 — re-spawn hygiene (stale exit-record + lingering stopRequested)
 
 ### Two bugs surfaced by the Verdant re-spawn in self-test fleet d47c0448
