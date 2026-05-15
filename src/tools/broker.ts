@@ -78,20 +78,55 @@ export function registerBroker(server: McpServer, store: StateStore, audit: Audi
                 .flatMap((p) => p.tasks)
                 .find((t) => t.id === task_id);
               if (anyMatch && anyMatch.spawnedSessionId) {
-                return {
-                  registered: false,
-                  conflict: {
-                    kind: "task_already_claimed",
-                    task_id,
-                    claimed_by_session: anyMatch.spawnedSessionId,
-                    task_title: anyMatch.title,
-                    explanation: `Task ${task_id} is already claimed by session ${anyMatch.spawnedSessionId}. Your prompt's task_id is stale or duplicated — flag it to the orchestrator.`,
-                  },
-                  messages: [],
-                  stop_signal: null,
-                  blocking_notes_acked: [],
-                  guidance: "STOP and post_note to the orchestrator. Don't do work that won't be tracked.",
-                };
+                // v0.10.5+: defense-in-depth for session-id rotation.
+                // spawn_via_cli pre-allocates a session_id and writes it
+                // into task.spawnedSessionId BEFORE the agent starts. If
+                // the agent's checkin arrives with a different session_id
+                // AND the task has no recorded activity yet (no
+                // last_activity_at, no notes, no commit), treat this as
+                // "the spawned process resolved its session_id differently
+                // than orqlaude pre-allocated" and accept the rotation.
+                // The window is narrow: once the agent has done any work,
+                // a different session_id IS a genuine conflict.
+                //
+                // We detect "fresh task" by checking startedAt minus a 60s
+                // grace window AND no posted notes from this task.
+                const wasJustSpawned =
+                  anyMatch.startedAt !== undefined && Date.now() - anyMatch.startedAt < 60_000;
+                const noNotesYet = !Object.values(state.plans)
+                  .flatMap((p) => p.notes)
+                  .some((n) => n.taskId === task_id);
+                if (wasJustSpawned && noNotesYet) {
+                  // Rotate the spawnedSessionId to what the agent reports.
+                  // This is safe because the task_id is a UUID known only
+                  // to the legitimately-spawned agent (orqlaude writes it
+                  // into the prompt + .orqlaude.mcp.json which only the
+                  // child process can read).
+                  anyMatch.spawnedSessionId = session_id;
+                  // Walk plans to set `found` properly.
+                  for (const p of Object.values(state.plans)) {
+                    if (p.tasks.some((t) => t.id === task_id)) {
+                      found = { plan: p, task: anyMatch };
+                      break;
+                    }
+                  }
+                  selfRegistered = true;
+                } else {
+                  return {
+                    registered: false,
+                    conflict: {
+                      kind: "task_already_claimed",
+                      task_id,
+                      claimed_by_session: anyMatch.spawnedSessionId,
+                      task_title: anyMatch.title,
+                      explanation: `Task ${task_id} is already claimed by session ${anyMatch.spawnedSessionId}. Your prompt's task_id is stale or duplicated — flag it to the orchestrator.`,
+                    },
+                    messages: [],
+                    stop_signal: null,
+                    blocking_notes_acked: [],
+                    guidance: "STOP and post_note to the orchestrator. Don't do work that won't be tracked.",
+                  };
+                }
               }
             }
           }
