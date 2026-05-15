@@ -183,6 +183,171 @@ User says: *"Refactor the auth system — magic-link login, update the docs, add
 8. `orqlaude.collect` → three PR URLs and summaries.
 9. **NEW**: `orqlaude.review_prs(plan_id)` → spawns three reviewer agents, one per PR. Each reviews, runs tests, posts findings. You aggregate the second-round notes.
 
+## Asking the user (v0.10.4 pattern)
+
+`ask_user` and its companion `wait_for_user_response` are the bounded-block loop primary Claude uses to put a question on Telegram and stay alive past the MCP host's 60s per-request timeout.
+
+The split exists because Claude Desktop and Claude Code both use the SDK default `DEFAULT_REQUEST_TIMEOUT_MSEC = 60000`. v0.10.2's progress notifications turned out to be ignored unless the client passes `resetTimeoutOnProgress: true` (it doesn't), so a single blocking call can't outrun the host. Instead, `ask_user` blocks at most 45s (the new `initial_block_sec`, capped at 45). The question's overall lifetime is `total_timeout_sec` (default 900s, max 3600s) -- that's how long it stays answerable. If the user replies inside the first window, you get `status: "answered"`. Otherwise you get `status: "still_pending"` with a `short_id`, and the caller must invoke `wait_for_user_response(short_id)` to keep waiting.
+
+Loop pattern (TS pseudocode):
+
+```ts
+let result = await ask_user({
+  prompt: "Approve the auth refactor plan?",
+  options: ["Approve", "Hold off"],
+  total_timeout_sec: 1800,
+});
+
+while (result.status === "still_pending") {
+  result = await wait_for_user_response({ short_id: result.short_id });
+}
+// result.status is now "answered" / "timed_out" / "cancelled"
+```
+
+Each call stays safely under 60s. A fast answer is one round-trip; a 5-minute wait is roughly 7 round-trips, no `ScheduleWakeup`-and-come-back required.
+
+Telegram side is plain text only (no Markdown), so escaping bugs can't silently swallow a send. The notifier ships each question with `force_reply` enabled -- the user just types and their reply carries `reply_to_message.message_id`, which the bot matches back to the request. Inline-keyboard buttons fire the same answer path when `options` are provided; `/respond <short_id> <text>` remains as a manual fallback.
+
+## Autopilot daemon
+
+A persistent orchestrator that ticks every 10 seconds, picks goals off the backlog, auto-reviews PRs, retries failed Agnets, and watches the budget. Opt-in -- nothing runs in the background unless you start it.
+
+Five tick-loop phases:
+
+1. **Reconcile state** -- for every spawned Agnet, refresh from JSONL, PID, and exit-record; promote `died_at_launch` / `done` / `failed`.
+2. **Recover from failures** -- classify each failure via a Plan-billed `claude -p` turn, then retry with backoff, spawn a debugger Agnet, or escalate to the user via Telegram.
+3. **Auto-review PRs** -- fetch the diff, run a reviewer turn, apply the fleet template's auto-merge rule, and either `gh pr merge` or `gh pr comment`.
+4. **Pick the next goal** -- when the fleet is idle and autopilot is unpaused, pull the highest-priority unblocked goal from the backlog and prompt the user via Telegram.
+5. **Watch the budget** -- yellow / orange / red thresholds; auto-pause at orange.
+
+CLI:
+
+```sh
+orql autopilot start            # foreground; daemonize with launchd / systemd / nohup
+orql autopilot stop
+orql autopilot pause            # stop picking new work; in-flight Agnets keep running
+orql autopilot resume
+orql autopilot status
+```
+
+Plan-billing note: the daemon **never** talks to the Anthropic API. Every intelligent decision (failure classifier, PR reviewer, Telegram intent classifier, template suggester) is a `claude -p` invocation. On the Max plan that bills like an interactive Claude Code session, and cache reads are free, so a full day of ticking burns a tiny fraction of quota.
+
+## Durable memory
+
+A `memory.json` file at `<state_dir>/memory.json` holds long-lived facts that outlive plan lifecycles. Four spirit-themed categories, each with a different surfacing rule:
+
+- **lore** -- facts about the user. Pinned, slow churn, injected into every spawned Agnet prompt. _Example: "Russian comments in CRM templates", "no auto-deploy on Fridays."_
+- **playbook** -- code conventions. Scope-tagged by path-glob; injected when a fleet's scope overlaps. _Example: "migrations live in `<app>/migrations/`", "use AntD ConfigProvider for dark mode."_
+- **ledger** -- decisions plus rationale. Append-only; surfaced when a similar decision recurs. _Example: "Sonnet over Opus for transcription, latency mattered more than depth."_
+- **atlas** -- project map. Auto-updated by the post-PR review with one entry per touched file mapping path to purpose.
+
+Pinned entries always load. Scope-tagged entries (typically playbook and atlas) auto-inject into a spawn prompt when the Agnet's worktree scope matches any of the entry's globs -- you don't have to remember to thread conventions through manually.
+
+MCP tools:
+
+```
+remember(category, key, value, { pinned?, scopeGlobs?, rationale? })
+recall(category?, key?, scopeMatch?)
+forget(category, key)
+compose_memory_context(scopeGlobs?, max_tokens?)
+```
+
+Older entries with the same `(category, key)` are soft-superseded: kept for history but invisible to read paths. `compose_memory_context` is the function the spawn pipeline uses internally; call it directly to preview the block that will be injected for a given scope before you commit to spawning.
+
+## Backlog
+
+A `backlog.json` file holds `Goal` records -- durable task descriptions the daemon (or you) can pick from when idle.
+
+Shape:
+
+```json
+{
+  "id": "g_8f3...",
+  "title": "Rotate JWT signing keys quarterly",
+  "priority": 70,
+  "deadlineAt": "2026-06-30T00:00:00Z",
+  "dependsOn": ["g_5c1..."],
+  "createdAt": "2026-05-12T10:14:00Z",
+  "status": "pending"
+}
+```
+
+Priority is 0-100. `deadlineAt` boosts effective priority as the deadline approaches (linear ramp over the last 14 days, so something due tomorrow with priority 40 beats a no-deadline priority 70 item). `dependsOn` is a list of goal ids; a goal is blocked until every parent has `status: "done"`.
+
+MCP tools:
+
+```
+enqueue_goal(title, { priority?, deadlineAt?, dependsOn?, source? })
+list_goals({ status?, includeBlocked? })
+update_goal(id, { priority?, deadlineAt?, dependsOn?, status? })
+pick_next_goal()
+```
+
+`pick_next_goal` returns the highest-priority unblocked pending goal, factoring in deadline boost. The autopilot daemon calls this on every idle tick; when something comes back it surfaces the goal to the user via Telegram for confirmation before spawning a fleet, so you keep approval-in-the-loop even when the orchestrator is running unattended.
+
+## Fleet templates
+
+Eight named patterns ship out of the box. Each defines a default Agnet layout, a suggested model per role (haiku / sonnet / opus), a default budget, and an `AutoMergeRule` the daemon applies to PRs produced by the fleet.
+
+| id | what it does | auto-merge rule |
+|---|---|---|
+| `backend-feature` | Django/DRF: model + migration + serializer + viewset + admin + tests | requireCi, maxLoc 2500 |
+| `frontend-feature` | React/AntD: components + hooks + i18n + tests | requireCi, maxLoc 2000 |
+| `migration-only` | Schema change with backwards-compat reviewer (opus) | requireReviewerApprove; `blockOnMigrations: false` (migrations are the point) |
+| `audit-sweep` | Multiple haiku auditors + sonnet synthesizer (read-only) | requireReviewerApprove (no merge) |
+| `dep-upgrade` | Dep version bump + breaking-change patches + reviewer | requireCi, requireReviewerApprove |
+| `i18n-pass` | Audit, then translator pass | requireCi, maxLoc 3000 |
+| `test-coverage-fill` | Parallel testers; blocks PRs that touch prod code | requireCi, blockOnPaths globs for non-test files |
+| `bug-hunt` | Reproducer Agnet then fixer Agnet (sequential) | requireReviewerApprove, requireCi |
+
+MCP tools:
+
+```
+list_fleet_templates()
+suggest_fleet_template(goal_text)    # Plan-billed turn picks the best fit
+apply_fleet_template(template_id, { goal, scope, budget_override? })
+```
+
+`suggest_fleet_template` makes a single `claude -p` call that returns `{ template_id, confidence, reason }`. The autopilot daemon uses this to turn a freeform goal description into a concrete fleet definition without manual plan authoring. `apply_fleet_template` then expands the chosen template into a real plan via `create_plan`, with the template's auto-merge rule attached for later use by the auto-review pipeline.
+
+## Auto-PR-review
+
+When the autopilot daemon is running, every PR produced by a template-driven fleet gets a reviewer turn and an auto-merge attempt.
+
+The reviewer turn runs `gh pr view` for the diff and metadata, feeds them into a strict-JSON `claude -p` prompt, and parses the response `{ verdict, blockers, suggestions, summary }` where `verdict` is `APPROVE` / `REQUEST_CHANGES` / `COMMENT`. The summary is appended as a PR comment regardless of verdict so you have a paper trail.
+
+The fleet template's `AutoMergeRule` then decides whether to merge:
+
+```json
+{
+  "requireReviewerApprove": true,
+  "requireCi": true,
+  "maxLoc": 2500,
+  "blockOnMigrations": false,
+  "blockOnPaths": ["**/settings.py", "**/secrets/**"]
+}
+```
+
+- `requireReviewerApprove` -- the reviewer's verdict must be `APPROVE`.
+- `requireCi` -- `gh pr checks` must come back all-green.
+- `maxLoc` -- additions plus deletions under cap. Larger PRs route to user.
+- `blockOnMigrations` -- refuses PRs that add files under `*/migrations/` (used by templates that aren't supposed to touch schema).
+- `blockOnPaths` -- refuses PRs touching specific globs.
+
+If every check passes the daemon runs `gh pr merge --squash --auto --delete-branch`. Otherwise it `gh pr comment`s with the verdict and blockers and leaves the PR open. Each review writes a `ledger` memory entry so the next fleet inherits the rationale.
+
+## Cost guardrails
+
+A `guardrails.json` rolling ledger tracks billed tokens against two windows: a 5-hour rolling window (matching Anthropic's Plan reset cadence) and a per-local-day soft cap (default 30M billed tokens).
+
+Three threshold bands on the rolling window:
+
+- **yellow** at 60% -- notify the user, daemon slows inter-tick interval.
+- **orange** at 80% -- daemon auto-pauses; refuses to start new fleets; in-flight Agnets keep running but no new spawns happen.
+- **red** at 95% -- halt entirely; await user `/resume` after the next 5h reset.
+
+The day soft-cap applies independently of the rolling window -- you can sit comfortably in green on the 5h window and still cross the day cap if you've been running multiple windows back to back. Both checks happen on every autopilot tick, and the orange auto-pause uses the same code path as `orql autopilot pause`: it surfaces in `orql autopilot status` and is undone with `orql autopilot resume` once the window has rolled.
+
 ## State
 
 orqlaude resolves its state directory at startup using this order (first match wins):
