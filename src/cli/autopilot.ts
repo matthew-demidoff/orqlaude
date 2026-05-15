@@ -367,11 +367,17 @@ async function tick(
     // Force pause for new goals until next window.
     if (!existsSync(pauseFile())) writeFileSync(pauseFile(), `orange_at_${Date.now()}\n`);
   } else if (snap.level === "red") {
-    await pushOrphanNotification(
-      store,
-      `🔴 Budget window at ${Math.round(snap.windowPct * 100)}% — autopilot HALTED. Use /resume after the next 5h reset.`,
-      "high"
-    );
+    // Rate-limit to every 18 ticks (~3 min). Without this the red branch
+    // would post a high-urgency Telegram on every tick (every 10s) — a
+    // sustained red event across a 5h Plan window would spam ~1,800
+    // notifications. 3 min is louder than orange (5 min) but not insane.
+    if (state.ticks % 18 === 0) {
+      await pushOrphanNotification(
+        store,
+        `🔴 Budget window at ${Math.round(snap.windowPct * 100)}% — autopilot HALTED. Use /resume after the next 5h reset.`,
+        "high"
+      );
+    }
     if (!existsSync(pauseFile())) writeFileSync(pauseFile(), `red_at_${Date.now()}\n`);
   }
   if (opts.verbose && state.ticks % 6 === 0) {
