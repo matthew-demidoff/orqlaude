@@ -2,6 +2,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { isProcessAlive, sleep } from "./process_lib.js";
+import { pickAgnetName } from "./agnet.js";
 
 /**
  * orqlaude state store — single JSON file per project, atomically written
@@ -478,11 +479,24 @@ export function newPlan(
   budgetCapTokens: number,
   tasksInput: Array<Omit<Task, "id" | "status">>
 ): Plan {
-  const tasks: Task[] = tasksInput.map((t) => ({
-    ...t,
-    id: randomUUID(),
-    status: "pending" as const,
-  }));
+  // v0.9.6+: assign a stable Agnet name to every task here, so all
+  // callers — `create_plan`, `review_prs`, and any future plan-creating
+  // tool — get named tasks automatically. Before this, only `create_plan`
+  // ran its own pickAgnetName loop; review fleets shipped without names,
+  // showing as bare "Agnet" in CLI / Telegram output. If a caller
+  // pre-populated `agnetName` (rare; mostly tests), we honor it.
+  const taken = new Set<string>();
+  const tasks: Task[] = tasksInput.map((t) => {
+    const id = randomUUID();
+    const agnetName = t.agnetName ?? pickAgnetName(id, taken);
+    taken.add(agnetName);
+    return {
+      ...t,
+      id,
+      status: "pending" as const,
+      agnetName,
+    };
+  });
   return {
     id: randomUUID(),
     createdAt: Date.now(),
