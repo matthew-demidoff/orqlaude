@@ -1,5 +1,86 @@
 # Changelog
 
+## 0.10.9 — pre-spawn worktree hygiene + finer-grained fingerprint
+
+Three small fixes for issues that surfaced during the Email Hub polish
++ fix-up fleets, where the orchestrator repeatedly couldn't trust the
+snapshot's view of agent state and the long-poll missed real progress.
+
+### Bug 1: stale `.orqlaude.stdout.log` / `.orqlaude.stderr.log` survive worktree recreate
+
+v0.10.7 added `fs.unlink(.orqlaude.exit.json)` before each spawn so the
+snapshot's `terminated: !!exitRecord` fast-path wouldn't read a prior
+agent's exit record. The same problem applies to the stdout/stderr
+logs: when a worktree is removed + recreated for a re-spawn (or a new
+agent in a similarly-named worktree), the prior stdout.log content can
+hang around long enough for one or two `snapshotSession` calls to
+return the OLD agent's tokens / lastAssistantText / terminated flag.
+
+**Fix**: pre-spawn unlink covers all three files now. Same loop as
+the exit.json fix:
+
+```ts
+for (const stalePath of [exitJsonPathPre, stdoutPath, stderrPath]) {
+  try { await fs.unlink(stalePath); } catch { /* normal */ }
+}
+```
+
+Then `fs.open(path, "w")` for stdout/stderr creates fresh inodes,
+which maximizes the chance v0.8.0's `entry.inode !== stat.ino` check
+fires immediately on the next snapshot.
+
+### Bug 2: snapshot cache survives across spawns on the same worktree path
+
+The module-level `cache: Map<string, CacheEntry>` in `jsonl_tail.ts`
+is keyed by stream path. If two consecutive spawns share a worktree
+path (re-spawn, or a near-collision in plan_short / agnet_slug), the
+SECOND spawn can see the FIRST's cached `snap` for one or two ticks
+before the inode/mtime/size invalidation catches up. Symptom: the new
+agent's `tokens_used` reads as the old agent's final count.
+
+**Fix**: new `evictTailCacheEntry(streamPath)` export on `jsonl_tail.ts`.
+`spawn_via_cli` calls it for the new agent's stdoutPath after the
+unlink loop, BEFORE the new agent starts writing. No-op when nothing
+is cached. Defense-in-depth.
+
+### Bug 3: fingerprint bucket too coarse for the early/mid lifecycle
+
+`wait_for_status_change` bucketed `billed_tokens / 1024`. For an agent
+climbing slowly through the 1k-4k billed range (read-heavy work,
+Russian comments, careful test writing), the bucket stays at 1 or 2
+for minutes, so the long-poll returns `changed: false` every 45s
+despite real progress.
+
+**Fix**: bucket is `/256` now — same units (256 tokens are a roughly
+meaningful chunk of work) but 4x finer granularity. Cache-read churn
+still filtered because we bucket on `billed`, not `total`. The
+long-poll wakes ~4x more often during slow burns; once per ~256
+billed tokens.
+
+### Tests
+
+6 new tests in `v0109.test.ts`:
+- `evictTailCacheEntry` drops a single entry without affecting siblings
+- Source-level: spawn_cli unlinks all three files in a single loop
+- Source-level: spawn_cli imports + calls `evictTailCacheEntry`
+- Source-level: dispatch.ts uses `/256` not `/1024`
+- Math check: /256 trips ~4x more buckets than /1024 over a 0→4096 climb
+- Integration: snapshot reload after eviction reflects fresh content
+
+1 updated test in `v0107.test.ts` to match the new loop pattern.
+
+**195 total, all green.**
+
+### Migration notes
+
+No state migration. The cache eviction is purely in-process and
+backward-compatible (it's a no-op if nothing is cached at the path).
+The fingerprint bucket change is a behavior tweak — old fingerprints
+won't match new ones after upgrade, but `wait_for_status_change`'s
+"first call returns immediately with current state + fresh fingerprint"
+contract means the orchestrator just resynchronizes naturally on its
+first post-upgrade poll.
+
 ## 0.10.8 — cross-process staleness fix (StateStore.read())
 
 ### The bug user caught

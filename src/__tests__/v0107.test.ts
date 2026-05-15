@@ -18,6 +18,9 @@ import path from "node:path";
  */
 
 test("v0.10.7: spawn_cli unlinks stale .orqlaude.exit.json before spawn", async () => {
+  // v0.10.9 extended this from a single fs.unlink(exitJsonPathPre) to a
+  // loop covering exit.json + stdout.log + stderr.log. The exit-record
+  // path is still unlinked, just inside the loop now.
   const src = await fs.readFile(
     path.join(import.meta.dirname, "..", "..", "src", "lib", "spawn_cli.ts"),
     "utf8"
@@ -27,8 +30,8 @@ test("v0.10.7: spawn_cli unlinks stale .orqlaude.exit.json before spawn", async 
     "spawn_cli should pre-unlink the exit json with a named variable"
   );
   assert.ok(
-    /fs\.unlink\(exitJsonPathPre\)/.test(src),
-    "spawn_cli should actually attempt to unlink the prior exit json"
+    /fs\.unlink\(stalePath\)/.test(src) || /fs\.unlink\(exitJsonPathPre\)/.test(src),
+    "spawn_cli should attempt to unlink the prior exit json (directly or via the v0.10.9 loop)"
   );
   assert.ok(
     src.indexOf("exitJsonPathPre") < src.indexOf("spawn(claudeBin"),
