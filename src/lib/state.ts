@@ -522,14 +522,31 @@ export function findUserStream(state: State, streamId: string): { plan: Plan; st
   return undefined;
 }
 
+/**
+ * Find a UserResponseRequest by full id or 8-char shortId.
+ *
+ * v0.10.3+: also searches `state.orphanResponseRequests` (plan-less requests
+ * created by ask_user / request_user_response without a plan_id). Before
+ * this, the discovery only walked plan-attached arrays — so a user who
+ * answered an orphan question via Telegram saw the bot ACK their reply
+ * (because the reply-to handler in commands.ts already searched both
+ * arrays) but `poll_user_response` / ask_user's own blocking poll loop
+ * returned `unknown` / `timed_out` because they used this function and
+ * never saw the answer. Plan is now optional in the return type — orphan
+ * requests don't have a parent plan.
+ */
 export function findUserResponseRequest(
   state: State,
   requestId: string
-): { plan: Plan; req: UserResponseRequest } | undefined {
+): { plan?: Plan; req: UserResponseRequest } | undefined {
   for (const plan of Object.values(state.plans)) {
     const req = plan.userResponseRequests.find((r) => r.id === requestId || r.shortId === requestId);
     if (req) return { plan, req };
   }
+  const orphan = (state.orphanResponseRequests ?? []).find(
+    (r) => r.id === requestId || r.shortId === requestId
+  );
+  if (orphan) return { req: orphan };
   return undefined;
 }
 

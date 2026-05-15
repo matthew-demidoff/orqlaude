@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.10.3 — `findUserResponseRequest` now searches orphan requests too
+
+The hidden bug that made `ask_user` *seem* broken even though everything
+on the Telegram side was working.
+
+### The bug
+
+`ask_user` (and `request_user_response`) without a `plan_id` create a
+request in `state.orphanResponseRequests` — the plan-less queue
+introduced in v0.9.0 for session-level questions.
+
+The user replies to the question in Telegram. `commands.ts`'s reply-to-
+message handler correctly searches BOTH arrays (plan-attached + orphan),
+finds the request, writes the response, and the bot confirms.
+
+So far so good. BUT `findUserResponseRequest` in `state.ts` only
+searched `plan.userResponseRequests`. That function is used by:
+
+- `poll_user_response` — to read the answer
+- `ask_user`'s own blocking poll loop — to detect "we have an answer"
+- `commands.ts` `/respond` and `handleCallbackQuery` fallback paths
+
+All four called the discovery function which had a blind spot, so the
+answer was invisible from the MCP-server side even though it was sitting
+in state. User reports: "I did answer; you didn't get it."
+
+### The fix
+
+Single-function change in `state.ts`: `findUserResponseRequest` now also
+walks `state.orphanResponseRequests`, with plans taking precedence
+(plan-attached match wins if there's a collision on shortId — vanishingly
+unlikely with UUIDs but tested anyway). The return type changes from
+`{plan, req}` to `{plan?, req}` because orphan requests have no parent.
+
+All five existing callers destructure `{req}` only — none read `plan` —
+so making it optional is non-breaking. Type-check confirms.
+
+### Tests
+
+2 new tests in `v0101.test.ts`:
+1. `findUserResponseRequest` finds an orphan request by full id AND
+   short id; returned `plan` is `undefined`.
+2. Plan-attached requests take precedence over orphan in the unlikely
+   shortId collision case; returned `plan` is present.
+
+136 total, all green.
+
 ## 0.10.2 — MCP progress notifications keep `ask_user` alive past client timeout
 
 ### The bug v0.10.1 didn't catch

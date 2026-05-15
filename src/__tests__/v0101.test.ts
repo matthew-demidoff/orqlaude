@@ -116,6 +116,74 @@ test("v0.10.1: writing a response sets responded_at and persists", async () => {
   assert.ok(after?.respondedAt && after.respondedAt > 0);
 });
 
+test("v0.10.3: findUserResponseRequest also searches orphan array", async () => {
+  // The bug: ask_user without plan_id puts the request in orphanResponseRequests.
+  // The bot's reply-to-message handler correctly searched both arrays, but
+  // findUserResponseRequest (used by poll_user_response and ask_user's own
+  // blocking poll) only searched plan-attached. Result: user answers an orphan
+  // question via Telegram, bot writes response into state, but the MCP-side
+  // discovery returns "unknown" and the blocking call times out — even though
+  // the answer exists in state.
+  const { findUserResponseRequest } = await import("../lib/state.js");
+  const dir = await tempDir("orphan-lookup");
+  const store = new StateStore(dir);
+  const id = "orphan-find-test-id-12345678";
+  await store.update((state) => {
+    state.orphanResponseRequests = state.orphanResponseRequests ?? [];
+    state.orphanResponseRequests.push({
+      id,
+      shortId: id.slice(0, 8),
+      prompt: "find me",
+      createdAt: Date.now(),
+      timeoutAt: Date.now() + 60_000,
+      delivered: false,
+      response: "the answer",
+      respondedAt: Date.now(),
+    });
+  });
+  const byFullId = await store.read((s) => findUserResponseRequest(s, id));
+  assert.ok(byFullId);
+  assert.equal(byFullId!.req.response, "the answer");
+  assert.equal(byFullId!.plan, undefined, "orphan requests have no parent plan");
+  const byShortId = await store.read((s) => findUserResponseRequest(s, id.slice(0, 8)));
+  assert.ok(byShortId);
+  assert.equal(byShortId!.req.response, "the answer");
+});
+
+test("v0.10.3: plan-attached requests still take precedence over orphan", async () => {
+  // If somehow the same short_id collides (vanishingly unlikely with UUIDs
+  // but tests the resolution order), the plan-attached one wins because we
+  // walk plans first.
+  const { findUserResponseRequest, newPlan } = await import("../lib/state.js");
+  const dir = await tempDir("orphan-vs-plan");
+  const store = new StateStore(dir);
+  const sharedId = "collision-test-id-12345678abcd";
+  await store.update((state) => {
+    const plan = newPlan("test", 1000, [{ title: "t", tldr: "t", prompt: "p" }]);
+    plan.userResponseRequests.push({
+      id: sharedId,
+      shortId: sharedId.slice(0, 8),
+      prompt: "from plan",
+      createdAt: Date.now(),
+      timeoutAt: Date.now() + 60_000,
+      delivered: false,
+    });
+    state.plans[plan.id] = plan;
+    state.orphanResponseRequests = state.orphanResponseRequests ?? [];
+    state.orphanResponseRequests.push({
+      id: sharedId,
+      shortId: sharedId.slice(0, 8),
+      prompt: "from orphan",
+      createdAt: Date.now(),
+      timeoutAt: Date.now() + 60_000,
+      delivered: false,
+    });
+  });
+  const got = await store.read((s) => findUserResponseRequest(s, sharedId));
+  assert.equal(got!.req.prompt, "from plan");
+  assert.ok(got!.plan, "plan-attached match should include its plan");
+});
+
 test("v0.10.1: cancelled requests short-circuit before answering", async () => {
   const dir = await tempDir("cancelled");
   const store = new StateStore(dir);
