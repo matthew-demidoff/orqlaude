@@ -1,5 +1,195 @@
 # Changelog
 
+## 0.10.0 — autopilot daemon, memory, auto-PR-review, retry, Telegram free-form, backlog scheduler
+
+The biggest single release since v0.5. Adds a persistent orchestrator
+daemon that runs in the background, picks goals off a durable backlog,
+auto-reviews and merges PRs by configurable rule, retries failed Agnets
+intelligently, and listens for free-form Telegram messages — all
+**Plan-billed** (no Anthropic API key required). Every "thinking" turn
+uses `claude -p` with cache reads, which are free on the Claude Max plan,
+so a full day of the daemon ticking burns a tiny fraction of the quota.
+
+### The autopilot daemon (`orql autopilot`)
+
+`orql autopilot start` runs a long-lived Node process that ticks every
+10 seconds and:
+
+1. **Reconciles state** — for every spawned Agnet, refreshes from JSONL,
+   PID, and exit-record; promotes `died_at_launch` / `done` / `failed`.
+2. **Recovers from failures** — classifies each failure via a Plan-billed
+   `claude -p` turn (haiku-cheap), then either retries with backoff,
+   spawns a debugger Agnet, or escalates to the user via Telegram.
+3. **Auto-reviews PRs** — fetches the diff, runs a reviewer turn,
+   applies the fleet template's auto-merge rule, and either
+   `gh pr merge --squash --auto` or posts a review comment.
+4. **Picks the next goal** — when the fleet is idle and autopilot is
+   unpaused, pulls the highest-priority unblocked goal from the
+   backlog and prompts the user via Telegram.
+5. **Watches the budget** — yellow / orange / red thresholds with
+   automatic pause at orange+.
+
+Plan-billing note: orqlaude **never** talks to the Anthropic API. Every
+intelligent decision the daemon makes is a `claude -p` invocation, which
+on the Max plan is billed exactly the way an interactive Claude Code
+session is — and cache reads are free, so the cost of repeatedly reading
+"is this PR mergeable?" is approximately zero output tokens worth of
+quota each.
+
+CLI surface: `orql autopilot start|stop|status|pause|resume`.
+
+### Memory module — durable, spirit-themed categories
+
+A `memory.json` file at `<state_dir>/memory.json` holds four kinds of
+durable facts (separate from the plan-bound state file so it survives
+plan lifecycles):
+
+- **lore** — facts about the user. Pinned, slow churn, surfaced into
+  every spawned Agnet prompt. _Example: "Russian comments in CRM
+  templates", "no auto-deploy on Fridays."_
+- **playbook** — code conventions. Surfaced when a fleet's scope
+  overlaps with the entry's path-glob. _Example: "Migrations live in
+  `<app>/migrations/`", "use AntD ConfigProvider for dark mode."_
+- **ledger** — past decisions + their rationale. Append-only; surfaced
+  when a similar decision recurs. _Example: "Sonnet over Opus for
+  transcription — latency mattered more than depth."_
+- **atlas** — project map. Auto-updated by the post-PR review with one
+  entry per touched file mapping path → purpose.
+
+New MCP tools: `remember`, `recall`, `forget`, `compose_memory_context`.
+Older entries with the same `(category, key)` are soft-superseded — kept
+for history but invisible to read paths.
+
+### Backlog scheduler
+
+A `backlog.json` file holds `Goal` records — durable task descriptions
+with `priority` (0-100), optional `deadlineAt` (boosts effective
+priority as the deadline approaches), and `dependsOn` (block until
+parents are done).
+
+The daemon picks the highest-priority unblocked goal when idle and
+proposes it via Telegram. Primary Claude can also use this mid-session
+to capture "things to do next" without immediately spawning a fleet.
+
+New MCP tools: `enqueue_goal`, `list_goals`, `update_goal`,
+`pick_next_goal`.
+
+### Fleet templates
+
+Eight named patterns ship out of the box, each with default Agnet
+layout, suggested model per role (sonnet/opus/haiku), default budget,
+and an `AutoMergeRule` the daemon applies:
+
+| id | description |
+|---|---|
+| `backend-feature` | Django/DRF: model + migration + serializer + viewset + admin + tests |
+| `frontend-feature` | React/AntD: components + hooks + i18n + tests |
+| `migration-only` | Schema change with backwards-compat reviewer (opus) — `block_on_migrations:true` |
+| `audit-sweep` | Multiple haiku auditors + sonnet synthesizer (read-only) |
+| `dep-upgrade` | Dep version bump + breaking-change patches + reviewer |
+| `i18n-pass` | Audit then translator pass |
+| `test-coverage-fill` | Parallel testers; blocks on prod-code touches |
+| `bug-hunt` | Reproducer Agnet → fixer Agnet (sequential) |
+
+New MCP tools: `list_fleet_templates`, `suggest_fleet_template`,
+`apply_fleet_template`.
+
+### Auto-PR-review + auto-merge
+
+For every fleet that uses a template with an `AutoMergeRule`, the
+daemon fetches the PR via `gh pr view`, runs a reviewer turn that
+returns strict JSON (`{verdict, blockers, suggestions, summary}`),
+and applies the rule:
+
+- `requireReviewerApprove` — verdict must be APPROVE
+- `requireCi` — `gh pr checks` must be all-green
+- `maxLoc` — additions + deletions under cap (default 1500-3000 per
+  template)
+- `blockOnMigrations` — refuses PRs that add migration files
+- `blockOnPaths` — refuses PRs touching specific globs (e.g.
+  `**/settings.py`, `**/views.py` for the test-coverage-fill template)
+
+If everything passes: `gh pr merge --squash --auto --delete-branch`.
+Otherwise: `gh pr comment` with the review verdict + blockers. Each
+review writes a `ledger` memory entry so the next fleet inherits the
+rationale.
+
+### Retry logic — died_at_launch + failed-after-work-started
+
+Two failure modes get distinct handling:
+
+- **died_at_launch** (PID gone within ~1.5s of spawn): auto-retry up
+  to 2 times with 30s backoff. After exhausted, escalate via Telegram.
+- **failed-after-work-started**: classify via a Plan-billed turn. The
+  classifier decides between `retry` (flaky), `spawn_debugger` (need
+  investigation), `escalate` (user attention), or `give_up`. Debugger
+  Agnets read the worktree + logs + JSONL and write a ledger memory
+  entry capturing "X failed because Y; next time do Z."
+
+### Telegram free-form input + slash commands
+
+v0.9 only listened for `/respond <short_id> <text>`. v0.10 makes the
+bot listen to **every** message and classify intent via a Plan-billed
+turn:
+
+- `new_task` → enqueue_goal
+- `followup` → post_note to the most-recent active plan, or enqueue
+- `kill` → request_stop / kill_task on matched plan
+- `status` → fleet_summary → notify_user
+- `chitchat` → ack or ignore
+
+Below a 0.6 confidence threshold, the daemon asks the user to confirm
+before acting (`AskUserQuestion`-style).
+
+New slash commands: `/now`, `/queue`, `/pause`, `/resume`, `/morning`,
+`/pulse`, `/budget` (in addition to the existing `/respond`).
+
+### Cost guardrails
+
+A `guardrails.json` rolling ledger tracks billed tokens per 5-hour
+window and per local day:
+
+- **green** (< 60% window): full speed
+- **yellow** (≥ 60%): notify user, slow down
+- **orange** (≥ 80%): refuse to start new fleets, force pause
+- **red** (≥ 95%): halt entirely, await user `/resume` after next 5h
+  reset
+
+Day soft-cap (default 30M billed) applies independently.
+
+### Orchestrator-turn helper
+
+New `lib/orch_turn.ts` exposes `runOrchTurn()` — the daemon's thinking
+primitive. Spawns `claude -p` synchronously, parses the strict-JSON
+response (handles ` ```json` fences and prose-wrapped JSON), enforces
+timeout. This is THE reason the daemon can exist without an API key —
+every "intelligent" decision in the daemon (failure classifier,
+Telegram intent classifier, PR reviewer) goes through this one
+function.
+
+### Files
+
+- `src/lib/memory.ts` + `src/tools/memory.ts`
+- `src/lib/backlog.ts` + `src/tools/backlog.ts`
+- `src/lib/templates.ts` + `src/tools/templates.ts`
+- `src/lib/orch_turn.ts`
+- `src/lib/auto_merge.ts`
+- `src/lib/retry.ts`
+- `src/lib/tg_classifier.ts`
+- `src/lib/guardrails.ts`
+- `src/cli/autopilot.ts`
+- `src/__tests__/v010.test.ts` — 27 new tests, 129 total green
+
+### Migration notes
+
+- `<state_dir>/memory.json`, `<state_dir>/backlog.json`, and
+  `<state_dir>/guardrails.json` are created on first write. No
+  migration of existing state files required.
+- The MCP `server.ts` now registers three additional tool modules.
+  Existing tool names are unchanged.
+- `orql autopilot` is opt-in — nothing runs in the background unless
+  the user starts the daemon explicitly.
+
 ## 0.9.2 — billed-vs-cached token accounting + budget enforcement on long-poll
 
 Fixes the budget-cap UX for users on the Claude Plan, and closes a real
