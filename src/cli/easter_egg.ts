@@ -2,19 +2,41 @@ import { TAGLINES } from "./taglines.js";
 import { style } from "../lib/style.js";
 
 /**
- * Bare `orql` easter egg — a never-repeating typewriter cycling through
- * 149 tagline variants under the orqlaude diamond logo. Runs until Ctrl-C.
+ * Bare `orql` easter egg — typewriter cycling through 149 tagline variants
+ * beneath the orqlaude diamond. Runs until Ctrl-C / Ctrl-D.
  *
- * The natural terminal cursor sits at the end of each tagline while it's
- * displayed and blinks on its own — no explicit blink animation needed.
+ * v0.9.3 rewrite. Two fixes over the v0.6.1 implementation:
+ *
+ *   1. **Stdin echo no longer bleeds into the line.** Previously the
+ *      terminal was in cooked mode with echo on, so anything the user
+ *      typed at the keyboard while the animation ran was printed inline
+ *      with the tagline — and the `\b \b` erase pass walked back over
+ *      their characters too, leaving partial garbage when the next
+ *      tagline started. Now we put stdin in raw mode and silently
+ *      swallow every byte except Ctrl-C (0x03) and Ctrl-D (0x04).
+ *
+ *   2. **Full-screen ownership + resize-aware redraw.** Enters the
+ *      alternate screen buffer (\x1b[?1049h, the same mode vim / less /
+ *      htop use) so the orqlaude logo claims the entire viewport while
+ *      running, with nothing else visible. On exit, the original shell
+ *      contents are restored. We repaint the full frame from top-left on
+ *      every animation tick AND on `process.stdout` resize events — so
+ *      the watermark always lives in the top-left corner regardless of
+ *      window size.
+ *
+ * If stdout isn't a TTY (piped, CI, redirected), we fall back to a
+ * single-line static print and exit immediately. Animation only happens
+ * when there's an interactive terminal on the other end.
  */
 
 const ESC = "\x1b[";
-const SAVE = `${ESC}s`;
-const RESTORE = `${ESC}u`;
-const CLEAR_TO_EOL = `${ESC}K`;
-const SAND_FG = `${ESC}38;2;185;182;171m`;
-const RESET = `${ESC}0m`;
+const ALT_SCREEN_ENTER = `${ESC}?1049h`;
+const ALT_SCREEN_LEAVE = `${ESC}?1049l`;
+const HIDE_CURSOR = `${ESC}?25l`;
+const SHOW_CURSOR = `${ESC}?25h`;
+const CLEAR_SCREEN = `${ESC}2J`;
+const MOVE_TO_HOME = `${ESC}H`;
+const moveTo = (row: number, col: number) => `${ESC}${row};${col}H`;
 
 const TYPE_MIN_MS = 28;
 const TYPE_MAX_MS = 90;
@@ -25,68 +47,140 @@ const ERASE_MAX_MS = 30;
 const BETWEEN_MIN_MS = 280;
 const BETWEEN_MAX_MS = 600;
 
+// Layout: 1-based rows/cols (ANSI convention).
+// Row 1: blank padding so the logo doesn't kiss the top edge.
+// Row 2-4: logo + wordmark + tagline.
+// The tagline starts at column 14 (after `   ◆◆◆      ` which is exactly
+// 13 visible chars when the ANSI color codes are stripped: 3 spaces + 3
+// glyphs + 6 spaces + 1 = column 14 for the first tagline char).
+const LOGO_ROW = 2;
+const WORDMARK_ROW = 3;
+const TAGLINE_ROW = 4;
+const TAGLINE_COL = 14;
+
 export async function runEasterEgg(): Promise<number> {
+  // Non-TTY fallback (piped, redirected, CI). No animation, no alt screen.
+  if (!process.stdout.isTTY) {
+    process.stdout.write(
+      `◆ orqlaude — ${TAGLINES[0]}\n`
+    );
+    return 0;
+  }
+
   return new Promise<number>((resolve) => {
     let stopped = false;
-    const onSig = () => {
+    let currentText = "";
+
+    const cleanup = () => {
+      try {
+        if (process.stdin.isTTY && process.stdin.setRawMode) {
+          process.stdin.setRawMode(false);
+        }
+      } catch {
+        /* harmless on shutdown */
+      }
+      process.stdin.removeListener("data", onData);
+      process.stdin.pause();
+      process.stdout.off("resize", onResize);
+      process.removeListener("SIGINT", stop);
+      process.stdout.write(SHOW_CURSOR + ALT_SCREEN_LEAVE);
+    };
+
+    const stop = () => {
+      if (stopped) return;
       stopped = true;
-      // Move cursor below the tagline line and reset, then exit.
-      process.stdout.write(RESET + "\n\n");
+      cleanup();
       resolve(0);
     };
-    process.on("SIGINT", onSig);
 
-    // Static logo + wordmark. Last line ends without a newline so the
-    // cursor sits where taglines should animate.
-    const logo = [
-      `   ${style.coral("◆◆◆")}`,
-      `  ${style.coral("◆   ◆")}     ${style.bold(style.coral("orqlaude"))}`,
-      `   ${style.coral("◆◆◆")}      `, // trailing spaces are the "padding" before the tagline
-    ];
-    process.stdout.write("\n" + logo.join("\n"));
-    process.stdout.write(SAVE);
+    // Raw-mode keystroke capture. Every byte is swallowed; Ctrl-C / Ctrl-D
+    // exit. This is what stops the user's keyboard from echoing into the
+    // animation.
+    const onData = (chunk: Buffer) => {
+      for (const byte of chunk) {
+        if (byte === 0x03 /* Ctrl-C */ || byte === 0x04 /* Ctrl-D */) {
+          stop();
+          return;
+        }
+        // All other input is silently discarded.
+      }
+    };
 
-    // Animate in a loop. We do this without `await` in the main scope so
-    // SIGINT can interrupt cleanly via the `stopped` flag check between
-    // sleeps.
+    // Repaint the full frame from the top-left. Called on every animation
+    // tick and on terminal resize. Idempotent.
+    const paintFrame = () => {
+      const out: string[] = [
+        MOVE_TO_HOME,
+        CLEAR_SCREEN,
+        moveTo(LOGO_ROW, 4),
+        style.coral("◆◆◆"),
+        moveTo(WORDMARK_ROW, 3),
+        style.coral("◆   ◆"),
+        "     ",
+        style.bold(style.coral("orqlaude")),
+        moveTo(TAGLINE_ROW, 4),
+        style.coral("◆◆◆"),
+        moveTo(TAGLINE_ROW, TAGLINE_COL),
+        style.sand(currentText),
+      ];
+      process.stdout.write(out.join(""));
+    };
+
+    const onResize = () => {
+      paintFrame();
+    };
+
+    // Initial setup.
+    process.stdout.write(ALT_SCREEN_ENTER + HIDE_CURSOR);
+    try {
+      if (process.stdin.isTTY && process.stdin.setRawMode) {
+        process.stdin.setRawMode(true);
+      }
+      process.stdin.resume();
+      process.stdin.on("data", onData);
+    } catch {
+      /* if raw mode isn't available, we'll only react to SIGINT */
+    }
+    process.on("SIGINT", stop);
+    process.stdout.on("resize", onResize);
+    paintFrame();
+
+    // Animation loop.
     (async () => {
       let lastIdx = -1;
       while (!stopped) {
         let idx = Math.floor(Math.random() * TAGLINES.length);
-        // Never repeat the previous tagline.
         while (idx === lastIdx) {
           idx = Math.floor(Math.random() * TAGLINES.length);
         }
         lastIdx = idx;
         const tagline = TAGLINES[idx];
 
-        // Reset cursor + clear any leftover from the previous tagline.
-        process.stdout.write(RESTORE + CLEAR_TO_EOL + SAND_FG);
-
-        // Type out character by character. Each char is plain text — the
-        // SAND_FG above persists until we reset, so a single \b backspace
-        // erases one visible character.
-        for (let i = 0; i < tagline.length; i++) {
+        // Type out character by character. Repainting the whole frame
+        // each tick is overkill, but it's correct under resize and
+        // makes the code easier to reason about than tracking partial
+        // updates.
+        for (let i = 1; i <= tagline.length; i++) {
           if (stopped) return;
-          process.stdout.write(tagline[i]);
+          currentText = tagline.slice(0, i);
+          paintFrame();
           await sleep(rand(TYPE_MIN_MS, TYPE_MAX_MS));
         }
 
-        // Hold while the natural terminal cursor blinks at the end.
         await sleep(rand(HOLD_MIN_MS, HOLD_MAX_MS));
         if (stopped) return;
 
-        // Erase backwards for a satisfying "delete" feel.
-        for (let i = tagline.length; i > 0; i--) {
+        for (let i = tagline.length - 1; i >= 0; i--) {
           if (stopped) return;
-          process.stdout.write("\b \b");
+          currentText = tagline.slice(0, i);
+          paintFrame();
           await sleep(rand(ERASE_MIN_MS, ERASE_MAX_MS));
         }
-        process.stdout.write(RESET);
+
         await sleep(rand(BETWEEN_MIN_MS, BETWEEN_MAX_MS));
       }
     })().catch(() => {
-      /* swallow — never crash on the easter egg */
+      /* never crash the easter egg */
     });
   });
 }
