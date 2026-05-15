@@ -1,9 +1,24 @@
 import { TAGLINES } from "./taglines.js";
 import { style } from "../lib/style.js";
+import { VERSION } from "../lib/version.js";
+import {
+  emptyDashboardSnapshot,
+  loadDashboardSnapshot,
+  renderStatusPanel,
+  type DashboardSnapshot,
+} from "./dashboard.js";
 
 /**
  * Bare `orql` easter egg — typewriter cycling through 149 tagline variants
- * beneath the orqlaude diamond. Runs until Ctrl-C / Ctrl-D.
+ * beneath the orqlaude diamond, with a live STATUS panel showing the real
+ * project state below. Runs until Ctrl-C / Ctrl-D.
+ *
+ * v0.9.5: live dashboard panel. The blank lower half of the alt screen is
+ * now a STATUS card pulling from StateStore + Telegram probe + Claude
+ * Desktop config. Refreshes every 2s on a setInterval — way too expensive
+ * to recompute on every animation tick, but cheap enough to feel "live"
+ * when a fleet is actually running. Footer line at the bottom of the
+ * viewport shows version + ^C hint and re-anchors on terminal resize.
  *
  * v0.9.4 adds a fake typing cursor. We hide the real terminal cursor (so
  * stdin echo can't bleed into the line, see v0.9.3 below), which means
@@ -73,7 +88,16 @@ const WORDMARK_ROW = 3;
 const TAGLINE_ROW = 4;
 const TAGLINE_COL = 14;
 
-export async function runEasterEgg(): Promise<number> {
+// Status panel layout. Sits below the tagline with a blank spacer row.
+const PANEL_START_ROW = 6;
+const PANEL_LEFT_COL = 4;
+
+// Dashboard refresh cadence. 2s is responsive enough to feel "live" when
+// a fleet is running, but light enough that the state read + telegram probe
+// + desktop-config check don't measurably affect the typing animation.
+const DASHBOARD_REFRESH_MS = 2000;
+
+export async function runEasterEgg(stateDir?: string): Promise<number> {
   // Non-TTY fallback (piped, redirected, CI). No animation, no alt screen.
   if (!process.stdout.isTTY) {
     process.stdout.write(
@@ -93,6 +117,10 @@ export async function runEasterEgg(): Promise<number> {
     let cursorOn = true;
     let lastTypeAt = 0;
 
+    // Dashboard snapshot, refreshed every DASHBOARD_REFRESH_MS. Starts
+    // zeroed so the very first paint doesn't have to wait on I/O.
+    let dashboard: DashboardSnapshot = emptyDashboardSnapshot();
+
     const isCursorVisible = (): boolean => {
       if (Date.now() - lastTypeAt < CURSOR_PULSE_MS) return true;
       return cursorOn;
@@ -107,6 +135,7 @@ export async function runEasterEgg(): Promise<number> {
         /* harmless on shutdown */
       }
       clearInterval(blinkInterval);
+      clearInterval(dashboardInterval);
       process.stdin.removeListener("data", onData);
       process.stdin.pause();
       process.stdout.off("resize", onResize);
@@ -135,10 +164,16 @@ export async function runEasterEgg(): Promise<number> {
     };
 
     // Repaint the full frame from the top-left. Called on every animation
-    // tick, on terminal resize, and from the cursor-blink interval.
-    // Idempotent.
+    // tick, on terminal resize, from the cursor-blink interval, and from
+    // the dashboard-refresh interval. Idempotent.
     const paintFrame = () => {
       const cursor = isCursorVisible() ? style.sand(CURSOR_BLOCK) : "";
+      const panelLines = renderStatusPanel(dashboard);
+      // Footer pinned to the bottom row of the viewport. Re-reads
+      // `process.stdout.rows` each paint so it stays anchored on resize.
+      // Fallback to row 20 if rows is unavailable (some non-standard TTYs).
+      const footerRow = process.stdout.rows ?? 20;
+
       const out: string[] = [
         MOVE_TO_HOME,
         CLEAR_SCREEN,
@@ -154,6 +189,15 @@ export async function runEasterEgg(): Promise<number> {
         style.sand(currentText),
         cursor,
       ];
+      // Status panel rows.
+      for (let i = 0; i < panelLines.length; i++) {
+        out.push(moveTo(PANEL_START_ROW + i, PANEL_LEFT_COL), panelLines[i]);
+      }
+      // Footer.
+      out.push(
+        moveTo(footerRow, PANEL_LEFT_COL),
+        style.dim(`v${VERSION}  ${style.coral("·")}  ^C exit`)
+      );
       process.stdout.write(out.join(""));
     };
 
@@ -172,6 +216,26 @@ export async function runEasterEgg(): Promise<number> {
         paintFrame();
       }
     }, CURSOR_BLINK_MS);
+
+    // Periodic dashboard refresh. Reads state + telegram + desktop config,
+    // updates the closure-held snapshot, then repaints once. Awaited
+    // promise is fire-and-forget — never crash the easter egg on a state
+    // read failure (loadDashboardSnapshot handles those by returning
+    // zeroed defaults internally).
+    const refreshDashboard = () => {
+      if (!stateDir) return;
+      loadDashboardSnapshot(stateDir)
+        .then((snap) => {
+          if (stopped) return;
+          dashboard = snap;
+          paintFrame();
+        })
+        .catch(() => {
+          /* never crash; emptyDashboardSnapshot stays in `dashboard` */
+        });
+    };
+    refreshDashboard(); // initial async load — frame painted from defaults until it resolves
+    const dashboardInterval = setInterval(refreshDashboard, DASHBOARD_REFRESH_MS);
 
     // Initial setup.
     process.stdout.write(ALT_SCREEN_ENTER + HIDE_CURSOR);

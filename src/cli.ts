@@ -57,7 +57,7 @@ async function main(): Promise<number> {
 
   // First-run welcome — skip for purely informational commands so the user
   // can `orql --version` / `orql about` without forcing the onboarding.
-  if (cmd !== "--version" && cmd !== "-v" && cmd !== "about" && cmd !== "help" && cmd !== "--help" && cmd !== "-h") {
+  if (cmd !== "version" && cmd !== "--version" && cmd !== "-v" && cmd !== "about" && cmd !== "help" && cmd !== "--help" && cmd !== "-h") {
     await maybeShowWelcome();
   }
   const isJson = hasJsonFlag(rest);
@@ -74,8 +74,12 @@ async function main(): Promise<number> {
         printHelp();
         exitCode = 0;
         break;
+      case "version":
       case "--version":
       case "-v":
+        // `orql version` (subcommand), `--version`, and `-v` all print the
+        // same single line so the output is scriptable: `orql version` is
+        // safe inside `if [ "$(orql version)" = "orqlaude 0.9.4" ]`.
         process.stdout.write(`orqlaude ${VERSION}\n`);
         exitCode = 0;
         break;
@@ -152,10 +156,11 @@ async function maybeShowWelcome(): Promise<void> {
 }
 
 async function cmdBare(): Promise<number> {
-  // Bare `orql` runs the easter egg — the diamond logo + an animated
-  // typewriter cycling through 149 tagline variants. Ctrl-C exits.
-  // To see active plans use `orql list`; for the dashboard `orql watch`.
-  return runEasterEgg();
+  // Bare `orql` runs the easter egg — the diamond logo, an animated
+  // typewriter cycling through 149 tagline variants, AND a live STATUS
+  // panel showing plan/Agnet/MCP/Telegram health (v0.9.5+). Ctrl-C
+  // exits. For the per-plan dashboard with task detail use `orql watch`.
+  return runEasterEgg(STATE_DIR);
 }
 
 function printHelp(): void {
@@ -188,6 +193,11 @@ function printHelp(): void {
   console.log(`  ${style.coral("orqlaude tg test")} ${style.sand("<chat_id>")}      Send a test message`);
   console.log(`  ${style.coral("orqlaude tg start")}               Run the bot (foreground, monitors this project)`);
   console.log(`  ${style.coral("orqlaude tg help")}                Telegram-specific help`);
+  console.log("");
+  console.log(style.bold(style.cream("Info")));
+  console.log(`  ${style.coral("orql version")}                            Print orqlaude version`);
+  console.log(`  ${style.coral("orql about")}                              Stylized "what is this"`);
+  console.log(`  ${style.coral("orql help")}                               Show this help`);
   console.log("");
   console.log(style.dim(`State dir: ${STATE_DIR}`));
 }
