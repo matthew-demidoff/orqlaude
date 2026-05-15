@@ -1,6 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { StateStore, findPlan, findTask } from "../lib/state.js";
+import { StateStore, findPlan, findTask, type BudgetMode } from "../lib/state.js";
 import { jsonlPathFor, snapshotSession } from "../lib/jsonl_tail.js";
 import { detectHallucination, extractToolUses } from "../lib/hallucination.js";
 import { spawnAgnetViaCli, findGitRoot, cleanupPlanWorktrees, readChildExitRecord } from "../lib/spawn_cli.js";
@@ -357,10 +357,15 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
             // Per-task soft budget warning: if the task has a budgetHintTokens
             // hint and we've blown past 70% of it, surface a yellow flag so the
             // orchestrator can intervene before the plan-wide hard cap fires.
-            if (t.budgetHintTokens && snap.totalEffectiveTokens > 0.7 * t.budgetHintTokens) {
-              const pct = Math.round((snap.totalEffectiveTokens / t.budgetHintTokens) * 100);
+            // v0.9.2: compare against billed (not total) to match the new
+            // default plan-level budget mode.
+            const taskBudgetRelevant = (plan0.budgetMode ?? "billed") === "billed"
+              ? snap.billedTokens
+              : snap.totalEffectiveTokens;
+            if (t.budgetHintTokens && taskBudgetRelevant > 0.7 * t.budgetHintTokens) {
+              const pct = Math.round((taskBudgetRelevant / t.budgetHintTokens) * 100);
               taskWarnings.push(
-                `task at ${pct}% of hint (${snap.totalEffectiveTokens.toLocaleString()} / ${t.budgetHintTokens.toLocaleString()} tokens). Consider request_stop if it's stalling.`
+                `task at ${pct}% of hint (${taskBudgetRelevant.toLocaleString()} / ${t.budgetHintTokens.toLocaleString()} tokens, mode=${plan0.budgetMode ?? "billed"}). Consider request_stop if it's stalling.`
               );
             }
             return {
@@ -370,7 +375,12 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
               session_id: t.spawnedSessionId,
               pid: t.pid ?? null,
               pid_alive: t.pid ? isProcessAlive(t.pid) : null,
+              // v0.9.2: `tokens_used` retained as the back-compat field
+              // (= totalEffectiveTokens). Prefer `billed_tokens` for
+              // Plan-cost decisions.
               tokens_used: snap.totalEffectiveTokens,
+              billed_tokens: snap.billedTokens,
+              cached_tokens: snap.cachedTokens,
               budget_hint_tokens: t.budgetHintTokens ?? null,
               cost_usd: snap.totalCostUsd,
               last_event_type: snap.lastEventType,
@@ -388,11 +398,13 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
               stream_source: snap.source,
               exit_record: exitRecord,
               command_line: t.commandLine ?? null,
+              // Internal hand-off for enforceBudget below.
+              __billed: snap.billedTokens,
+              __cached: snap.cachedTokens,
             };
           })
         );
 
-        const totalTokens = snapshots.reduce((sum, s: any) => sum + (s.tokens_used ?? 0), 0);
         const totalCost = snapshots.reduce((sum, s: any) => sum + (s.cost_usd ?? 0), 0);
 
         // v0.5.2: orphan detection — dispatched > 60s ago without
@@ -419,30 +431,25 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
           }));
 
         // ---- budget enforcement: kill on overbudget --------------------------
-        const overbudget = totalTokens > plan0.budgetCapTokens;
-        let autoCancelled = false;
-        if (overbudget && plan0.status !== "cancelled_overbudget" && plan0.status !== "cancelled") {
-          await store.update((state) => {
-            const plan = findPlan(state, plan_id);
-            plan.status = "cancelled_overbudget";
-            for (const t of plan.tasks) {
-              if (t.spawnedSessionId && !t.stopRequested) {
-                t.stopRequested = { reason: "fleet overbudget", requestedAt: Date.now(), kind: "hard" };
-                plan.messages.push({
-                  id: cryptoRandomId(),
-                  toSessionId: t.spawnedSessionId,
-                  text: `STOP: fleet exceeded token budget (used ${Math.round(totalTokens / 1000)}k of ${Math.round(
-                    plan.budgetCapTokens / 1000
-                  )}k cap). Commit what you have and exit.`,
-                  queuedAt: Date.now(),
-                  delivered: false,
-                  kind: "stop",
-                });
-              }
-            }
-          });
-          autoCancelled = true;
+        // v0.9.2: shared helper, billed-vs-total aware. The helper picks
+        // billed (input + output, default) or total (all four buckets)
+        // based on `plan.budgetMode`.
+        const budget = await enforceBudget(
+          store,
+          plan_id,
+          snapshots.map((s: any) => ({
+            billed: s.__billed ?? 0,
+            cached: s.__cached ?? 0,
+          }))
+        );
+        // Strip the internal hand-off keys so they don't leak into the
+        // public response.
+        for (const s of snapshots as any[]) {
+          delete s.__billed;
+          delete s.__cached;
         }
+        const totalTokens = budget.total_all; // for the legacy field
+        const autoCancelled = budget.auto_cancelled;
 
         // ---- aggregated hallucination warning -------------------------------
         const concerningAgents = snapshots
@@ -469,10 +476,22 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
                 {
                   plan_id,
                   plan_status: autoCancelled ? "cancelled_overbudget" : plan0.status,
-                  budget_cap_tokens: plan0.budgetCapTokens,
+                  budget_cap_tokens: budget.budget_cap_tokens,
+                  // v0.9.2: legacy field; sum of all four token buckets.
+                  // For Plan-cost decisions read `tokens.billed` instead.
                   total_tokens_used: totalTokens,
-                  budget_remaining_tokens: Math.max(0, plan0.budgetCapTokens - totalTokens),
+                  budget_remaining_tokens: budget.budget_remaining_tokens,
                   total_cost_usd: totalCost,
+                  // v0.9.2: explicit token breakdown so orchestrators can
+                  // distinguish "cost-relevant" from "cache churn".
+                  tokens: {
+                    billed: budget.total_billed,
+                    cached: budget.total_cached,
+                    total: budget.total_all,
+                    budget_mode: budget.budget_mode,
+                    budget_relevant: budget.total_for_budget,
+                    budget_pct: budget.budget_pct,
+                  },
                   hallucination_alerts: concerningAgents,
                   orphan_alerts: orphans,
                   died_at_launch_alerts: deadAgents,
@@ -531,6 +550,8 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
                   title: t.title,
                   status: t.status,
                   tokens_used: 0,
+                  billed_tokens: 0,
+                  cached_tokens: 0,
                   pr_url: t.prUrl ?? null,
                   pid_alive: null as boolean | null,
                   exit_record: null as Awaited<ReturnType<typeof readChildExitRecord>>,
@@ -545,6 +566,8 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
                 title: t.title,
                 status: exitRecord ? (exitRecord.success ? "done" : "failed") : t.status,
                 tokens_used: snap.totalEffectiveTokens,
+                billed_tokens: snap.billedTokens,
+                cached_tokens: snap.cachedTokens,
                 pr_url: t.prUrl ?? null,
                 pid_alive: t.pid ? isProcessAlive(t.pid) : null,
                 exit_record: exitRecord,
@@ -553,10 +576,19 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
               };
             })
           );
+          // v0.9.2: enforce budget on every poll, not just from status().
+          // The plan-level kill needs to fire whether the orchestrator is
+          // calling status() or wait_for_status_change.
+          const budget = await enforceBudget(
+            store,
+            plan_id,
+            agents.map((a) => ({ billed: a.billed_tokens, cached: a.cached_tokens }))
+          );
           return {
             plan_id,
-            plan_status: plan.status,
+            plan_status: budget.auto_cancelled ? "cancelled_overbudget" : plan.status,
             agents,
+            budget,
           };
         };
 
@@ -568,11 +600,12 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
           // Also includes `stop_kind` so kill_task / request_stop transitions
           // wake the long-poll without waiting for the child to actually
           // terminate - useful when a soft-stop is in flight.
+          // v0.9.2: KB bucket runs off `billed_tokens` (input + output) so
+          // cache-read churn doesn't trip the fingerprint every 2s. The
+          // long-poll now fires only when something cost-relevant moves.
           const parts: Array<unknown> = [snap.plan_status];
           for (const a of snap.agents) {
-            // Round token count to KB so per-token churn doesn't trip the
-            // fingerprint - only material progress does.
-            const kb = Math.floor(a.tokens_used / 1024);
+            const kb = Math.floor(a.billed_tokens / 1024);
             parts.push([
               a.task_id,
               a.status,
@@ -774,12 +807,23 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
             }
             const taskTokens = await Promise.all(
               p.tasks.map(async (t) => {
-                if (!t.spawnedSessionId) return 0;
+                if (!t.spawnedSessionId) return { billed: 0, cached: 0, total: 0 };
                 const snap = await snapshotSession(cwd, t.spawnedSessionId, t.stdoutPath);
-                return snap.totalEffectiveTokens;
+                return {
+                  billed: snap.billedTokens,
+                  cached: snap.cachedTokens,
+                  total: snap.totalEffectiveTokens,
+                };
               })
             );
-            const tokensTotal = taskTokens.reduce((s, v) => s + v, 0);
+            const tokensBilled = taskTokens.reduce((s, v) => s + v.billed, 0);
+            const tokensCached = taskTokens.reduce((s, v) => s + v.cached, 0);
+            const tokensTotal = taskTokens.reduce((s, v) => s + v.total, 0);
+            // v0.9.2: budget_pct reflects the plan's chosen mode (billed
+            // default). Plan users see the cost-relevant pct, not the
+            // cache-inflated total.
+            const mode: BudgetMode = p.budgetMode ?? "billed";
+            const tokensForBudget = mode === "billed" ? tokensBilled : tokensTotal;
             const allDone = p.tasks.length > 0 && p.tasks.every((t) => t.status === "done" || t.status === "failed" || t.status === "cancelled");
             return {
               plan_id: p.id,
@@ -788,9 +832,16 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
               root_task: p.rootTask.slice(0, 120),
               task_count: p.tasks.length,
               task_status_counts: counts,
-              tokens_used: tokensTotal,
+              tokens_used: tokensTotal, // legacy field (sum of all four buckets)
+              tokens: {
+                billed: tokensBilled,
+                cached: tokensCached,
+                total: tokensTotal,
+                budget_mode: mode,
+                budget_relevant: tokensForBudget,
+              },
               budget_cap_tokens: p.budgetCapTokens,
-              budget_pct: p.budgetCapTokens ? Math.round((tokensTotal / p.budgetCapTokens) * 100) : 0,
+              budget_pct: p.budgetCapTokens ? Math.round((tokensForBudget / p.budgetCapTokens) * 100) : 0,
               prs,
               all_terminal: allDone,
               suggested_next:
@@ -811,6 +862,8 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
           0
         );
         const grandTokens = planRollups.reduce((sum, r) => sum + r.tokens_used, 0);
+        const grandBilled = planRollups.reduce((sum, r) => sum + r.tokens.billed, 0);
+        const grandCached = planRollups.reduce((sum, r) => sum + r.tokens.cached, 0);
         return {
           content: [
             {
@@ -823,7 +876,9 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
                   totals: {
                     plan_count: plans.length,
                     active_agnets: activeAgnets,
-                    grand_total_tokens: grandTokens,
+                    grand_total_tokens: grandTokens, // legacy: sum of all buckets
+                    grand_billed_tokens: grandBilled, // v0.9.2: input + output only
+                    grand_cached_tokens: grandCached, // v0.9.2: cache reads + creations
                   },
                   orphan_queue: {
                     notifications: orphanNotificationCount,
@@ -899,6 +954,91 @@ task_id: ${taskId}
    \`collect\` reads it from there.
 ═══════════════════════════════════════════════════════════════
 `;
+}
+
+/**
+ * v0.9.2: shared budget-enforcement helper called from both `status()`
+ * and `wait_for_status_change`. The latter previously skipped the kill,
+ * meaning a fleet over budget would only get cancelled if the orchestrator
+ * happened to call status() (not just wait + collect).
+ *
+ * `agents` are flat token rollups extracted from snapshots; the helper
+ * is metric-agnostic and uses whichever bucket matches `plan.budgetMode`
+ * (defaults to "billed" - input + output only, ignoring free-on-the-Plan
+ * cache reads).
+ *
+ * Side effect: when over budget, the plan flips to `cancelled_overbudget`
+ * and STOP messages are queued for every still-running task. Idempotent -
+ * subsequent calls observe the already-cancelled state and return
+ * `auto_cancelled: false`.
+ */
+export interface BudgetSnapshot {
+  total_billed: number;
+  total_cached: number;
+  total_all: number;
+  total_for_budget: number;
+  budget_mode: BudgetMode;
+  budget_cap_tokens: number;
+  budget_remaining_tokens: number;
+  budget_pct: number;
+  overbudget: boolean;
+  auto_cancelled: boolean;
+}
+
+async function enforceBudget(
+  store: StateStore,
+  plan_id: string,
+  agents: Array<{ billed: number; cached: number }>
+): Promise<BudgetSnapshot> {
+  const plan0 = await store.read((state) => findPlan(state, plan_id));
+  const totalBilled = agents.reduce((s, a) => s + a.billed, 0);
+  const totalCached = agents.reduce((s, a) => s + a.cached, 0);
+  const totalAll = totalBilled + totalCached;
+  const budgetMode: BudgetMode = plan0.budgetMode ?? "billed";
+  const totalForBudget = budgetMode === "billed" ? totalBilled : totalAll;
+  const cap = plan0.budgetCapTokens;
+  const overbudget = totalForBudget > cap;
+  const alreadyCancelled =
+    plan0.status === "cancelled_overbudget" || plan0.status === "cancelled";
+  let autoCancelled = false;
+
+  if (overbudget && !alreadyCancelled) {
+    await store.update((state) => {
+      const plan = findPlan(state, plan_id);
+      // Re-check inside the lock - another concurrent call may have raced us.
+      if (plan.status === "cancelled_overbudget" || plan.status === "cancelled") return;
+      plan.status = "cancelled_overbudget";
+      for (const t of plan.tasks) {
+        if (t.spawnedSessionId && !t.stopRequested) {
+          t.stopRequested = { reason: "fleet overbudget", requestedAt: Date.now(), kind: "hard" };
+          plan.messages.push({
+            id: cryptoRandomId(),
+            toSessionId: t.spawnedSessionId,
+            text:
+              `STOP: fleet exceeded token budget (used ${Math.round(totalForBudget / 1000)}k of ` +
+              `${Math.round(cap / 1000)}k cap, mode=${budgetMode}). Commit what you have and exit.`,
+            queuedAt: Date.now(),
+            delivered: false,
+            kind: "stop",
+          });
+        }
+      }
+    });
+    autoCancelled = true;
+  }
+
+  return {
+    total_billed: totalBilled,
+    total_cached: totalCached,
+    total_all: totalAll,
+    total_for_budget: totalForBudget,
+    budget_mode: budgetMode,
+    budget_cap_tokens: cap,
+    budget_remaining_tokens: Math.max(0, cap - totalForBudget),
+    budget_pct: cap > 0 ? Math.round((totalForBudget / cap) * 100) : 0,
+    overbudget,
+    auto_cancelled: autoCancelled,
+  };
 }
 
 function cryptoRandomId(): string {
