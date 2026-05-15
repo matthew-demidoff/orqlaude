@@ -293,6 +293,16 @@ export async function spawnAgnetViaCli(input: SpawnViaCliInput): Promise<SpawnVi
   const stderrPath = path.join(wt.path, ".orqlaude.stderr.log");
   const stdoutPath = path.join(wt.path, ".orqlaude.stdout.log");
   const mcpConfigPath = path.join(wt.path, ".orqlaude.mcp.json");
+  // v0.10.7: when re-spawning into a worktree that's seen a prior agent,
+  // a stale .orqlaude.exit.json on disk would otherwise make snapshot()
+  // report the NEW agent as already terminated. Wipe it BEFORE spawn so
+  // a clean child gets a clean filesystem.
+  const exitJsonPathPre = path.join(wt.path, ".orqlaude.exit.json");
+  try {
+    await fs.unlink(exitJsonPathPre);
+  } catch {
+    /* no prior exit record - normal first-spawn case */
+  }
   await fs.writeFile(mcpConfigPath, mcpConfigBody, { mode: 0o600 });
   const stderrFh = await fs.open(stderrPath, "w");
   const stdoutFh = await fs.open(stdoutPath, "w");

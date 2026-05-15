@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.10.7 — re-spawn hygiene (stale exit-record + lingering stopRequested)
+
+### Two bugs surfaced by the Verdant re-spawn in self-test fleet d47c0448
+
+The v0.10.5 session-id fix worked perfectly: Verdant's checkin matched
+the pre-allocated session_id, registered cleanly. But then it
+**immediately exited** because the prior `kill_task` (which released
+the spawn lock per v0.9.0) left `task.stopRequested = {kind: "hard"}`
+on the task. The new agent's first checkin received the stale STOP and
+bailed correctly per protocol.
+
+Separately, the snapshot reported the new spawn as already terminated
+because the **prior `.orqlaude.exit.json` was still on disk** in the
+shared worktree — `terminated: !!exitRecord` evaluates to true even
+though the PID is alive.
+
+### Fix 1: `spawn_via_cli` clears `task.stopRequested` on re-spawn
+
+In `dispatch.ts`, after setting the new `spawnedSessionId` / `pid` /
+`status: "running"`, also reset:
+```ts
+task.stopRequested = undefined;
+task.finishedAt = undefined;
+task.exitReason = undefined;
+```
+
+Order matters: clear AFTER setting the new spawnedSessionId so a
+concurrent reader never sees an intermediate state where the slot is
+both "no-longer-stopped" and "still-claimed-by-old-session".
+
+### Fix 2: `spawn_cli.ts` unlinks `.orqlaude.exit.json` before spawn
+
+In `spawnAgnetViaCli`, before the `spawn(claudeBin, args)` call,
+best-effort `fs.unlink(exitJsonPathPre)`. Normal first-spawn case has
+no prior record so the unlink ENOENT-no-ops. Re-spawn case wipes the
+stale fast-path entry so `snapshot()` correctly reports the new agent
+as running.
+
+### Tests
+
+3 new tests in `v0107.test.ts` (source-level: the actual spawn path
+needs an integration test with `claude`). 143 total green.
+
+### Migration
+
+No state migration. Existing in-flight plans continue to work; new
+spawns get the cleaner re-spawn hygiene automatically.
+
 ## 0.10.6 — `wait_for_status_change` capped at 45s so the loop pattern actually works
 
 ### The bug
