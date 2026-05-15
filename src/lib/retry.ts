@@ -156,7 +156,7 @@ Use \`mcp__orqlaude__post_note\` to your parent plan with a single comprehensive
 Be brief but complete. The user is the audience.`;
 }
 
-function countRetries(task: Task): number {
+export function countRetries(task: Task): number {
   // We encode retry counts in the task summary as "[retry N/M]" markers.
   // Daemon writes these when it re-spawns.
   const m = (task.summary ?? "").match(/\[retry (\d+)\/\d+\]/);
