@@ -5,6 +5,15 @@ import { style } from "../lib/style.js";
  * Bare `orql` easter egg — typewriter cycling through 149 tagline variants
  * beneath the orqlaude diamond. Runs until Ctrl-C / Ctrl-D.
  *
+ * v0.9.4 adds a fake typing cursor. We hide the real terminal cursor (so
+ * stdin echo can't bleed into the line, see v0.9.3 below), which means
+ * the typewriter looks dead — characters appearing on a line with nothing
+ * trailing them. So we draw our own: a medium-shade block (▒) painted
+ * right after `currentText`. It stays SOLID while the typewriter is
+ * actively typing/erasing (a 700ms "just-typed" pulse window), then
+ * BLINKS at the standard 530ms cadence during the hold and gap phases —
+ * the same behavior real terminal cursors have when the user goes idle.
+ *
  * v0.9.3 rewrite. Two fixes over the v0.6.1 implementation:
  *
  *   1. **Stdin echo no longer bleeds into the line.** Previously the
@@ -47,6 +56,12 @@ const ERASE_MAX_MS = 30;
 const BETWEEN_MIN_MS = 280;
 const BETWEEN_MAX_MS = 600;
 
+// Fake typing cursor. The real terminal cursor is hidden (see HIDE_CURSOR
+// below) to keep stdin echo out of the line, so we draw our own.
+const CURSOR_BLOCK = "▒";
+const CURSOR_BLINK_MS = 530; // standard terminal cursor blink half-period
+const CURSOR_PULSE_MS = 700; // stay solid for this long after the last keystroke
+
 // Layout: 1-based rows/cols (ANSI convention).
 // Row 1: blank padding so the logo doesn't kiss the top edge.
 // Row 2-4: logo + wordmark + tagline.
@@ -70,6 +85,18 @@ export async function runEasterEgg(): Promise<number> {
   return new Promise<number>((resolve) => {
     let stopped = false;
     let currentText = "";
+    // Fake-cursor state. `cursorOn` is the blink phase, toggled by an
+    // interval. `lastTypeAt` is the wall-clock timestamp of the last
+    // type/erase event — within CURSOR_PULSE_MS we force the cursor to
+    // be solid so it looks like an actively-typing person rather than a
+    // blinking idle prompt.
+    let cursorOn = true;
+    let lastTypeAt = 0;
+
+    const isCursorVisible = (): boolean => {
+      if (Date.now() - lastTypeAt < CURSOR_PULSE_MS) return true;
+      return cursorOn;
+    };
 
     const cleanup = () => {
       try {
@@ -79,6 +106,7 @@ export async function runEasterEgg(): Promise<number> {
       } catch {
         /* harmless on shutdown */
       }
+      clearInterval(blinkInterval);
       process.stdin.removeListener("data", onData);
       process.stdin.pause();
       process.stdout.off("resize", onResize);
@@ -107,8 +135,10 @@ export async function runEasterEgg(): Promise<number> {
     };
 
     // Repaint the full frame from the top-left. Called on every animation
-    // tick and on terminal resize. Idempotent.
+    // tick, on terminal resize, and from the cursor-blink interval.
+    // Idempotent.
     const paintFrame = () => {
+      const cursor = isCursorVisible() ? style.sand(CURSOR_BLOCK) : "";
       const out: string[] = [
         MOVE_TO_HOME,
         CLEAR_SCREEN,
@@ -122,6 +152,7 @@ export async function runEasterEgg(): Promise<number> {
         style.coral("◆◆◆"),
         moveTo(TAGLINE_ROW, TAGLINE_COL),
         style.sand(currentText),
+        cursor,
       ];
       process.stdout.write(out.join(""));
     };
@@ -129,6 +160,18 @@ export async function runEasterEgg(): Promise<number> {
     const onResize = () => {
       paintFrame();
     };
+
+    // Drive the blink even during the hold/gap phases when the animation
+    // loop is sleeping and would otherwise not repaint.
+    const blinkInterval = setInterval(() => {
+      cursorOn = !cursorOn;
+      // Only repaint if the visible cursor state would actually change.
+      // Inside the pulse window we're locked-on regardless of cursorOn,
+      // so skip the write to avoid stomping on the typing loop's rhythm.
+      if (Date.now() - lastTypeAt >= CURSOR_PULSE_MS) {
+        paintFrame();
+      }
+    }, CURSOR_BLINK_MS);
 
     // Initial setup.
     process.stdout.write(ALT_SCREEN_ENTER + HIDE_CURSOR);
@@ -159,10 +202,12 @@ export async function runEasterEgg(): Promise<number> {
         // Type out character by character. Repainting the whole frame
         // each tick is overkill, but it's correct under resize and
         // makes the code easier to reason about than tracking partial
-        // updates.
+        // updates. `lastTypeAt` marks the keystroke for the cursor
+        // pulse — within CURSOR_PULSE_MS the cursor stays solid.
         for (let i = 1; i <= tagline.length; i++) {
           if (stopped) return;
           currentText = tagline.slice(0, i);
+          lastTypeAt = Date.now();
           paintFrame();
           await sleep(rand(TYPE_MIN_MS, TYPE_MAX_MS));
         }
@@ -173,6 +218,7 @@ export async function runEasterEgg(): Promise<number> {
         for (let i = tagline.length - 1; i >= 0; i--) {
           if (stopped) return;
           currentText = tagline.slice(0, i);
+          lastTypeAt = Date.now();
           paintFrame();
           await sleep(rand(ERASE_MIN_MS, ERASE_MAX_MS));
         }
