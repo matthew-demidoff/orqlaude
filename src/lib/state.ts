@@ -206,11 +206,31 @@ export interface UserResponseRequest {
   cancelled?: boolean;
 }
 
+/**
+ * v0.9.2+: how to interpret `Plan.budgetCapTokens`.
+ *
+ * - `"billed"` (default): the cap applies to `input + output` tokens only.
+ *   Cache reads (which are free on the Claude Plan) don't trip the kill.
+ *   This is the right default for the vast majority of orqlaude users.
+ *
+ * - `"total"`: the cap applies to `input + output + cache_read + cache_create`.
+ *   Pick this if you're paying per-token through the Anthropic API where
+ *   cache reads cost ~10% of fresh input.
+ */
+export type BudgetMode = "billed" | "total";
+
 export interface Plan {
   id: string;
   createdAt: number;
   rootTask: string;
   budgetCapTokens: number;
+  /**
+   * v0.9.2+: which token bucket `budgetCapTokens` constrains. Defaults to
+   * `"billed"` so cache reads (free on the Claude Plan) don't inflate the
+   * effective spend and trigger spurious overbudget kills. Set to `"total"`
+   * for API-cost-sensitive runs.
+   */
+  budgetMode?: BudgetMode;
   perAgentCapTokens: number;
   estimatedTokens?: number;
   budgetCapUsd?: number;

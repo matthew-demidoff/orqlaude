@@ -1,5 +1,80 @@
 # Changelog
 
+## 0.9.2 — billed-vs-cached token accounting + budget enforcement on long-poll
+
+Fixes the budget-cap UX for users on the Claude Plan, and closes a real
+defect where `wait_for_status_change` skipped the overbudget kill (only
+`status()` was wired to it).
+
+### The Claude-Plan accounting problem
+
+The `usage` block in stream-json events has four counters: `input_tokens`,
+`output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`.
+On the Claude Plan, **cache reads are free** - they don't count against
+your plan limit. Through the Anthropic API, cache reads cost ~10% of fresh
+input tokens.
+
+Earlier versions summed all four into a single `totalEffectiveTokens` and
+treated the sum as "the budget." A typical Agnet turn cache-reads
+50-100 KB (system prompt + tool defs + protocol footer), so 20 turns easily
+shows 1-2M `totalEffectiveTokens` while only ~50 KB is actually Plan-relevant.
+Result: fleets were getting auto-cancelled in 4-5 minutes for hitting an
+imaginary budget.
+
+### Changes
+
+- **`SessionSnapshot` now exposes three rollups:**
+  - `billedTokens` = `input + output` (what the Plan / API actually charges)
+  - `cachedTokens` = `cache_read + cache_creation` (~free on the Plan)
+  - `totalEffectiveTokens` = sum (kept for back-compat with v0.8/v0.9 callers)
+- **`Plan.budgetMode: "billed" | "total"`** - new field, default `"billed"`.
+  Cap applies to billed only on the Plan (default), or to the sum on the
+  API (opt-in via `create_plan({ budget_mode: "total" })`).
+- **`enforceBudget(store, plan_id, agents)`** - new shared helper at module
+  scope in `tools/dispatch.ts`. Picks the right bucket per `plan.budgetMode`,
+  flips the plan to `cancelled_overbudget` + queues STOP messages, and is
+  idempotent (concurrent callers race-safe via re-check inside the lock).
+- **`wait_for_status_change` calls `enforceBudget` on every poll.** Before
+  this, an orchestrator using only the long-poll never tripped the kill -
+  budget enforcement was status()-only. Fix matches the prior round's
+  guidance to prefer wait_for_status_change over status() for polling.
+- **`status()` response gains a `tokens` object:**
+  ```json
+  "tokens": {
+    "billed": 187432,
+    "cached": 1614900,
+    "total": 1802332,
+    "budget_mode": "billed",
+    "budget_relevant": 187432,
+    "budget_pct": 62
+  }
+  ```
+  `total_tokens_used` retained as a legacy field (sum of all buckets);
+  `budget_remaining_tokens` now reflects the mode-relevant bucket.
+- **Per-agent payload** in `status()` and `wait_for_status_change` gains
+  `billed_tokens` and `cached_tokens` alongside the legacy `tokens_used`.
+- **`fleet_summary` totals** add `grand_billed_tokens` and
+  `grand_cached_tokens`. `budget_pct` per plan is now mode-relevant.
+- **Long-poll fingerprint** runs the KB bucket off `billed_tokens` instead
+  of `totalEffectiveTokens`. Cache-read churn no longer trips the
+  fingerprint every 2s; the long-poll fires only when cost-relevant
+  progress happens.
+- **`create_plan({ budget_mode })`** new optional arg with `"billed"`
+  default. The response includes `budget_mode` so the orchestrator can
+  confirm.
+
+### Migration
+
+- State schema stays v3, additive. Plans without `budgetMode` are treated
+  as `"billed"`. Existing on-disk state loads unchanged.
+- The legacy `tokens_used` field still exists; new orchestrators should
+  read `tokens.billed` / `tokens.budget_relevant` for Plan-cost decisions.
+
+### Tests
+
+- `src/__tests__/v092.test.ts` - 5 new tests pinning the bucket maths +
+  the cache-inflation invariant. **93/93 total tests pass.**
+
 ## 0.9.1 — review follow-ups
 
 Three follow-ups + three nits from the v0.9.0 review (#22).

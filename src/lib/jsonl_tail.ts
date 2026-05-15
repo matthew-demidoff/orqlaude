@@ -54,7 +54,32 @@ export interface SessionSnapshot {
   outputTokens: number;
   cacheReadTokens: number;
   cacheCreationTokens: number;
+  /**
+   * Sum of all four. Kept for back-compat with v0.8.x callers.
+   *
+   * For BUDGET ENFORCEMENT prefer `billedTokens` (Plan users) - this
+   * total is inflated by cache reads, which are FREE on the Claude Plan
+   * but counted 1:1 with output tokens here. A single Agnet turn often
+   * cache-reads 50-100k (system prompt + tool defs + protocol footer),
+   * and 20 turns can show 1-2M `totalEffectiveTokens` while only ~50k
+   * is plan-relevant.
+   */
   totalEffectiveTokens: number;
+  /**
+   * v0.9.2+: tokens that actually count against the Claude Plan limit
+   * (= input_tokens + output_tokens). Cache reads are excluded because
+   * they're free on the Plan. Use this for budget caps on Plan-user
+   * fleets; use `totalEffectiveTokens` if you're paying per-token via
+   * the API (cache reads cost ~10% there).
+   */
+  billedTokens: number;
+  /**
+   * v0.9.2+: cache reads + cache creations. Informational; reflects how
+   * much context Claude Code is re-loading per turn. High `cachedTokens`
+   * with low `billedTokens` is the normal "Agnet reading the codebase
+   * repeatedly" pattern and is essentially free.
+   */
+  cachedTokens: number;
   lastEventType: string | null;
   lastActivityAt: number | null;
   lastAssistantText: string | null;
@@ -100,6 +125,8 @@ function emptySnap(sessionId: string, jsonlPath: string): SessionSnapshot {
     cacheReadTokens: 0,
     cacheCreationTokens: 0,
     totalEffectiveTokens: 0,
+    billedTokens: 0,
+    cachedTokens: 0,
     lastEventType: null,
     lastActivityAt: null,
     lastAssistantText: null,
@@ -247,8 +274,11 @@ function applyEvent(snap: SessionSnapshot, evt: any): void {
     if (typeof usage.cache_read_input_tokens === "number") snap.cacheReadTokens += usage.cache_read_input_tokens;
     if (typeof usage.cache_creation_input_tokens === "number") snap.cacheCreationTokens += usage.cache_creation_input_tokens;
   }
-  snap.totalEffectiveTokens =
-    snap.inputTokens + snap.outputTokens + snap.cacheReadTokens + snap.cacheCreationTokens;
+  // v0.9.2: maintain three rollups in parallel so callers can pick the
+  // metric appropriate to their billing model.
+  snap.billedTokens = snap.inputTokens + snap.outputTokens;
+  snap.cachedTokens = snap.cacheReadTokens + snap.cacheCreationTokens;
+  snap.totalEffectiveTokens = snap.billedTokens + snap.cachedTokens;
 
   if (typeof evt.total_cost_usd === "number") {
     snap.totalCostUsd = evt.total_cost_usd; // running total from result rows

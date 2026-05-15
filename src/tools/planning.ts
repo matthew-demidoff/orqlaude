@@ -34,13 +34,14 @@ export function registerPlanning(server: McpServer, store: StateStore, audit: Au
       root_task: z.string().min(1).describe("The user's original task description, for audit and history."),
       tasks: z.array(TaskInputSchema).min(1).max(12).describe("The decomposed subtasks. Each becomes one spawned agent. Keep under ~6 unless you've discussed a larger fleet."),
       budget_cap_tokens: z.number().int().positive().default(DEFAULT_BUDGET_TOKENS).describe("Hard ceiling for the whole fleet in tokens. Per-agent cap is derived as budget_cap_tokens / tasks.length unless tasks have individual budgetHintTokens. Default 500k tokens (~5 agents × 100k each)."),
+      budget_mode: z.enum(["billed", "total"]).default("billed").describe("v0.9.2+: which token bucket the cap constrains. `billed` (default) counts only input + output tokens - cache reads are free on the Claude Plan so excluding them stops spurious overbudget kills. `total` counts everything including cache reads; pick this if you're paying per-token via the API."),
       model_for_estimate: z.string().default("claude-sonnet-4-6").describe("Model assumed for cost estimation (informational USD only; doesn't control what spawn_task uses)."),
       effort_multiplier: z.number().positive().default(1.0).describe("Rough difficulty multiplier. 0.5 trivial, 1 moderate, 2+ heavy refactors."),
       strict_scope: z.boolean().default(false).describe("If true, reject the plan when two tasks declare overlapping `scope` paths. Default false (warn but allow)."),
     },
     audit.wrap(
       "create_plan",
-      async ({ root_task, tasks, budget_cap_tokens, model_for_estimate, effort_multiplier, strict_scope }) => {
+      async ({ root_task, tasks, budget_cap_tokens, budget_mode, model_for_estimate, effort_multiplier, strict_scope }) => {
         // Pre-check: scope overlap. Surface as warning, or reject if strict.
         const overlaps = detectScopeOverlaps(tasks);
         if (overlaps.length > 0 && strict_scope) {
@@ -54,6 +55,7 @@ export function registerPlanning(server: McpServer, store: StateStore, audit: Au
         try {
           plan = await store.update<Plan>((state) => {
             const p = newPlan(root_task, budget_cap_tokens, tasks);
+            p.budgetMode = budget_mode;
             // Assign Agnet names — stable per task_id, unique within plan.
             const taken = new Set<string>();
             for (const t of p.tasks) {
@@ -90,6 +92,7 @@ export function registerPlanning(server: McpServer, store: StateStore, audit: Au
           plan_id: plan.id,
           task_count: plan.tasks.length,
           budget_cap_tokens: plan.budgetCapTokens,
+          budget_mode: plan.budgetMode ?? "billed",
           per_agent_cap_tokens: plan.perAgentCapTokens,
           estimated_tokens: plan.estimatedTokens,
           estimated_cost_usd: plan.estimatedCostUsd,
