@@ -9,6 +9,7 @@ import { resolveStateDir } from "../lib/state_dir.js";
 import { probeTelegramStatus } from "../lib/telegram_status.js";
 import { VERSION } from "../lib/version.js";
 import { promises as fs } from "node:fs";
+import { randomUUID } from "node:crypto";
 import type { AuditLog } from "../lib/audit.js";
 
 /**
@@ -128,15 +129,21 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
           }
           const root = project_root ?? findGitRoot(process.cwd());
           const stateDir = resolveStateDir().path;
+          // v0.10.5: pre-allocate session_id HERE so it can be embedded in
+          // the prompt. The agent will see the exact id under "session_id:"
+          // in the protocol footer and use it for checkin — no env-var
+          // ambiguity.
+          const presetSessionId = randomUUID();
           const spawn = await spawnAgnetViaCli({
             projectRoot: root,
             stateDir,
             planId: plan.id,
             taskId: task.id,
             agnetName: task.agnetName,
-            prompt: buildSpawnPrompt(plan.id, task.id, task.prompt, task.branchHint),
+            prompt: buildSpawnPrompt(plan.id, task.id, task.prompt, task.branchHint, presetSessionId),
             branchHint: task.branchHint,
             claudeBin: claude_bin,
+            sessionId: presetSessionId,
           });
           // Pre-register the session so checkin from the child is idempotent.
           // v0.7.0: also record pid + command line + log file paths for
@@ -905,19 +912,36 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
   );
 }
 
-function buildSpawnPrompt(planId: string, taskId: string, userPrompt: string, branchHint?: string): string {
+function buildSpawnPrompt(
+  planId: string,
+  taskId: string,
+  userPrompt: string,
+  branchHint?: string,
+  /**
+   * v0.10.5+: when orqlaude spawns via spawn_via_cli, it pre-allocates a
+   * session_id and embeds it here so the agent checkins with the exact
+   * value orqlaude expects. The agent's $CLAUDE_CODE_SESSION_ID env var
+   * is set by Claude Code itself and may NOT match the --session-id flag
+   * orqlaude passed; before v0.10.5 the protocol told agents to use the
+   * env var which led to checkin conflicts.
+   */
+  sessionId?: string
+): string {
   const branchSection = branchHint ? `\n\nSuggested branch: \`${branchHint}\`.` : "";
+  const sessionIdLine = sessionId
+    ? `     • session_id: ${sessionId}  (EXACT value, pre-allocated by orqlaude — use this, NOT $CLAUDE_CODE_SESSION_ID)`
+    : `     • session_id: your own session id (from $CLAUDE_CODE_SESSION_ID env, or the orqlaude-allocated id if visible)`;
   return `${userPrompt}${branchSection}
 
 ═══════════════════════════════════════════════════════════════
 ORQLAUDE FLEET PROTOCOL — READ BEFORE DOING ANYTHING ELSE
 ═══════════════════════════════════════════════════════════════
 plan_id: ${planId}
-task_id: ${taskId}
+task_id: ${taskId}${sessionId ? `\nsession_id: ${sessionId}` : ""}
 
 ▶ STEP 1 — REGISTER YOURSELF (REQUIRED, IMMEDIATELY)
    Your FIRST tool call MUST be \`mcp__orqlaude__checkin\` with:
-     • session_id: your own session id (from $CLAUDE_CODE_SESSION_ID env)
+${sessionIdLine}
      • task_id:    ${taskId}  (from this prompt)
 
    If you skip this, the orchestrator can't see you, your work is

@@ -82,6 +82,17 @@ export interface SpawnViaCliInput {
   claudeBin?: string;
   /** Override the default 1500 ms healthcheck delay (mainly for tests). */
   healthCheckDelayMs?: number;
+  /**
+   * v0.10.5+: pre-allocated session_id. When provided, this exact value is
+   * used as the --session-id flag (no internal randomUUID). The caller is
+   * expected to have ALSO embedded this session_id in the prompt so the
+   * agent's checkin matches what orqlaude pre-recorded in
+   * `task.spawnedSessionId`. Before v0.10.5 the session_id was generated
+   * inside this function and never made it into the prompt — agents read
+   * $CLAUDE_CODE_SESSION_ID (a different value Claude Code generates
+   * internally) and their checkin conflicted with the pre-allocation.
+   */
+  sessionId?: string;
 }
 
 const DEFAULT_HEALTHCHECK_MS = 1500;
@@ -267,7 +278,9 @@ export async function spawnAgnetViaCli(input: SpawnViaCliInput): Promise<SpawnVi
   });
 
   // 3. Session id + JSONL path.
-  const sessionId = randomUUID();
+  // v0.10.5: accept caller-provided sessionId so the prompt + state +
+  // --session-id flag all match. Falls back to randomUUID for back-compat.
+  const sessionId = input.sessionId ?? randomUUID();
   const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
   const jsonlPath = path.join(home, ".claude", "projects", wt.path.replace(/\//g, "-"), `${sessionId}.jsonl`);
 

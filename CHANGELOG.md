@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.10.5 — spawn_via_cli session-id reconciliation
+
+### The bug exposed by the orqlaude self-test fleet d47c0448
+
+Verdant (one of three Agnets in the fleet) bailed cleanly after 9 turns
+having produced no PR. Investigation showed:
+
+1. `spawn_via_cli` generated `session_id = 046dd37b` and passed it via
+   `--session-id` to claude. It also wrote that id into
+   `task.spawnedSessionId` BEFORE the agent started.
+2. The agent's $CLAUDE_CODE_SESSION_ID env var (set by Claude Code itself)
+   was `D0D521BB` — a DIFFERENT value.
+3. The protocol-prompt footer told the agent to checkin with the env var.
+4. `checkin` did `planForSession(state, "D0D521BB")` → undefined; tried
+   `unclaimedTaskById(taskId)` → undefined because spawnedSessionId was
+   already pre-allocated; fell through to `task_already_claimed` rejection.
+5. Verdant correctly stopped to avoid duplicate work.
+
+### Two-layer fix
+
+**Fix 1 — Embed the pre-allocated session_id in the prompt.**
+`buildSpawnPrompt` now takes an optional `sessionId` arg. When provided,
+the protocol footer says `session_id: <uuid> (EXACT value, pre-allocated
+by orqlaude — use this, NOT $CLAUDE_CODE_SESSION_ID)`. The
+`spawn_via_cli` tool handler in `dispatch.ts` pre-generates the
+session_id with `randomUUID()`, embeds it in the prompt, AND passes it
+to `spawnAgnetViaCli` so the `--session-id` flag matches. Three places,
+one value.
+
+`SpawnViaCliInput` gained an optional `sessionId` field; the function
+uses it if provided, falls back to `randomUUID()` otherwise (back-compat).
+
+**Fix 2 — Defense-in-depth: checkin accepts session-id rotation for
+fresh tasks.** If an agent shows up with `session_id = X` but the task
+already has `spawnedSessionId = Y`, AND the task was spawned within the
+last 60s, AND no notes have been posted for the task yet, accept the
+rotation (update `spawnedSessionId = X`). This handles the case where
+the prompt instruction was misread or the agent's first checkin happens
+faster than expected. Once the agent has done real work (posted notes,
+committed, etc.), a different session_id reverts to a hard conflict.
+
+Both fixes are needed: fix 1 prevents the conflict in the happy case,
+fix 2 covers stragglers + unknown future MCP host quirks.
+
+### Tests
+
+4 new tests in `v0105.test.ts` (source-level verification — the actual
+spawn requires a real claude binary). 140 total, all green.
+
+### Migration notes
+
+No state migration. Old fleets in state (with the v0.10.4-and-earlier
+session_id mismatch) continue to work because the bug only manifested
+during the initial checkin. Existing running tasks proceed normally.
+
 ## 0.10.4 — bounded-block `ask_user` + `wait_for_user_response` companion
 
 ### Why v0.10.2's progress notifications didn't fix it
