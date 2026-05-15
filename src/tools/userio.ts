@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { StateStore, findPlan, findUserResponseRequest, findUserStream } from "../lib/state.js";
 import { probeTelegramStatus } from "../lib/telegram_status.js";
 import { resolveStateDir } from "../lib/state_dir.js";
+import { sleep } from "../lib/process_lib.js";
 import type { AuditLog } from "../lib/audit.js";
 
 /**
@@ -89,7 +90,150 @@ export function registerUserIo(server: McpServer, store: StateStore, audit: Audi
     )
   );
 
-  // ---- request_user_response -----------------------------------------------
+  // ---- ask_user (v0.10.1+, BLOCKING) ---------------------------------------
+  server.tool(
+    "ask_user",
+    "PRIMARY CLAUDE asks the user a question via Telegram and BLOCKS until the user answers, the timeout hits, or the request is cancelled. Single round-trip — no polling. v0.10.1+. The bot sends the question with Telegram's native reply-UI focused; the user can reply directly to the message, OR tap an inline-keyboard button if `options` were provided. Returns `{status: 'answered'|'timed_out'|'cancelled'|'unreachable', response, responded_at}`. Default timeout 900s (15min); cap 3600 (1h). PLAIN TEXT only — never use Markdown in your prompt; the bot has stopped using parse_mode entirely (v0.10.1) because the parser was eating special chars and silently failing sends.",
+    {
+      prompt: z.string().min(1).max(2000).describe("The question. PLAIN TEXT only — no Markdown. Newlines OK."),
+      options: z.array(z.string().min(1).max(32)).max(8).optional().describe("Optional inline-keyboard quick-pick buttons (≤8, each ≤32 chars). User can tap one OR reply to the message with freeform text — both paths work."),
+      timeout_sec: z.number().int().positive().max(3600).default(900).describe("How long to BLOCK waiting. Default 900s (15 min). Cap 3600 (1h)."),
+      plan_id: z.string().optional().describe("Optional plan id to attach the question to. Omit for session-level questions (v0.9.0+ orphan path)."),
+      task_id: z.string().optional(),
+      poll_interval_ms: z.number().int().min(250).max(5000).default(750).describe("Internal poll cadence while blocking. Default 750ms."),
+    },
+    audit.wrap(
+      "ask_user",
+      async ({ prompt, options, timeout_sec, plan_id, task_id, poll_interval_ms }) => {
+        const id = randomUUID();
+        const shortId = id.slice(0, 8);
+        const timeoutAt = Date.now() + timeout_sec * 1000;
+        const req = {
+          id,
+          shortId,
+          taskId: task_id,
+          prompt,
+          options,
+          createdAt: Date.now(),
+          timeoutAt,
+          delivered: false,
+        };
+        await store.update((state) => {
+          if (plan_id) {
+            const plan = findPlan(state, plan_id);
+            plan.userResponseRequests.push(req);
+          } else {
+            state.orphanResponseRequests = state.orphanResponseRequests ?? [];
+            state.orphanResponseRequests.push(req);
+          }
+        });
+        // Sanity-check Telegram up front. If not reachable, return immediately
+        // rather than block for 15min on a closed channel.
+        const tg = await probeTelegramStatus(resolveStateDir().path);
+        if (tg.status !== "active") {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    status: "unreachable",
+                    short_id: shortId,
+                    request_id: id,
+                    telegram_status: tg.status,
+                    note: `Telegram is ${tg.status}; not blocking. ${tg.notes.join(" ")} The question was still queued — use poll_user_response later if Telegram comes back, or fall back to AskUserQuestion.`,
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+        // Block-poll until answered, cancelled, or timeout.
+        const interval = Math.max(250, Math.min(5000, poll_interval_ms));
+        while (Date.now() < timeoutAt) {
+          await sleep(interval);
+          const result = await store.read((state) => {
+            const found = findUserResponseRequest(state, id);
+            if (!found) return null;
+            const { req: r } = found;
+            if (r.cancelled) return { kind: "cancelled" as const };
+            if (r.response !== undefined) {
+              return {
+                kind: "answered" as const,
+                response: r.response,
+                responded_at: r.respondedAt,
+                delivered: r.delivered,
+              };
+            }
+            return null;
+          });
+          if (result?.kind === "answered") {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    {
+                      status: "answered",
+                      short_id: shortId,
+                      request_id: id,
+                      response: result.response,
+                      responded_at: result.responded_at,
+                      blocked_for_ms: Date.now() - req.createdAt,
+                    },
+                    null,
+                    2
+                  ),
+                },
+              ],
+            };
+          }
+          if (result?.kind === "cancelled") {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    {
+                      status: "cancelled",
+                      short_id: shortId,
+                      request_id: id,
+                      blocked_for_ms: Date.now() - req.createdAt,
+                    },
+                    null,
+                    2
+                  ),
+                },
+              ],
+            };
+          }
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  status: "timed_out",
+                  short_id: shortId,
+                  request_id: id,
+                  timeout_sec,
+                  note: "User didn't answer within the timeout. The question is still in state — they can still answer, and you can pick it up via poll_user_response.",
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      },
+      ({ plan_id }) => ({ planId: plan_id ?? "(ask_user)" })
+    )
+  );
+
+  // ---- request_user_response (legacy, non-blocking; kept for back-compat) --
   server.tool(
     "request_user_response",
     "PRIMARY CLAUDE asks the user a question via Telegram and awaits the response. If `options` is provided, the message has inline-keyboard buttons; otherwise the user is told to reply with `/respond <short_id> <text>`. Returns a `request_id` — poll it via `poll_user_response`. Times out after `timeout_sec` (default 600s = 10 min); if no response, status returns `timed_out`.",

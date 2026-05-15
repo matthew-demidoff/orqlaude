@@ -28,6 +28,13 @@ export interface TelegramMessage {
   chat: TelegramChat;
   date: number;
   text?: string;
+  /**
+   * v0.10.1+: when the user replies to a bot message, Telegram populates
+   * this field with the original. We use `reply_to_message.message_id` to
+   * route the reply back to a specific UserResponseRequest, replacing the
+   * fragile `/respond <short_id> <text>` convention.
+   */
+  reply_to_message?: TelegramMessage;
 }
 
 export interface TelegramCallbackQuery {
@@ -70,7 +77,17 @@ export class TelegramApi {
   async sendMessage(
     chatId: number,
     text: string,
-    opts: { parseMode?: "Markdown" | "HTML"; inlineKeyboard?: InlineKeyboardButton[][] } = {}
+    opts: {
+      parseMode?: "Markdown" | "HTML";
+      inlineKeyboard?: InlineKeyboardButton[][];
+      /**
+       * v0.10.1+: enable Telegram's "force reply" UI. When set, tapping the
+       * message focuses the chat input and the user's next message becomes a
+       * reply-to of this one. Use for questions where we want the user to
+       * reply-to (not just press a button).
+       */
+      forceReply?: boolean;
+    } = {}
   ): Promise<{ message_id: number }> {
     const body: Record<string, unknown> = {
       chat_id: chatId,
@@ -80,6 +97,11 @@ export class TelegramApi {
     };
     if (opts.inlineKeyboard) {
       body.reply_markup = { inline_keyboard: opts.inlineKeyboard };
+    } else if (opts.forceReply) {
+      // ForceReply prompts the Telegram client to focus its input box with
+      // the question pre-selected as a reply target. Selective:false means
+      // every chat member sees it (we're in private chats so this is moot).
+      body.reply_markup = { force_reply: true, selective: false };
     }
     const res = await fetch(this.endpoint("sendMessage"), {
       method: "POST",
