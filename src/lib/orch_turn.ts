@@ -156,7 +156,7 @@ export async function runOrchTurn(input: OrchTurnInput): Promise<OrchTurnResult>
  * one per line. We need the final assistant text. Concatenate every text
  * delta we see; the model's actual response is the union of these.
  */
-function extractAssistantText(stdout: string): string {
+export function extractAssistantText(stdout: string): string {
   const lines = stdout.split("\n").filter((l) => l.trim());
   let out = "";
   for (const line of lines) {
@@ -184,7 +184,7 @@ function extractAssistantText(stdout: string): string {
   return out.trim();
 }
 
-function tryParseJson(text: string): { ok: true; value: unknown } | { ok: false; error: string } {
+export function tryParseJson(text: string): { ok: true; value: unknown } | { ok: false; error: string } {
   if (!text) return { ok: false, error: "empty response" };
   // Strip ```json ... ``` fences if present.
   const fence = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
