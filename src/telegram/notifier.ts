@@ -84,7 +84,13 @@ export class Notifier {
     if (this.cfg.whitelist.length === 0) return;
     const cursor = await this.loadCursor();
     const store = new StateStore(path.join(this.projectDir, ".orqlaude"));
-    const plans: Plan[] = await store.read((s) => Object.values(s.plans));
+    // v0.9.0: also pull orphan notification arrays so notify_user without a
+    // plan_id reaches Telegram.
+    const { plans, orphanNotifications, orphanResponseRequests } = await store.read((s) => ({
+      plans: Object.values(s.plans),
+      orphanNotifications: s.orphanNotifications ?? [],
+      orphanResponseRequests: s.orphanResponseRequests ?? [],
+    }));
 
     // First-tick seed: silently snapshot current state, no messages.
     if (!cursor.initialized) {
@@ -200,6 +206,31 @@ export class Notifier {
         questionPushes.push({ req: r, text, inlineKeyboard });
         cursor.notifiedUserRequestIds.push(r.id);
       }
+    }
+
+    // ---- v0.9.0: orphan notifications (no plan_id) ----
+    for (const n of orphanNotifications) {
+      if (cursor.notifiedUserNotificationIds.includes(n.id)) continue;
+      const emoji = URGENCY_EMOJI[n.urgency] ?? URGENCY_EMOJI.normal;
+      plainMessages.push(`${emoji} ${escapeMd(n.text)}`);
+      cursor.notifiedUserNotificationIds.push(n.id);
+    }
+    for (const r of orphanResponseRequests) {
+      if (cursor.notifiedUserRequestIds.includes(r.id)) continue;
+      if (r.cancelled || r.response !== undefined) {
+        cursor.notifiedUserRequestIds.push(r.id);
+        continue;
+      }
+      const headline = `❓ *Question from orqlaude* \\(${r.shortId}\\)\n${escapeMd(r.prompt)}`;
+      const trailer = r.options
+        ? ""
+        : `\n\nReply with: \`/respond ${r.shortId} <your answer>\``;
+      const text = headline + trailer;
+      const inlineKeyboard = r.options
+        ? buildInlineKeyboard(r.shortId, r.options)
+        : undefined;
+      questionPushes.push({ req: r, text, inlineKeyboard });
+      cursor.notifiedUserRequestIds.push(r.id);
     }
 
     // Persist cursor BEFORE we attempt sends — so a failed network call

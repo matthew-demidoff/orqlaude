@@ -67,6 +67,12 @@ export interface Task {
   /** v0.7.0+: paths to the captured stdout/stderr log files. */
   stderrPath?: string;
   stdoutPath?: string;
+  /**
+   * v0.9.0+: path to the per-task exit-record file written by the
+   * `child.on('exit')` handler in spawn_via_cli. Read as a fast-path
+   * in status() instead of waiting on a poll cycle.
+   */
+  exitJsonPath?: string;
   /** v0.5+: Human-friendly Agnet designation (e.g. "Zenith"). Used in CLI
    *  output and Telegram notifications. Stable per task_id. */
   agnetName?: string;
@@ -231,9 +237,17 @@ export interface Plan {
 export interface State {
   schemaVersion: 3;
   plans: Record<string, Plan>;
+  /**
+   * v0.9.0+: notifications + response requests that aren't bound to any
+   * plan (e.g. session-startup pings, ad-hoc "I'm done" messages from the
+   * orchestrator). The notifier daemon drains these the same way it
+   * drains per-plan notifications.
+   */
+  orphanNotifications?: UserNotification[];
+  orphanResponseRequests?: UserResponseRequest[];
 }
 
-const EMPTY_STATE: State = { schemaVersion: 3, plans: {} };
+const EMPTY_STATE: State = { schemaVersion: 3, plans: {}, orphanNotifications: [], orphanResponseRequests: [] };
 const LOCK_TIMEOUT_MS = 5_000;
 const LOCK_RETRY_BASE_MS = 30;
 
@@ -406,8 +420,19 @@ export class StateStore {
 /** Forward-compatible migration from earlier schemas. v1 → v3 in one pass. */
 function migrate(input: Partial<State> & { schemaVersion?: number }): State {
   const v = input.schemaVersion ?? 1;
-  if (v === 3 && input.plans) return input as State;
-  const out: State = { schemaVersion: 3, plans: {} };
+  if (v === 3 && input.plans) {
+    // v0.9.0: backfill orphan arrays so older v3 state files load cleanly.
+    const out = input as State;
+    out.orphanNotifications = out.orphanNotifications ?? [];
+    out.orphanResponseRequests = out.orphanResponseRequests ?? [];
+    return out;
+  }
+  const out: State = {
+    schemaVersion: 3,
+    plans: {},
+    orphanNotifications: input.orphanNotifications ?? [],
+    orphanResponseRequests: input.orphanResponseRequests ?? [],
+  };
   for (const [id, plan] of Object.entries(input.plans ?? {})) {
     const p = plan as Plan & { budgetCapUsd?: number; perAgentCapUsd?: number };
     out.plans[id] = {

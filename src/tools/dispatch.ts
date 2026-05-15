@@ -3,9 +3,11 @@ import { z } from "zod";
 import { StateStore, findPlan, findTask } from "../lib/state.js";
 import { jsonlPathFor, snapshotSession } from "../lib/jsonl_tail.js";
 import { detectHallucination, extractToolUses } from "../lib/hallucination.js";
-import { spawnAgnetViaCli, findGitRoot, cleanupPlanWorktrees } from "../lib/spawn_cli.js";
+import { spawnAgnetViaCli, findGitRoot, cleanupPlanWorktrees, readChildExitRecord } from "../lib/spawn_cli.js";
 import { isProcessAlive } from "../lib/process_lib.js";
 import { resolveStateDir } from "../lib/state_dir.js";
+import { probeTelegramStatus } from "../lib/telegram_status.js";
+import { VERSION } from "../lib/version.js";
 import { promises as fs } from "node:fs";
 import type { AuditLog } from "../lib/audit.js";
 
@@ -146,6 +148,7 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
           task.commandLine = spawn.commandLine;
           task.stderrPath = spawn.stderrPath;
           task.stdoutPath = spawn.stdoutPath;
+          task.exitJsonPath = spawn.exitJsonPath;
           task.status = "running";
           task.startedAt = Date.now();
           return {
@@ -174,7 +177,7 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
   // ---- cleanup_worktrees (companion to spawn_via_cli, v0.5.3+) -------------
   server.tool(
     "cleanup_worktrees",
-    "Remove all orqlaude-managed worktrees for a plan (typically called after `collect`). Only touches paths under <project>/.orqlaude-worktrees/<plan_short>-*. Force-removes via `git worktree remove --force` then falls back to rm -rf if git refuses.",
+    "Remove all orqlaude-managed worktrees for a plan (typically called after `collect`). Only touches paths under <project>/.orqlaude-worktrees/<plan_short>-*. Force-removes via `git worktree remove --force` then falls back to rm -rf if git refuses. v0.9.0: also releases the spawn locks on every task whose worktree was removed - so the orchestrator can re-spawn against the same plan_id + task_id without create_plan churn.",
     {
       plan_id: z.string(),
       project_root: z.string().optional(),
@@ -184,7 +187,49 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
       async ({ plan_id, project_root }) => {
         const root = project_root ?? findGitRoot(process.cwd());
         const removed = await cleanupPlanWorktrees(root, plan_id);
-        return { content: [{ type: "text", text: JSON.stringify({ plan_id, removed_count: removed.length, removed }, null, 2) }] };
+        // v0.9.0: walk the plan's tasks and release any spawn lock whose
+        // worktreePath was just removed. This makes cleanup_worktrees the
+        // canonical "reset this plan, let me re-spawn fresh" entry point.
+        const released = await store.update((state) => {
+          const plan = findPlan(state, plan_id);
+          const releasedIds: string[] = [];
+          for (const t of plan.tasks) {
+            if (t.worktreePath && removed.includes(t.worktreePath)) {
+              t.spawnedSessionId = undefined;
+              t.pid = undefined;
+              t.exitJsonPath = undefined;
+              // Reset to pending so next_task / spawn_via_cli treat it fresh.
+              // Preserve worktreePath/branch for audit but they'll be
+              // overwritten on the next spawn.
+              if (t.status === "running" || t.status === "dispatched" || t.status === "died_at_launch") {
+                t.status = "pending";
+              }
+              releasedIds.push(t.id);
+            }
+          }
+          return releasedIds;
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  plan_id,
+                  removed_count: removed.length,
+                  removed,
+                  released_task_ids: released,
+                  next_step:
+                    released.length > 0
+                      ? `Released ${released.length} spawn lock(s). You can call spawn_via_cli on the same task_ids to re-fire.`
+                      : undefined,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
       },
       ({ plan_id }) => ({ planId: plan_id })
     )
@@ -240,7 +285,13 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
                 note: "Not yet spawned (waiting for chip click + self-registration).",
               };
             }
-            const snap = await snapshotSession(cwd, t.spawnedSessionId);
+            const snap = await snapshotSession(cwd, t.spawnedSessionId, t.stdoutPath);
+            // v0.9.0: fast-path terminal-state read. If the child wrote an
+            // exit record via the spawn_via_cli on('exit') handler, surface
+            // it - the orchestrator doesn't have to re-poll until isProcessAlive
+            // ticks over. Falls through to the regular PID/snapshot path if
+            // the file is missing (server restart after spawn, etc).
+            const exitRecord = t.exitJsonPath ? await readChildExitRecord(t.exitJsonPath) : null;
             const toolUses = await extractToolUses(jsonlPathFor(cwd, t.spawnedSessionId));
             const hallu = await detectHallucination(toolUses, cwd);
             const taskWarnings: string[] = [];
@@ -251,11 +302,39 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
             // stops polling a corpse.
             let derivedStatus: typeof t.status = snap.terminated ? "done" : t.status;
             let stderrExcerpt: string | null = null;
+            // v0.9.0: terminal-state precedence:
+            //   1. exit-record file (most authoritative; written by the
+            //      parent's on('exit') handler).
+            //   2. snap.terminated (result row in the event stream).
+            //   3. PID liveness + empty stream = died_at_launch.
+            if (exitRecord) {
+              derivedStatus = exitRecord.success ? "done" : "failed";
+              if (!exitRecord.success && t.stderrPath) {
+                try {
+                  const buf = await fs.readFile(t.stderrPath, "utf8");
+                  stderrExcerpt = buf.slice(0, 1000);
+                } catch {
+                  /* file missing */
+                }
+              }
+              t.status = derivedStatus;
+              if (!t.finishedAt) t.finishedAt = exitRecord.terminated_at;
+            }
+            // died_at_launch is now defined as "PID dead AND no event was
+            // ever parsed from either stream source." Earlier versions
+            // checked `!snap.exists` which broke once we started creating
+            // the stdout log file at spawn time (the file exists but is
+            // empty when the child exits before writing). Use
+            // lastActivityAt + tokens-used == 0 as the canonical signal.
+            const producedNothing =
+              !snap.lastActivityAt &&
+              snap.totalEffectiveTokens === 0 &&
+              !snap.lastAssistantText &&
+              !snap.lastToolUse;
             if (
               t.pid &&
               !isProcessAlive(t.pid) &&
-              !snap.exists &&
-              !snap.lastActivityAt &&
+              producedNothing &&
               (t.status === "running" || t.status === "dispatched")
             ) {
               derivedStatus = "died_at_launch";
@@ -268,7 +347,7 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
                 }
               }
               taskWarnings.push(
-                `Child PID ${t.pid} is dead and no JSONL was written. ` +
+                `Child PID ${t.pid} is dead and no events were parsed from either the Desktop JSONL or the spawn_via_cli stdout log. ` +
                   `Inspect stderr at ${t.stderrPath ?? "(unknown)"} or re-run the command: ${t.commandLine ?? "(unknown)"}`
               );
               // Persist the new status so subsequent calls don't redo this.
@@ -305,6 +384,9 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
               stop_requested: t.stopRequested ?? null,
               stderr_excerpt: stderrExcerpt,
               stderr_path: t.stderrPath ?? null,
+              stdout_path: t.stdoutPath ?? null,
+              stream_source: snap.source,
+              exit_record: exitRecord,
               command_line: t.commandLine ?? null,
             };
           })
@@ -417,6 +499,176 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
     )
   );
 
+  // ---- wait_for_status_change (long-poll) ----------------------------------
+  // v0.9.0: replaces the orchestrator's polling-loop pattern. Blocks for up
+  // to `timeout_sec` (default 60s) until ANY task in the plan transitions
+  // state, finishes, opens a PR, dies at launch, or chews through a
+  // material slice of its token budget. Cheap internal poll (every 2s
+  // file-stat + tiny snapshot read), but holds the connection open so the
+  // primary Claude can sleep without waking up to call status() every 90s.
+  server.tool(
+    "wait_for_status_change",
+    "Long-poll: blocks up to `timeout_sec` (default 60, max 600) and returns as soon as the fleet state changes (task transition, new PR url, exit-record, +1 KB token delta) - OR returns the unchanged state when the timeout elapses. Use this INSTEAD of ScheduleWakeup + status() polling: pass the `fingerprint` from the prior response as `since_fingerprint` and the call returns the moment something useful happens. v0.9.0+.",
+    {
+      plan_id: z.string(),
+      since_fingerprint: z.string().optional().describe("The `fingerprint` field from the prior wait_for_status_change (or status) response. Omit on first call - the server returns immediately with the current snapshot + the fresh fingerprint to thread through subsequent calls."),
+      timeout_sec: z.number().int().positive().max(600).default(60).describe("Max seconds the call blocks before returning the unchanged state. Default 60. Cap 600 (10 min)."),
+    },
+    audit.wrap(
+      "wait_for_status_change",
+      async ({ plan_id, since_fingerprint, timeout_sec }) => {
+        const cwd = process.cwd();
+        const POLL_INTERVAL_MS = 2_000;
+        const deadline = Date.now() + timeout_sec * 1000;
+
+        const buildSnapshot = async () => {
+          const plan = await store.read((state) => findPlan(state, plan_id));
+          const agents = await Promise.all(
+            plan.tasks.map(async (t) => {
+              if (!t.spawnedSessionId) {
+                return {
+                  task_id: t.id,
+                  title: t.title,
+                  status: t.status,
+                  tokens_used: 0,
+                  pr_url: t.prUrl ?? null,
+                  pid_alive: null as boolean | null,
+                  exit_record: null as Awaited<ReturnType<typeof readChildExitRecord>>,
+                  terminated: false,
+                  stop_kind: t.stopRequested?.kind ?? null,
+                };
+              }
+              const snap = await snapshotSession(cwd, t.spawnedSessionId, t.stdoutPath);
+              const exitRecord = t.exitJsonPath ? await readChildExitRecord(t.exitJsonPath) : null;
+              return {
+                task_id: t.id,
+                title: t.title,
+                status: exitRecord ? (exitRecord.success ? "done" : "failed") : t.status,
+                tokens_used: snap.totalEffectiveTokens,
+                pr_url: t.prUrl ?? null,
+                pid_alive: t.pid ? isProcessAlive(t.pid) : null,
+                exit_record: exitRecord,
+                terminated: snap.terminated || !!exitRecord,
+                stop_kind: t.stopRequested?.kind ?? null,
+              };
+            })
+          );
+          return {
+            plan_id,
+            plan_status: plan.status,
+            agents,
+          };
+        };
+
+        const computeFingerprint = (snap: Awaited<ReturnType<typeof buildSnapshot>>): string => {
+          // v0.9.1: hash-safe encoding via JSON.stringify. The previous
+          // pipe-joined / colon-separated form was fragile if a task_id or
+          // pr_url ever contained a `|` or `:` (today both are sanitized
+          // UUIDs / GitHub URLs, but pinning the structure costs nothing).
+          // Also includes `stop_kind` so kill_task / request_stop transitions
+          // wake the long-poll without waiting for the child to actually
+          // terminate - useful when a soft-stop is in flight.
+          const parts: Array<unknown> = [snap.plan_status];
+          for (const a of snap.agents) {
+            // Round token count to KB so per-token churn doesn't trip the
+            // fingerprint - only material progress does.
+            const kb = Math.floor(a.tokens_used / 1024);
+            parts.push([
+              a.task_id,
+              a.status,
+              a.pr_url ?? null,
+              kb,
+              a.exit_record
+                ? { code: a.exit_record.exit_code, sig: a.exit_record.signal }
+                : null,
+              a.terminated,
+              a.pid_alive,
+              a.stop_kind,
+            ]);
+          }
+          return JSON.stringify(parts);
+        };
+
+        // First read - if no fingerprint, return immediately with the
+        // current state (still useful as a fresh dispatch).
+        let snapshot = await buildSnapshot();
+        let fingerprint = computeFingerprint(snapshot);
+        if (!since_fingerprint || fingerprint !== since_fingerprint) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    ...snapshot,
+                    fingerprint,
+                    changed: !!since_fingerprint,
+                    elapsed_sec: 0,
+                    timed_out: false,
+                    next_step:
+                      "Call wait_for_status_change again with this `fingerprint` as `since_fingerprint` to block until the next transition.",
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+
+        // Poll loop until fingerprint changes or deadline hits.
+        const startedAt = Date.now();
+        while (Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+          snapshot = await buildSnapshot();
+          fingerprint = computeFingerprint(snapshot);
+          if (fingerprint !== since_fingerprint) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    {
+                      ...snapshot,
+                      fingerprint,
+                      changed: true,
+                      elapsed_sec: Math.round((Date.now() - startedAt) / 1000),
+                      timed_out: false,
+                    },
+                    null,
+                    2
+                  ),
+                },
+              ],
+            };
+          }
+        }
+        // Timeout - return unchanged state.
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  ...snapshot,
+                  fingerprint,
+                  changed: false,
+                  elapsed_sec: Math.round((Date.now() - startedAt) / 1000),
+                  timed_out: true,
+                  next_step:
+                    "Nothing changed during the wait window. Call wait_for_status_change again with the same `since_fingerprint` to keep waiting, OR call status() for a deeper read.",
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      },
+      ({ plan_id }) => ({ planId: plan_id })
+    )
+  );
+
   // ---- collect --------------------------------------------------------------
   server.tool(
     "collect",
@@ -434,7 +686,9 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
         const cwd = process.cwd();
         const results = await Promise.all(
           plan.tasks.map(async (t) => {
-            const snap = t.spawnedSessionId ? await snapshotSession(cwd, t.spawnedSessionId) : null;
+            const snap = t.spawnedSessionId
+              ? await snapshotSession(cwd, t.spawnedSessionId, t.stdoutPath)
+              : null;
             return {
               task_id: t.id,
               title: t.title,
@@ -478,6 +732,120 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
         };
       },
       ({ plan_id }) => ({ planId: plan_id })
+    )
+  );
+
+  // ---- fleet_summary (v0.9.0 dashboard, one-tool aggregation) --------------
+  // Single-call replacement for ping + status + list_plans + telegram probe.
+  // Use this at the START of a fresh session ("what's in flight?") and any
+  // time you want a wide view of every active plan without making 4 round
+  // trips. Returns:
+  //   - server health (version, cwd, state dir, telegram status)
+  //   - per-plan rollup (counts of pending/running/done/failed, PR list)
+  //   - cross-plan totals (active Agnets, total tokens spent today)
+  server.tool(
+    "fleet_summary",
+    "Single-call dashboard for the entire orqlaude state. Returns server health + per-plan rollup + cross-plan totals. Use at session start to discover in-flight fleets; use mid-fleet for a wide view without ping + status + list_plans round-trips. v0.9.0+.",
+    {},
+    audit.wrap(
+      "fleet_summary",
+      async () => {
+        const cwd = process.cwd();
+        const stateDir = resolveStateDir().path;
+        const tg = await probeTelegramStatus(stateDir);
+        const { plans, orphanNotificationCount, orphanResponseCount } = await store.read((s) => ({
+          plans: Object.values(s.plans),
+          orphanNotificationCount: (s.orphanNotifications ?? []).length,
+          orphanResponseCount: (s.orphanResponseRequests ?? []).length,
+        }));
+        const planRollups = await Promise.all(
+          plans.map(async (p) => {
+            // Fast per-task counts WITHOUT the full snapshotSession read.
+            const counts = { pending: 0, dispatched: 0, running: 0, done: 0, failed: 0, cancelled: 0, died_at_launch: 0 } as Record<string, number>;
+            const prs: string[] = [];
+            // v0.9.1: parallelize the per-task snapshot reads. The first
+            // post-restart call is O(plans × tasks) IO; the inner Promise.all
+            // makes the per-plan inner loop concurrent. Cache makes
+            // subsequent calls cheap regardless.
+            for (const t of p.tasks) {
+              const status = t.status ?? "pending";
+              counts[status] = (counts[status] ?? 0) + 1;
+              if (t.prUrl) prs.push(t.prUrl);
+            }
+            const taskTokens = await Promise.all(
+              p.tasks.map(async (t) => {
+                if (!t.spawnedSessionId) return 0;
+                const snap = await snapshotSession(cwd, t.spawnedSessionId, t.stdoutPath);
+                return snap.totalEffectiveTokens;
+              })
+            );
+            const tokensTotal = taskTokens.reduce((s, v) => s + v, 0);
+            const allDone = p.tasks.length > 0 && p.tasks.every((t) => t.status === "done" || t.status === "failed" || t.status === "cancelled");
+            return {
+              plan_id: p.id,
+              status: p.status,
+              created_at: p.createdAt,
+              root_task: p.rootTask.slice(0, 120),
+              task_count: p.tasks.length,
+              task_status_counts: counts,
+              tokens_used: tokensTotal,
+              budget_cap_tokens: p.budgetCapTokens,
+              budget_pct: p.budgetCapTokens ? Math.round((tokensTotal / p.budgetCapTokens) * 100) : 0,
+              prs,
+              all_terminal: allDone,
+              suggested_next:
+                p.status === "draft"
+                  ? "request_approval + confirm"
+                  : counts.pending > 0
+                  ? "spawn_via_cli (per-task) or next_task"
+                  : counts.running + counts.dispatched > 0
+                  ? "wait_for_status_change"
+                  : allDone
+                  ? "collect + cleanup_worktrees"
+                  : "status",
+            };
+          })
+        );
+        const activeAgnets = planRollups.reduce(
+          (sum, r) => sum + (r.task_status_counts.running ?? 0) + (r.task_status_counts.dispatched ?? 0),
+          0
+        );
+        const grandTokens = planRollups.reduce((sum, r) => sum + r.tokens_used, 0);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  server: { version: VERSION, cwd, state_dir: stateDir },
+                  telegram: tg,
+                  plans: planRollups.sort((a, b) => b.created_at - a.created_at),
+                  totals: {
+                    plan_count: plans.length,
+                    active_agnets: activeAgnets,
+                    grand_total_tokens: grandTokens,
+                  },
+                  orphan_queue: {
+                    notifications: orphanNotificationCount,
+                    response_requests: orphanResponseCount,
+                  },
+                  next_step:
+                    activeAgnets > 0
+                      ? `${activeAgnets} Agnet(s) actively running. Call wait_for_status_change(<plan_id>) to block until any transitions.`
+                      : planRollups.some((r) => r.status === "draft")
+                      ? "One or more plans are draft - confirm or cancel."
+                      : planRollups.some((r) => r.all_terminal && r.status !== "collected")
+                      ? "All Agnets on at least one plan are terminal. Call collect + cleanup_worktrees."
+                      : "Idle.",
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      },
+      () => ({})
     )
   );
 }
