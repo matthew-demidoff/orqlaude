@@ -122,6 +122,12 @@ async function main(): Promise<number> {
       case "tg":
         exitCode = await cmdTg(rest);
         break;
+      case "autopilot":
+        // v0.10.0+: persistent daemon for hands-off fleet orchestration.
+        // Delegates to ./cli/autopilot.cmdAutopilot — sub-commands: start,
+        // stop, status, pause, resume.
+        exitCode = await (await import("./cli/autopilot.js")).cmdAutopilot(rest);
+        break;
       default:
         process.stderr.write(errorLine(`unknown subcommand: ${cmd}`, `try \`orql help\``));
         exitCode = 1;
@@ -184,6 +190,12 @@ function printHelp(): void {
   console.log("");
   console.log(style.bold(style.cream("Notifications")));
   console.log(`  ${style.coral("orql notify on|off|test|status")}           macOS desktop notifications (paired with Telegram)`);
+  console.log("");
+  console.log(style.bold(style.cream("Autopilot (v0.10.0+)")));
+  console.log(`  ${style.coral("orql autopilot start")} ${style.sand("[--verbose] [--tick-ms N]")}   Run the daemon (foreground)`);
+  console.log(`  ${style.coral("orql autopilot stop")}                       SIGTERM the daemon`);
+  console.log(`  ${style.coral("orql autopilot status")}                     Daemon + budget burn`);
+  console.log(`  ${style.coral("orql autopilot pause|resume")}               Halt new-goal pickup (in-flight fleets continue)`);
   console.log("");
   console.log(style.bold(style.cream("Telegram")));
   console.log(`  ${style.coral("orqlaude tg setup")}               Configure bot token (interactive)`);
