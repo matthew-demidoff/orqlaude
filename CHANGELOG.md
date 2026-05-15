@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.9.1 — review follow-ups
+
+Three follow-ups + three nits from the v0.9.0 review (#22).
+
+### Changed
+
+- **`spawn_cli.ts`** — the `child.on('exit')` handler now uses the
+  top-level `writeFileSync` import instead of an inline `require("node:fs")`.
+  Cosmetic; ESM-clean.
+- **`wait_for_status_change` fingerprint** — switched from pipe-and-colon
+  string-joining to `JSON.stringify(parts)`. Hash-safer if a task_id, PR
+  URL, or any other component ever contains a delimiter character. Also
+  added `stop_kind` per-agent so `kill_task` / `request_stop` transitions
+  wake the long-poll without waiting for the child to actually terminate.
+- **`fleet_summary`** — parallelized the per-task `snapshotSession` reads
+  inside each plan's rollup via `Promise.all`. First post-restart call is
+  noticeably faster on large fleets; cache makes subsequent calls cheap
+  regardless.
+
+### Internal
+
+- **`src/lib/version.ts`** — single source of truth for the runtime
+  version string. Imported by `server.ts`, `cli.ts`, `tools/ping.ts`,
+  `tools/dispatch.ts` (for `fleet_summary`). `package.json` stays
+  canonical for npm; on release bump both. Closes the "five places to
+  update" footgun the reviewer flagged.
+
+### Tests
+
+- Strengthened the v0.9.0 D migration test from "undefined OR array" to
+  pinning the contract: `Array.isArray(orphans.n) && length === 0`. The
+  weak form was passing regardless of whether the migration actually ran.
+
 ## 0.9.0 — observability overhaul
 
 Closes the gap between "the Agnet is doing work" and "orqlaude knows the Agnet

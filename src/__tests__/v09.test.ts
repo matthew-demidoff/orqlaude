@@ -166,12 +166,15 @@ test("v0.9.0 D: state.ts migrate fills orphanNotifications on a fresh v3 state",
     n: s.orphanNotifications,
     r: s.orphanResponseRequests,
   }));
-  // The migrate fn returns the loaded state directly when v3 - but our
-  // notifier code reads with `?? []`. The behavior we care about is that
-  // (a) reading doesn't throw, and (b) optional access returns
-  // undefined-or-array. Either is fine; the notifier-side `?? []` covers it.
-  assert.ok(orphans.n === undefined || Array.isArray(orphans.n));
-  assert.ok(orphans.r === undefined || Array.isArray(orphans.r));
+  // v0.9.1: pin the migration contract. The migrate fn explicitly
+  // initializes these arrays (out.orphanNotifications = out.orphanNotifications
+  // ?? []) so a load of a v3-without-orphans file must result in arrays,
+  // not undefineds. The notifier's `?? []` is defense-in-depth, not the
+  // primary contract.
+  assert.ok(Array.isArray(orphans.n), "orphanNotifications should be initialized as []");
+  assert.ok(Array.isArray(orphans.r), "orphanResponseRequests should be initialized as []");
+  assert.equal(orphans.n.length, 0);
+  assert.equal(orphans.r.length, 0);
 });
 
 test("v0.9.0 D: notify_user without plan_id pushes to orphan queue", async () => {

@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { resolveStateDir } from "../lib/state_dir.js";
 import { probeTelegramStatus } from "../lib/telegram_status.js";
+import { VERSION } from "../lib/version.js";
 
 export function registerPing(server: McpServer): void {
   server.tool(
@@ -27,7 +28,7 @@ export function registerPing(server: McpServer): void {
       const payload = {
         ok: warnings.length === 0,
         server: "orqlaude",
-        version: "0.8.0",
+        version: VERSION,
         cwd: realCwd,
         cwd_source: stateRes.cwdSource,
         state_dir: stateRes.path,

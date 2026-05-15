@@ -7,6 +7,7 @@ import { spawnAgnetViaCli, findGitRoot, cleanupPlanWorktrees, readChildExitRecor
 import { isProcessAlive } from "../lib/process_lib.js";
 import { resolveStateDir } from "../lib/state_dir.js";
 import { probeTelegramStatus } from "../lib/telegram_status.js";
+import { VERSION } from "../lib/version.js";
 import { promises as fs } from "node:fs";
 import type { AuditLog } from "../lib/audit.js";
 
@@ -534,6 +535,7 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
                   pid_alive: null as boolean | null,
                   exit_record: null as Awaited<ReturnType<typeof readChildExitRecord>>,
                   terminated: false,
+                  stop_kind: t.stopRequested?.kind ?? null,
                 };
               }
               const snap = await snapshotSession(cwd, t.spawnedSessionId, t.stdoutPath);
@@ -547,6 +549,7 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
                 pid_alive: t.pid ? isProcessAlive(t.pid) : null,
                 exit_record: exitRecord,
                 terminated: snap.terminated || !!exitRecord,
+                stop_kind: t.stopRequested?.kind ?? null,
               };
             })
           );
@@ -558,19 +561,32 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
         };
 
         const computeFingerprint = (snap: Awaited<ReturnType<typeof buildSnapshot>>): string => {
-          const parts: string[] = [String(snap.plan_status)];
+          // v0.9.1: hash-safe encoding via JSON.stringify. The previous
+          // pipe-joined / colon-separated form was fragile if a task_id or
+          // pr_url ever contained a `|` or `:` (today both are sanitized
+          // UUIDs / GitHub URLs, but pinning the structure costs nothing).
+          // Also includes `stop_kind` so kill_task / request_stop transitions
+          // wake the long-poll without waiting for the child to actually
+          // terminate - useful when a soft-stop is in flight.
+          const parts: Array<unknown> = [snap.plan_status];
           for (const a of snap.agents) {
             // Round token count to KB so per-token churn doesn't trip the
             // fingerprint - only material progress does.
             const kb = Math.floor(a.tokens_used / 1024);
-            const exitMark = a.exit_record
-              ? `exit:${a.exit_record.exit_code ?? ""}:${a.exit_record.signal ?? ""}`
-              : "";
-            parts.push(
-              `${a.task_id}:${a.status}:${a.pr_url ?? ""}:${kb}:${exitMark}:${a.terminated ? 1 : 0}:${a.pid_alive === null ? "?" : a.pid_alive ? "1" : "0"}`
-            );
+            parts.push([
+              a.task_id,
+              a.status,
+              a.pr_url ?? null,
+              kb,
+              a.exit_record
+                ? { code: a.exit_record.exit_code, sig: a.exit_record.signal }
+                : null,
+              a.terminated,
+              a.pid_alive,
+              a.stop_kind,
+            ]);
           }
-          return parts.join("|");
+          return JSON.stringify(parts);
         };
 
         // First read - if no fingerprint, return immediately with the
@@ -747,16 +763,23 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
             // Fast per-task counts WITHOUT the full snapshotSession read.
             const counts = { pending: 0, dispatched: 0, running: 0, done: 0, failed: 0, cancelled: 0, died_at_launch: 0 } as Record<string, number>;
             const prs: string[] = [];
-            let tokensTotal = 0;
+            // v0.9.1: parallelize the per-task snapshot reads. The first
+            // post-restart call is O(plans × tasks) IO; the inner Promise.all
+            // makes the per-plan inner loop concurrent. Cache makes
+            // subsequent calls cheap regardless.
             for (const t of p.tasks) {
               const status = t.status ?? "pending";
               counts[status] = (counts[status] ?? 0) + 1;
               if (t.prUrl) prs.push(t.prUrl);
-              if (t.spawnedSessionId) {
-                const snap = await snapshotSession(cwd, t.spawnedSessionId, t.stdoutPath);
-                tokensTotal += snap.totalEffectiveTokens;
-              }
             }
+            const taskTokens = await Promise.all(
+              p.tasks.map(async (t) => {
+                if (!t.spawnedSessionId) return 0;
+                const snap = await snapshotSession(cwd, t.spawnedSessionId, t.stdoutPath);
+                return snap.totalEffectiveTokens;
+              })
+            );
+            const tokensTotal = taskTokens.reduce((s, v) => s + v, 0);
             const allDone = p.tasks.length > 0 && p.tasks.every((t) => t.status === "done" || t.status === "failed" || t.status === "cancelled");
             return {
               plan_id: p.id,
@@ -794,7 +817,7 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
               type: "text",
               text: JSON.stringify(
                 {
-                  server: { version: SERVER_VERSION, cwd, state_dir: stateDir },
+                  server: { version: VERSION, cwd, state_dir: stateDir },
                   telegram: tg,
                   plans: planRollups.sort((a, b) => b.created_at - a.created_at),
                   totals: {
@@ -826,8 +849,6 @@ export function registerDispatch(server: McpServer, store: StateStore, audit: Au
     )
   );
 }
-
-const SERVER_VERSION = "0.9.0";
 
 function buildSpawnPrompt(planId: string, taskId: string, userPrompt: string, branchHint?: string): string {
   const branchSection = branchHint ? `\n\nSuggested branch: \`${branchHint}\`.` : "";

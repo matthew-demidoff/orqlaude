@@ -1,5 +1,14 @@
 import { execSync, spawn, spawnSync } from "node:child_process";
-import { promises as fs, existsSync, readdirSync, statSync, readFileSync, accessSync, constants } from "node:fs";
+import {
+  promises as fs,
+  existsSync,
+  readdirSync,
+  statSync,
+  readFileSync,
+  writeFileSync,
+  accessSync,
+  constants,
+} from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
@@ -347,7 +356,7 @@ export async function spawnAgnetViaCli(input: SpawnViaCliInput): Promise<SpawnVi
     // orchestrator, this silently no-ops. We use the sync API because
     // 'exit' fires during shutdown and the async fs queue may not flush.
     try {
-      require("node:fs").writeFileSync(exitJsonPath, JSON.stringify(record, null, 2));
+      writeFileSync(exitJsonPath, JSON.stringify(record, null, 2));
     } catch {
       /* worktree gone, or perms issue - status() will fall back to PID poll */
     }
