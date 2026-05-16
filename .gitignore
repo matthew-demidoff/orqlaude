@@ -12,3 +12,19 @@ dist/
 # Old scaffold names retained for safety
 .fleet/
 .claudefleet-state/
+
+# Editor/AI-tool config + session files
+.cursor/
+.aider*
+.continue/
+.copilot/
+.windsurf/
+CLAUDE.md
+AGENTS.md
+.cursorrules
+.aider.conf.yml
+
+# Local scratch / prompt files
+scratch/
+notes-*.md
+*.prompt.md

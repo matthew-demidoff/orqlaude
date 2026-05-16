@@ -311,7 +311,7 @@ async function tick(
           await postReviewComment(task.prUrl, review, cwd);
           await pushOrphanNotification(
             store,
-            `🤖 Auto-review for ${task.prUrl}: ${review.verdict}. Posted comment. Blockers: ${decision.violations.join("; ")}`,
+            `Auto-review for ${task.prUrl}: ${review.verdict}. Posted comment. Blockers: ${decision.violations.join("; ")}`,
             review.verdict === "BLOCKER" ? "high" : "normal"
           );
         }

@@ -228,7 +228,7 @@ export async function squashMerge(prUrl: string, cwd: string, method: "squash" |
 
 function renderReviewComment(review: ReviewVerdict): string {
   const lines: string[] = [];
-  lines.push(`### 🤖 orqlaude auto-review`);
+  lines.push(`### orqlaude auto-review`);
   lines.push("");
   lines.push(`**Verdict:** \`${review.verdict}\``);
   lines.push("");
