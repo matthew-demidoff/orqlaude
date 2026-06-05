@@ -6,6 +6,9 @@ dist/
 # Per-project orqlaude runtime state (plans, audit log, lock file)
 .orqlaude/
 
+# Per-task worktrees created by spawn_via_cli
+.orqlaude-worktrees/
+
 # Per-project Claude session/worktree scratch space
 .claude/
 

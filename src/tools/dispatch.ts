@@ -1051,7 +1051,7 @@ async function enforceBudget(
         if (t.spawnedSessionId && !t.stopRequested) {
           t.stopRequested = { reason: "fleet overbudget", requestedAt: Date.now(), kind: "hard" };
           plan.messages.push({
-            id: cryptoRandomId(),
+            id: randomUUID(),
             toSessionId: t.spawnedSessionId,
             text:
               `STOP: fleet exceeded token budget (used ${Math.round(totalForBudget / 1000)}k of ` +
@@ -1080,7 +1080,3 @@ async function enforceBudget(
   };
 }
 
-function cryptoRandomId(): string {
-  // small helper to avoid importing crypto in this top-of-file scope twice
-  return Math.random().toString(36).slice(2) + Date.now().toString(36);
-}

@@ -18,7 +18,7 @@ const TaskInputSchema = z.object({
   title: z.string().min(1).max(60).describe("Imperative action phrase, <60 chars. Becomes the spawned session's chip label."),
   prompt: z.string().min(1).describe("Self-contained prompt for the spawned agent. Must include file paths, scope, and the directive to commit + open a PR. The agent has no memory of this conversation."),
   tldr: z.string().min(1).describe("1-2 sentence plain-English summary shown to the user as a tooltip."),
-  scope: z.array(z.string()).optional().describe("Optional list of files/dirs this task touches. Used (1) to detect overlap with other tasks at plan creation, and (2) as a hint to the spawned agent for which files to claim_files. If two tasks declare the same path, create_plan returns a `scope_overlaps` warning (and rejects with `strict_scope: true`)."),
+  scope: z.array(z.string().min(1)).optional().describe("Optional list of files/dirs this task touches. Used (1) to detect overlap with other tasks at plan creation, and (2) as a hint to the spawned agent for which files to claim_files. If two tasks declare the same path, create_plan returns a `scope_overlaps` warning (and rejects with `strict_scope: true`)."),
   branchHint: z.string().optional().describe("Optional suggested branch name. The spawned agent decides the actual name."),
   budgetHintTokens: z.number().int().positive().optional().describe("Optional per-task token budget hint. status() will surface a soft warning when this task's usage exceeds 70% of this value. The plan-wide budget_cap_tokens still hard-stops everything at 100%."),
 });
@@ -36,7 +36,7 @@ export function registerPlanning(server: McpServer, store: StateStore, audit: Au
       budget_cap_tokens: z.number().int().positive().default(DEFAULT_BUDGET_TOKENS).describe("Hard ceiling for the whole fleet in tokens. Per-agent cap is derived as budget_cap_tokens / tasks.length unless tasks have individual budgetHintTokens. Default 500k tokens (~5 agents × 100k each)."),
       budget_mode: z.enum(["billed", "total"]).default("billed").describe("v0.9.2+: which token bucket the cap constrains. `billed` (default) counts only input + output tokens - cache reads are free on the Claude Plan so excluding them stops spurious overbudget kills. `total` counts everything including cache reads; pick this if you're paying per-token via the API."),
       model_for_estimate: z.string().default("claude-sonnet-4-6").describe("Model assumed for cost estimation (informational USD only; doesn't control what spawn_task uses)."),
-      effort_multiplier: z.number().positive().default(1.0).describe("Rough difficulty multiplier. 0.5 trivial, 1 moderate, 2+ heavy refactors."),
+      effort_multiplier: z.number().positive().max(10).default(1.0).describe("Rough difficulty multiplier. 0.5 trivial, 1 moderate, 2+ heavy refactors. Capped at 10 (a 10x multiplier already implies ~40-minute Agnets — any larger and the plan should be split)."),
       strict_scope: z.boolean().default(false).describe("If true, reject the plan when two tasks declare overlapping `scope` paths. Default false (warn but allow)."),
     },
     audit.wrap(
@@ -127,7 +127,7 @@ export function registerPlanning(server: McpServer, store: StateStore, audit: Au
     {
       plan_id: z.string(),
       model: z.string().optional(),
-      effort_multiplier: z.number().positive().optional(),
+      effort_multiplier: z.number().positive().max(10).optional(),
     },
     audit.wrap(
       "estimate",

@@ -1,7 +1,6 @@
 import { promises as fs } from "node:fs";
 import { existsSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import { StateStore, findPlan, type Plan, type Task } from "../lib/state.js";
 import { MemoryStore } from "../lib/memory.js";
 import { BacklogStore } from "../lib/backlog.js";
@@ -365,7 +364,7 @@ async function tick(
       );
     }
     // Force pause for new goals until next window.
-    if (!existsSync(pauseFile())) writeFileSync(pauseFile(), `orange_at_${Date.now()}\n`);
+    if (!existsSync(resolvePauseFile())) writeFileSync(resolvePauseFile(), `orange_at_${Date.now()}\n`);
   } else if (snap.level === "red") {
     // Rate-limit to every 18 ticks (~3 min). Without this the red branch
     // would post a high-urgency Telegram on every tick (every 10s) — a
@@ -378,13 +377,16 @@ async function tick(
         "high"
       );
     }
-    if (!existsSync(pauseFile())) writeFileSync(pauseFile(), `red_at_${Date.now()}\n`);
+    if (!existsSync(resolvePauseFile())) writeFileSync(resolvePauseFile(), `red_at_${Date.now()}\n`);
   }
   if (opts.verbose && state.ticks % 6 === 0) {
     log(`tick ${state.ticks}: plans=${reconciledPlans.length} guardrails=${snap.level} (win=${Math.round(snap.windowPct * 100)}%, day=${Math.round(snap.dayPct * 100)}%)`);
   }
 
-  function pauseFile(): string {
+  // Resolves the autopilot pause-file path. Named distinctly from the
+  // `pauseFile` string in `runAutopilot()` to avoid the variable/function
+  // shadowing that lived here through v0.10.x.
+  function resolvePauseFile(): string {
     return path.join(resolveStateDir().path, "autopilot.paused");
   }
 }

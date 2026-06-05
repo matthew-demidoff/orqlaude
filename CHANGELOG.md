@@ -1,5 +1,309 @@
 # Changelog
 
+## 0.12.1 — hardening pass: every bug a sharp reviewer found, fixed
+
+Driven by two parallel code-audit passes (one focused on the web server,
+one on the new CLI commands + shared JSON store) plus targeted research
+on 2026-era SSE production gotchas. Twelve real issues addressed; 12 new
+regression tests pin each one down so future refactors can't re-break
+them.
+
+Total test count: **236 passing** (up from 224 in v0.12.0).
+
+### Web server (`src/lib/web_server.ts`)
+
+  * **SSE backpressure**. `client.write()` return value is now respected;
+    a slow client whose socket buffer fills is evicted immediately
+    rather than allowed to balloon Node's internal queue. Combined with
+    bounded per-message size, server memory under a hung browser tab is
+    now strictly bounded.
+
+  * **SSE heartbeat** (`: keepalive` every 25s on idle streams). Defeats
+    proxy / load-balancer idle-kill (nginx default 60s, AWS ALB 60s,
+    Cloudflare 100s). The heartbeat is per-client and only fires when
+    the snapshot ticker hasn't already written to that client.
+
+  * **SSE proxy-friendly headers**: `X-Accel-Buffering: no`,
+    `Cache-Control: no-store, no-transform`, `retry: 5000`. The first two
+    are nginx/Cloudflare-respected; the third hints the EventSource
+    client to reconnect on a 5s window instead of the browser default.
+
+  * **Three-way disconnect cleanup**. SSE clients are evicted on any of
+    `req.close`, `res.close`, or `socket.error`. v0.12.0 only listened
+    for `req.close`, which doesn't fire on abrupt RST. No more stale
+    Set entries.
+
+  * **Broadcaster idles when no clients are connected**. v0.12.0 stat-
+    checked four files every second forever; v0.12.1 returns early.
+
+  * **`server.stop()` is idempotent**. SIGINT + SIGTERM arriving back-
+    to-back, or two parallel callers, won't double-close the server.
+
+  * **Slowloris defenses**: `requestTimeout: 30s`, `headersTimeout: 10s`,
+    `keepAliveTimeout: 5s`, `maxConnections: 64`. SSE responses opt out
+    via `socket.setTimeout(0)` after handshake, so their longevity is
+    unaffected.
+
+  * **Constant-time CSRF compare** via `crypto.timingSafeEqual`. Overkill
+    for a localhost-only server, but it removes the entire category
+    from any future security discussion.
+
+  * **Content-Security-Policy header** on the dashboard page. Even if a
+    future change leaks unescaped data into the HTML, inline-script and
+    eval-style XSS are blocked. `frame-ancestors 'none'` blocks
+    clickjacking. Paired with `X-Content-Type-Options: nosniff` and
+    `Referrer-Policy: no-referrer`.
+
+  * **Consistent attribute escaping**. The kill-button row in v0.12.0
+    used a mix of bare concat (`'data-kill-task="' + t.id + '"'`) and
+    `escapeHtml()` — fine for UUIDs in practice but a stink test. Every
+    attribute is now `escapeAttr()`'d uniformly.
+
+### Web dashboard page
+
+  * **Keyboard shortcuts**: `/` focus filter, `Esc` clear, `e` expand all
+    plans, `c` collapse all, `r` force-reconnect SSE, `?` help overlay.
+  * **Free-text filter** across plan ids, root tasks, agnet names, task
+    titles, and statuses. Persisted nowhere (intentional — clears on
+    reload).
+  * **Click-to-copy plan ids**. Hover any plan id, click, copied.
+    Clipboard API in a localhost page works under all major browsers.
+  * **Connection-lost overlay** when SSE has been silent for >15s.
+  * **Document title reflects fleet state**: `● orqlaude — 3/12 agnets`
+    when something is in flight. Spot it from a backgrounded tab.
+  * **localStorage in private/incognito mode no longer crashes the page.**
+    Wrapped in a try/catch helper. Open-plans state degrades to in-
+    memory only.
+  * **Graceful SSE close on `beforeunload`/`pagehide`** so the server's
+    eviction fires immediately instead of waiting for keep-alive to lapse.
+  * **External PR links** get `rel="noopener noreferrer"` (no tabnabbing).
+
+### `orql cost`
+
+  * **`--days` capped at 365** with a friendly note when truncated.
+    Defends against `--days 10000` allocating a bucket per day.
+  * **Ambiguous `--plan <prefix>` now errors** with a list of matching
+    plan ids instead of silently picking the first match.
+  * **Defensive `formatCost`**: NaN / negative / Infinity render as `$0`
+    instead of `$NaN`.
+  * **Sparkline NaN/Infinity guard**: non-finite values coerced to 0
+    before `Math.max`, so `sparkline([NaN, 5, 3])` no longer renders
+    every glyph as the lowest band.
+
+### `orql goal`
+
+  * **`cmdCancel` errors gracefully** instead of crashing with a stack
+    trace when the goal is already done/cancelled.
+  * **`parseDeadline` actually validates dates**: `2026-02-30`, `2026-13-15`,
+    `2026-04-31` are all rejected. Round-trip through `Date` and
+    compare back to the input string — only an exact match passes.
+  * **Relative deadlines**: `+7d`, `+2w`. Capped at +3650 days (10 years).
+  * **Non-TTY stdin fails fast** with a hint to use `--yes`, instead of
+    hanging forever waiting for input that will never come.
+
+### `JsonStore` (memory + backlog shared base)
+
+  * **Size-based cache fingerprint** in addition to mtime. Many
+    filesystems (HFS+, ext4 on older kernels, FAT32) have second-level
+    mtime granularity; two writes inside the same second wouldn't
+    invalidate a peer's cache. JSON files almost never have the exact
+    same size twice in a row, so size+mtime together catch the race.
+
+  * **Post-create lock token verification**. After winning the
+    `open(O_EXCL)` race, we re-read the lock file and confirm it
+    carries OUR token before proceeding. Defends against pathological
+    filesystems (NFS, some Docker volume drivers) where O_EXCL
+    semantics are best-effort.
+
+  * **`LOCK_TIMEOUT_MS` bumped from 5s to 15s.** The original was
+    triggering false positives during legitimate busy autopilot ticks
+    that needed >5s under the lock. Real deadlocks still surface, just
+    later.
+
+### Plumbing + tests
+
+  * 12 new tests in `v0121_hardening.test.ts` covering: stop()
+    idempotence, CSRF surface, CSP header, SSE proxy headers, idle
+    broadcaster guard, JsonStore size-fingerprint, concurrent
+    multi-instance writes, sparkline NaN coercion, parseDeadline
+    accepting `+Nd` / rejecting out-of-range / rejecting malformed,
+    BacklogStore double-cancel propagation.
+
+  * `parseDeadline` exported for unit-test coverage.
+
+## 0.12.0 — `orql web` dashboard, `orql cost` analytics, `orql goal new` wizard
+
+Three new headline commands. Each is end-to-end usable today: shipped with
+tests, integrated into help output, and exercised against a live state
+directory before the release commit.
+
+### `orql web` — live HTML fleet dashboard
+
+`orql watch` is great when one fleet is in flight, but it owns the terminal
+and can't show drilldown. `orql web` boots a local HTTP server (default
+`http://127.0.0.1:7777`) that renders every plan + every Agnet + a live
+audit feed in a single dark-themed page.
+
+Highlights:
+
+  * **Live updates via SSE.** A `setInterval` on the server polls the state
+    file once a second and broadcasts a fresh snapshot to every connected
+    page. EventSource handles reconnection for free.
+  * **Diff rendering.** The page keeps DOM nodes for plans it has already
+    drawn — your scroll position and which plans you've expanded are
+    preserved across snapshots (persisted in `localStorage`).
+  * **Inline controls.** Stop a plan, kill a hung Agnet, pause autopilot —
+    all without leaving the page. POSTs are CSRF-protected with a token
+    minted at boot.
+  * **Zero build step, zero deps.** The full HTML/CSS/JS lives in a single
+    string in `web_server.ts`. No `node_modules` bloat, no `npm install`
+    in the dashboard dir, no Vite. Renders fine on any modern browser.
+  * **Port autoscan.** If 7777 is taken (another `orql web` is already
+    open), we silently scan up to 7799 instead of failing.
+  * **Security.** Binds to 127.0.0.1 only. POST endpoints require the
+    matching `x-orql-csrf` header; the token is echoed into the page on
+    initial GET. Remote access is the user's responsibility (SSH tunnel).
+
+Try it: `orql web` — opens your default browser automatically.
+
+### `orql cost` — spend analytics with terminal sparklines
+
+Reads `orqlaude-state.json` and attributes per-task token + cost burn to
+a calendar day. Default view: last 14 days. Outputs:
+
+  * Window totals + all-time totals + projected monthly spend (extrapolated
+    from a trailing-7-day average — early warning when burn drifts).
+  * Two ASCII sparklines (daily cost + daily tokens) using
+    `▁▂▃▄▅▆▇█` blocks. Recent days highlighted in coral, older in sand.
+  * Per-day table with weekend rows dimmed.
+  * Top 5 plans by cost in the window.
+
+`orql cost --plan <id>` drills into one plan: per-Agnet rows sorted by
+cost, with status / duration / PR link.
+
+`--json` emits the same data as a structured object — pipe it into
+whatever spreadsheet / dashboard you already have.
+
+### `orql goal new <template>` — quickstart wizard
+
+`orql backlog add` always worked but required you to remember the JSON
+shape of a `Goal`. The wizard takes a fleet template id (`audit-sweep`,
+`test-coverage-fill`, `dep-upgrade`, `bug-hunt`, …), walks you through
+the missing pieces interactively (title, priority, scope, tags,
+deadline), and enqueues the goal so the autopilot daemon picks it up on
+its next idle tick.
+
+  * `--yes` accepts every default — script-friendly.
+  * `orql goal templates` lists every bundled template with descriptions.
+  * `orql goal list` / `show` / `cancel` are aliases for the most common
+    backlog operations, but tab-grouped by status (running first,
+    cancelled last) so the eye lands on what matters.
+
+### Plumbing
+
+  * New module `src/lib/web_server.ts` (~500 LOC). HTTP server, SSE, CSRF.
+  * New modules `src/cli/web.ts`, `src/cli/cost.ts`, `src/cli/goal.ts`.
+  * `cli.ts` routes for `web` / `dashboard` / `cost` / `goal` (typo
+    suggester now knows about them).
+  * Help text gets a `★` glyph next to the headline commands.
+  * 19 new tests in `v012_web.test.ts` + `v012_cost_goal.test.ts`. Total
+    test count: **224 passing** (up from 205 in v0.11).
+
+### Notes for v0.12.x
+
+The web dashboard's `stop plan` hook flips `stopRequested` on each task
+in state.json — in-flight CLI agents notice the flag on their next status
+poll and wind down on their own (commit, push, exit). The `kill task`
+hook additionally sends `SIGKILL` directly to the recorded child PID,
+so it works even when the autopilot daemon is asleep.
+
+The browser-open code uses `open` (macOS), `xdg-open` (Linux), and
+`cmd /c start` (Windows). On Linux distros without `xdg-utils` the
+browser open is silently a no-op — the user just clicks the URL printed
+to stdout.
+
+## 0.11.0 — polish pass: cross-process safety for memory + backlog
+
+This release closes a class of silent data loss + cleans up a handful of
+sharp edges that accumulated through the v0.10.x series. No new public
+tools; the focus is making what's already there bulletproof.
+
+### Bug 1: `MemoryStore` and `BacklogStore` lacked cross-process locking
+
+`StateStore` got cross-process file locks + mtime-based cache
+invalidation in v0.3.1 / v0.10.8. `MemoryStore` and `BacklogStore` —
+which are written by all three of (MCP server, CLI, autopilot daemon) —
+never received the same treatment. Symptom: a `orql backlog add` issued
+while the autopilot daemon was mid-tick could be overwritten by the
+daemon's next `persist()` call (last-writer-wins on stale in-memory
+cache); a `mcp__orqlaude__remember` issued from a fleet agent could be
+invisible to the CLI's `orql memory list` until the daemon happened to
+reload.
+
+**Fix**: extracted a shared `JsonStore<T>` (`src/lib/json_store.ts`)
+that mirrors `StateStore`'s discipline — sidecar `.lock` file with
+PID-based stale reclaim, UUID-token ownership verification on release,
+and per-read mtime stat-check. `MemoryStore` and `BacklogStore` both
+now route through it. Existing call sites are unchanged.
+
+### Bug 2: `dispatch.ts` minted overbudget stop-message IDs from `Math.random`
+
+`enforceBudget()` queued one `kind: "stop"` message per running task
+when the fleet went overbudget. Each got an id from a hand-rolled
+`Math.random + Date.now` helper instead of `crypto.randomUUID`. Two
+overbudget snapshots within the same millisecond could collide on id;
+the helper's comment also lied about why it existed (claimed `crypto`
+wasn't imported — it was).
+
+**Fix**: deleted the helper, replaced both call sites with `randomUUID`
+(already imported at the top of the file).
+
+### Bug 3: `effort_multiplier` had no upper bound
+
+`create_plan` and `estimate` accepted any positive number for
+`effort_multiplier`. A typoed `100` produced a `(2-character) ⋅ 100 = 400
+minutes` duration estimate and a budget that no real Plan account would
+honor.
+
+**Fix**: capped at `10` (a 10x multiplier already implies ~40-minute
+Agnets; anything bigger should be split into a separate plan).
+
+### Bug 4: `autopilot.ts` shadowed `pauseFile` with a local function
+
+The top-of-`runAutopilot` `const pauseFile = path.join(...)` and the
+nested `function pauseFile() { ... }` defined inside `tick()` worked by
+accident — JS hoisting made the function visible inside `tick`, hiding
+the string. Renamed the nested function to `resolvePauseFile()` so a
+reader can tell which is which without thinking about scope rules.
+
+Also removed an unused `import os from "node:os"` from the same file.
+
+### Bug 5: `orql <typo>` told you "unknown subcommand" with no hint
+
+Now it suggests the nearest known subcommand within Levenshtein distance
+≤ 2 (`orql lst` → "did you mean `orql list`?") and always points at
+`orql help` as the fallback.
+
+### Bug 6: `audit.tail()` silently dropped malformed JSONL lines
+
+A partially-written audit line (writer killed mid-`appendFile`) was
+swallowed without trace. Now the tail emits a one-line stderr warning
+naming the file and count of dropped lines — the good events are still
+returned, the user just knows the window shrank.
+
+### Bug 7: `.orqlaude-worktrees/` wasn't in `.gitignore`
+
+`spawn_via_cli` creates worktrees under `<project>/.orqlaude-worktrees/`;
+the gitignore only listed `.orqlaude/`, so the worktree directory
+showed up in `git status` on the orqlaude repo itself when dogfooding.
+
+### Coverage
+
+Ten new tests in `src/__tests__/v011.test.ts` exercise the shared
+JsonStore (round-trip, cross-process mtime invalidation, corrupt-file
+fallback) plus the memory + backlog stores against the same scenarios.
+All 205 tests pass.
+
 ## 0.10.9 — pre-spawn worktree hygiene + finer-grained fingerprint
 
 Three small fixes for issues that surfaced during the Email Hub polish

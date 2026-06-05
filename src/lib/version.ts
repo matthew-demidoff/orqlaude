@@ -15,4 +15,4 @@
  * `npm run release` (or a pre-publish hook) can be wired to keep them in
  * sync automatically; for now they're updated by hand.
  */
-export const VERSION = "0.10.9";
+export const VERSION = "0.12.1";

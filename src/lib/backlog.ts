@@ -1,6 +1,6 @@
-import { promises as fs } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { JsonStore } from "./json_store.js";
 
 /**
  * Backlog — a durable queue of Goals the autopilot daemon picks from when
@@ -15,6 +15,10 @@ import { randomUUID } from "node:crypto";
  *
  * Goals can declare dependencies on other goals (only spawn after dep is
  * "done") and deadlines (priority gets boosted as deadline approaches).
+ *
+ * Storage: `<state_dir>/backlog.json`, written atomically through `JsonStore`
+ * — cross-process lock + mtime invalidation so the CLI (orql backlog add),
+ * the autopilot daemon, and the MCP server can all touch it concurrently.
  */
 
 export type GoalStatus =
@@ -65,48 +69,48 @@ export interface BacklogFile {
 const EMPTY: BacklogFile = { schemaVersion: 1, goals: [] };
 
 export class BacklogStore {
-  private filePath: string;
-  private cache: BacklogFile | null = null;
-  private writeLock: Promise<void> = Promise.resolve();
+  private store: JsonStore<BacklogFile>;
 
   constructor(stateDir: string) {
-    this.filePath = path.join(stateDir, "backlog.json");
-  }
-
-  private async load(): Promise<BacklogFile> {
-    if (this.cache) return this.cache;
-    try {
-      const raw = await fs.readFile(this.filePath, "utf8");
-      const parsed = JSON.parse(raw) as BacklogFile;
-      this.cache = parsed.schemaVersion === 1 ? parsed : EMPTY;
-    } catch (err: any) {
-      if (err.code === "ENOENT") this.cache = structuredClone(EMPTY);
-      else throw err;
-    }
-    return this.cache!;
+    this.store = new JsonStore<BacklogFile>({
+      filePath: path.join(stateDir, "backlog.json"),
+      empty: EMPTY,
+      migrate: (raw) => {
+        const parsed = raw as Partial<BacklogFile> | undefined;
+        if (parsed && parsed.schemaVersion === 1 && Array.isArray(parsed.goals)) {
+          return parsed as BacklogFile;
+        }
+        return EMPTY;
+      },
+    });
   }
 
   async list(opts: { status?: GoalStatus | GoalStatus[]; limit?: number } = {}): Promise<Goal[]> {
-    const file = await this.load();
-    const statuses = Array.isArray(opts.status) ? new Set(opts.status) : opts.status ? new Set([opts.status]) : null;
-    const out = file.goals.filter((g) => (statuses ? statuses.has(g.status) : true));
-    out.sort((a, b) => {
-      const pa = effectivePriority(a);
-      const pb = effectivePriority(b);
-      if (pa !== pb) return pb - pa;
-      return b.createdAt - a.createdAt;
+    return this.store.read((file) => {
+      const statuses = Array.isArray(opts.status)
+        ? new Set(opts.status)
+        : opts.status
+        ? new Set([opts.status])
+        : null;
+      const out = file.goals.filter((g) => (statuses ? statuses.has(g.status) : true));
+      out.sort((a, b) => {
+        const pa = effectivePriority(a);
+        const pb = effectivePriority(b);
+        if (pa !== pb) return pb - pa;
+        return b.createdAt - a.createdAt;
+      });
+      return out.slice(0, opts.limit ?? 200);
     });
-    return out.slice(0, opts.limit ?? 200);
   }
 
   async findById(id: string): Promise<Goal | undefined> {
-    const file = await this.load();
-    return file.goals.find((g) => g.id === id || g.shortId === id);
+    return this.store.read((file) => file.goals.find((g) => g.id === id || g.shortId === id));
   }
 
-  async enqueue(input: Omit<Goal, "id" | "shortId" | "createdAt" | "status"> & { status?: GoalStatus }): Promise<Goal> {
-    return this.withLock(async () => {
-      const file = await this.loadFresh();
+  async enqueue(
+    input: Omit<Goal, "id" | "shortId" | "createdAt" | "status"> & { status?: GoalStatus }
+  ): Promise<Goal> {
+    return this.store.update((file) => {
       const id = randomUUID();
       const shortId = id.slice(0, 8);
       const goal: Goal = {
@@ -117,18 +121,15 @@ export class BacklogStore {
         status: input.status ?? "queued",
       };
       file.goals.push(goal);
-      await this.persist(file);
       return goal;
     });
   }
 
   async update(id: string, mut: (g: Goal) => void): Promise<Goal | undefined> {
-    return this.withLock(async () => {
-      const file = await this.loadFresh();
+    return this.store.update((file) => {
       const goal = file.goals.find((g) => g.id === id || g.shortId === id);
       if (!goal) return undefined;
       mut(goal);
-      await this.persist(file);
       return goal;
     });
   }
@@ -147,32 +148,6 @@ export class BacklogStore {
       if (deps.every((d) => done.has(d))) return g;
     }
     return undefined;
-  }
-
-  private async loadFresh(): Promise<BacklogFile> {
-    this.cache = null;
-    return this.load();
-  }
-
-  private async persist(file: BacklogFile): Promise<void> {
-    await fs.mkdir(path.dirname(this.filePath), { recursive: true });
-    const tmp = `${this.filePath}.${process.pid}.${Date.now()}.tmp`;
-    await fs.writeFile(tmp, JSON.stringify(file, null, 2), { mode: 0o600 });
-    await fs.rename(tmp, this.filePath);
-    this.cache = file;
-  }
-
-  private async withLock<T>(fn: () => Promise<T>): Promise<T> {
-    let release: () => void = () => {};
-    const next = new Promise<void>((res) => (release = res));
-    const prev = this.writeLock;
-    this.writeLock = prev.then(() => next);
-    await prev;
-    try {
-      return await fn();
-    } finally {
-      release();
-    }
   }
 }
 

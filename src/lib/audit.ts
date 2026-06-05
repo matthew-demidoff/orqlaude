@@ -101,16 +101,25 @@ export class AuditLog {
     try {
       const raw = await fs.readFile(this.filePath, "utf8");
       const lines = raw.split("\n").filter((l) => l.trim());
-      return lines
-        .slice(-limit)
-        .map((l) => {
-          try {
-            return JSON.parse(l) as AuditEvent;
-          } catch {
-            return null;
-          }
-        })
-        .filter((e): e is AuditEvent => e !== null);
+      const sliced = lines.slice(-limit);
+      let dropped = 0;
+      const out: AuditEvent[] = [];
+      for (const l of sliced) {
+        try {
+          out.push(JSON.parse(l) as AuditEvent);
+        } catch {
+          dropped += 1;
+        }
+      }
+      if (dropped > 0) {
+        // Surface partial corruption rather than silently shrinking the
+        // window. Common cause: a writer was killed mid-line. The good
+        // events are still returned; the user just gets a heads-up.
+        process.stderr.write(
+          `[orqlaude audit] dropped ${dropped} malformed line(s) from ${path.basename(this.filePath)}\n`
+        );
+      }
+      return out;
     } catch (err: any) {
       if (err.code === "ENOENT") return [];
       throw err;

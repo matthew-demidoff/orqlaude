@@ -1,6 +1,6 @@
 {
-  "name": "@synaplink/orqlaude",
-  "version": "0.10.9",
+  "name": "@bnecko/orqlaude",
+  "version": "0.12.1",
   "description": "Multi-agent orchestrator for Claude Code. One primary session decomposes a complex task, gets a single budget approval, then dispatches N parallel Agnets via the Desktop app's native spawn_task (with explicit fallbacks). Tracks cost/status via JSONL tails; brokers messages between Agnets; streams to Telegram; detects hallucination; manages PRs.",
   "type": "module",
   "bin": {
@@ -32,16 +32,16 @@
     "agents",
     "anthropic"
   ],
-  "author": "SynapLink",
+  "author": "matthew-demidoff",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/SynapLink/orqlaude.git"
+    "url": "git+https://github.com/matthew-demidoff/orqlaude.git"
   },
   "bugs": {
-    "url": "https://github.com/SynapLink/orqlaude/issues"
+    "url": "https://github.com/matthew-demidoff/orqlaude/issues"
   },
-  "homepage": "https://github.com/SynapLink/orqlaude#readme",
+  "homepage": "https://github.com/matthew-demidoff/orqlaude#readme",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
     "zod": "^3.23.8"

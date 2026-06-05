@@ -1,6 +1,6 @@
-import { promises as fs } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { JsonStore } from "./json_store.js";
 
 /**
  * Memory module — durable cross-session notebook for orqlaude.
@@ -26,8 +26,9 @@ import { randomUUID } from "node:crypto";
  *                automatically when fleets complete (the post-PR review
  *                writes back an atlas entry per touched file).
  *
- * Storage: `<state_dir>/memory.json`. Append-only writes; entries are never
- * deleted, only superseded (a new entry with the same key wins).
+ * Storage: `<state_dir>/memory.json`, written atomically through `JsonStore`
+ * — cross-process lock + mtime invalidation so the CLI, the MCP server, and
+ * the autopilot daemon can all write concurrently without losing entries.
  *
  * Why a separate file (not the main state)? Memory is durable across plans;
  * the main state file lives and breathes with plan lifecycles. Mixing them
@@ -67,30 +68,24 @@ export interface MemoryFile {
 const EMPTY: MemoryFile = { schemaVersion: 1, entries: [] };
 
 export class MemoryStore {
-  private filePath: string;
-  private cache: MemoryFile | null = null;
-  private writeLock: Promise<void> = Promise.resolve();
+  private store: JsonStore<MemoryFile>;
 
   constructor(stateDir: string) {
-    this.filePath = path.join(stateDir, "memory.json");
-  }
-
-  private async load(): Promise<MemoryFile> {
-    if (this.cache) return this.cache;
-    try {
-      const raw = await fs.readFile(this.filePath, "utf8");
-      const parsed = JSON.parse(raw) as MemoryFile;
-      this.cache = parsed.schemaVersion === 1 ? parsed : EMPTY;
-    } catch (err: any) {
-      if (err.code === "ENOENT") this.cache = structuredClone(EMPTY);
-      else throw err;
-    }
-    return this.cache!;
+    this.store = new JsonStore<MemoryFile>({
+      filePath: path.join(stateDir, "memory.json"),
+      empty: EMPTY,
+      migrate: (raw) => {
+        const parsed = raw as Partial<MemoryFile> | undefined;
+        if (parsed && parsed.schemaVersion === 1 && Array.isArray(parsed.entries)) {
+          return parsed as MemoryFile;
+        }
+        return EMPTY;
+      },
+    });
   }
 
   async list(): Promise<MemoryEntry[]> {
-    const file = await this.load();
-    return file.entries.filter((e) => !e.supersededBy);
+    return this.store.read((f) => f.entries.filter((e) => !e.supersededBy));
   }
 
   /**
@@ -109,28 +104,31 @@ export class MemoryStore {
     scope?: string[];
     limit?: number;
   }): Promise<MemoryEntry[]> {
-    const file = await this.load();
-    const q = opts.query?.toLowerCase();
-    const scopeSet = new Set(opts.scope ?? []);
-    const candidates = file.entries.filter((e) => {
-      if (e.supersededBy) return false;
-      if (opts.category && e.category !== opts.category) return false;
-      if (opts.key && e.key.toLowerCase() !== opts.key.toLowerCase()) return false;
-      if (q) {
-        const hay = `${e.key}\n${e.value}\n${(e.tags ?? []).join(" ")}`.toLowerCase();
-        if (!hay.includes(q)) return false;
-      }
-      if (scopeSet.size > 0 && e.scope) {
-        const hit = e.scope.some((s) => scopeSet.has(s) || [...scopeSet].some((ss) => globMatch(ss, s) || globMatch(s, ss)));
-        if (!hit) return false;
-      }
-      return true;
+    return this.store.read((file) => {
+      const q = opts.query?.toLowerCase();
+      const scopeSet = new Set(opts.scope ?? []);
+      const candidates = file.entries.filter((e) => {
+        if (e.supersededBy) return false;
+        if (opts.category && e.category !== opts.category) return false;
+        if (opts.key && e.key.toLowerCase() !== opts.key.toLowerCase()) return false;
+        if (q) {
+          const hay = `${e.key}\n${e.value}\n${(e.tags ?? []).join(" ")}`.toLowerCase();
+          if (!hay.includes(q)) return false;
+        }
+        if (scopeSet.size > 0 && e.scope) {
+          const hit = e.scope.some(
+            (s) => scopeSet.has(s) || [...scopeSet].some((ss) => globMatch(ss, s) || globMatch(s, ss))
+          );
+          if (!hit) return false;
+        }
+        return true;
+      });
+      candidates.sort((a, b) => {
+        if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
+        return b.createdAt - a.createdAt;
+      });
+      return candidates.slice(0, opts.limit ?? 50);
     });
-    candidates.sort((a, b) => {
-      if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
-      return b.createdAt - a.createdAt;
-    });
-    return candidates.slice(0, opts.limit ?? 50);
   }
 
   /**
@@ -139,17 +137,10 @@ export class MemoryStore {
    * doesn't surface in recall() anymore.
    */
   async remember(input: Omit<MemoryEntry, "id" | "createdAt">): Promise<MemoryEntry> {
-    return this.withLock(async () => {
-      const file = await this.loadFresh();
+    return this.store.update((file) => {
       const now = Date.now();
       const id = randomUUID();
-      const entry: MemoryEntry = {
-        ...input,
-        id,
-        createdAt: now,
-      };
-      // Supersede prior entries with the same (category, key) so recall()
-      // returns the latest only.
+      const entry: MemoryEntry = { ...input, id, createdAt: now };
       for (const old of file.entries) {
         if (!old.supersededBy && old.category === entry.category && old.key === entry.key && old.id !== id) {
           old.supersededBy = id;
@@ -157,7 +148,6 @@ export class MemoryStore {
         }
       }
       file.entries.push(entry);
-      await this.persist(file);
       return entry;
     });
   }
@@ -168,8 +158,7 @@ export class MemoryStore {
    * after a single PR merge.
    */
   async rememberBatch(entries: Array<Omit<MemoryEntry, "id" | "createdAt">>): Promise<MemoryEntry[]> {
-    return this.withLock(async () => {
-      const file = await this.loadFresh();
+    return this.store.update((file) => {
       const now = Date.now();
       const out: MemoryEntry[] = [];
       for (const input of entries) {
@@ -189,19 +178,16 @@ export class MemoryStore {
         file.entries.push(entry);
         out.push(entry);
       }
-      await this.persist(file);
       return out;
     });
   }
 
   async forget(id: string): Promise<boolean> {
-    return this.withLock(async () => {
-      const file = await this.loadFresh();
+    return this.store.update((file) => {
       const entry = file.entries.find((e) => e.id === id);
       if (!entry || entry.supersededBy) return false;
       entry.supersededBy = "(forgotten)";
       entry.supersededAt = Date.now();
-      await this.persist(file);
       return true;
     });
   }
@@ -211,10 +197,7 @@ export class MemoryStore {
    * Picks pinned entries first, then category-balanced relevant entries up
    * to maxChars. Returns markdown ready to splice into a prompt.
    */
-  async composeContextBlock(opts: {
-    scope?: string[];
-    maxChars?: number;
-  }): Promise<string> {
+  async composeContextBlock(opts: { scope?: string[]; maxChars?: number }): Promise<string> {
     const max = opts.maxChars ?? 2000;
     const all = await this.list();
     const pinned = all.filter((e) => e.pinned);
@@ -225,8 +208,6 @@ export class MemoryStore {
       atlas: [],
     };
     for (const e of all) if (!e.pinned) byCat[e.category].push(e);
-    // For scope-tagged entries, prefer ones whose scope overlaps with the
-    // requested scope. Otherwise recency.
     const scopeSet = new Set(opts.scope ?? []);
     const rank = (e: MemoryEntry): number => {
       let s = 0;
@@ -237,7 +218,7 @@ export class MemoryStore {
           }
         }
       }
-      s += (Date.now() - e.createdAt < 7 * 86400_000) ? 2 : 0;
+      s += Date.now() - e.createdAt < 7 * 86400_000 ? 2 : 0;
       return s;
     };
     for (const cat of Object.keys(byCat) as MemoryCategory[]) {
@@ -267,34 +248,6 @@ export class MemoryStore {
     }
     return blocks.join("");
   }
-
-  // ---- internals ----------------------------------------------------------
-
-  private async loadFresh(): Promise<MemoryFile> {
-    this.cache = null;
-    return this.load();
-  }
-
-  private async persist(file: MemoryFile): Promise<void> {
-    await fs.mkdir(path.dirname(this.filePath), { recursive: true });
-    const tmp = `${this.filePath}.${process.pid}.${Date.now()}.tmp`;
-    await fs.writeFile(tmp, JSON.stringify(file, null, 2), { mode: 0o600 });
-    await fs.rename(tmp, this.filePath);
-    this.cache = file;
-  }
-
-  private async withLock<T>(fn: () => Promise<T>): Promise<T> {
-    let release: () => void = () => {};
-    const next = new Promise<void>((res) => (release = res));
-    const prev = this.writeLock;
-    this.writeLock = prev.then(() => next);
-    await prev;
-    try {
-      return await fn();
-    } finally {
-      release();
-    }
-  }
 }
 
 /**
@@ -303,7 +256,6 @@ export class MemoryStore {
  * rather than silent.
  */
 function globMatch(pattern: string, candidate: string): boolean {
-  // Anchor + escape regex specials, then re-introduce ** and * patterns.
   const esc = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
   const re = "^" + esc.replace(/\*\*/g, ".*").replace(/\*/g, "[^/]*") + "$";
   try {

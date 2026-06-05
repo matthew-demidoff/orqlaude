@@ -134,9 +134,41 @@ async function main(): Promise<number> {
       case "backlog":
         exitCode = await (await import("./cli/backlog.js")).cmdBacklog(STATE_DIR, rest);
         break;
-      default:
-        process.stderr.write(errorLine(`unknown subcommand: ${cmd}`, `try \`orql help\``));
+      case "web":
+      case "dashboard": {
+        // v0.12.0: live HTML dashboard at http://127.0.0.1:7777.
+        // Lazy-imported so we don't pay the http server load cost on every
+        // CLI invocation.
+        const { runWeb } = await import("./cli/web.js");
+        const port = parseFlagInt(rest, "--port");
+        const open = !rest.includes("--no-open");
+        await runWeb({ stateDir: STATE_DIR, port, open });
+        // runWeb blocks on SIGINT; the await only returns on bind failure.
+        exitCode = 0;
+        break;
+      }
+      case "cost": {
+        // v0.12.0: historical spend analytics + sparklines.
+        const { runCost } = await import("./cli/cost.js");
+        const days = parseFlagInt(rest, "--days") ?? 14;
+        const planId = parseFlagString(rest, "--plan");
+        exitCode = await runCost({ stateDir: STATE_DIR, days, planId, json: isJson });
+        break;
+      }
+      case "goal": {
+        // v0.12.0: backlog goal quickstart from a fleet template.
+        const { runGoal } = await import("./cli/goal.js");
+        exitCode = await runGoal({ stateDir: STATE_DIR, args: rest });
+        break;
+      }
+      default: {
+        const suggestion = suggestSubcommand(cmd);
+        const hint = suggestion
+          ? `did you mean \`orql ${suggestion}\`? — \`orql help\` lists every command`
+          : `\`orql help\` lists every command`;
+        process.stderr.write(errorLine(`unknown subcommand: ${cmd}`, hint));
         exitCode = 1;
+      }
     }
   } catch (err) {
     const { message, suggestion } = formatError(err);
@@ -183,9 +215,11 @@ function printHelp(): void {
   console.log(`  ${style.coral("orql doctor")}                              Verify your install end-to-end`);
   console.log("");
   console.log(style.bold(style.cream("Live")));
+  console.log(`  ${style.coral("orql web")} ${style.sand("[--port N] [--no-open]")}            ${style.sand("★")} Live HTML dashboard (default port 7777)`);
   console.log(`  ${style.coral("orql watch")} ${style.sand("<plan_id>")}                    Live fleet dashboard (1Hz refresh, Ctrl-C to exit)`);
   console.log(`  ${style.coral("orql tail")} ${style.sand("[plan_id]")}                     Stream the audit log; filter by plan prefix if given`);
   console.log(`  ${style.coral("orql open")} ${style.sand("<plan_id>")}                     Open all PRs from a plan in your browser`);
+  console.log(`  ${style.coral("orql cost")} ${style.sand("[--days N] [--plan ID] [--json]")}   Spend analytics with sparklines`);
   console.log("");
   console.log(style.bold(style.cream("Inspection")));
   console.log(`  ${style.coral("orql list")} ${style.sand("[--json]")}                      List plans in this project`);
@@ -213,6 +247,8 @@ function printHelp(): void {
   console.log(`  ${style.coral("orql backlog add")} ${style.sand("<title> [--priority N] [--deadline T] [--tag a,b]")}`);
   console.log(`  ${style.coral("orql backlog done|cancel")} ${style.sand("<id>")}               Mark a goal done or cancelled`);
   console.log(`  ${style.coral("orql backlog next")}                          Show what autopilot would pick next`);
+  console.log(`  ${style.coral("orql goal new")} ${style.sand("<template> [--yes]")}            ${style.sand("★")} Quickstart wizard: pick a fleet template`);
+  console.log(`  ${style.coral("orql goal list|show|cancel|templates")}    Goal management shortcuts`);
   console.log("");
   console.log(style.bold(style.cream("Telegram")));
   console.log(`  ${style.coral("orqlaude tg setup")}               Configure bot token (interactive)`);
@@ -720,6 +756,80 @@ function parseLimit(args: string[]): number {
 function truncate(s: string, n: number): string {
   if (s.length <= n) return s;
   return s.slice(0, n - 1) + "…";
+}
+
+const KNOWN_SUBCOMMANDS = [
+  "list", "status", "show", "history", "where", "setup", "watch", "doctor",
+  "tail", "open", "notify", "about", "tg", "autopilot", "memory", "backlog",
+  "web", "dashboard", "cost", "goal",
+  "help", "version",
+];
+
+/**
+ * Parse a numeric CLI flag like `--port 7777` or `--days 30`. Returns
+ * undefined if the flag is absent. Returns undefined (with no error)
+ * if the value is non-numeric — caller decides how to fall back.
+ */
+function parseFlagInt(argv: string[], flag: string): number | undefined {
+  const idx = argv.indexOf(flag);
+  if (idx === -1) return undefined;
+  const raw = argv[idx + 1];
+  if (raw === undefined) return undefined;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function parseFlagString(argv: string[], flag: string): string | undefined {
+  const idx = argv.indexOf(flag);
+  if (idx === -1) return undefined;
+  return argv[idx + 1];
+}
+
+/**
+ * Suggest the closest known subcommand for a typo. Returns the first
+ * candidate within Levenshtein distance ≤ 2; undefined if nothing close
+ * enough. Avoids the "did you mean X" anti-pattern where the suggestion is
+ * a wild guess (cap at 2 to keep it conservative).
+ *
+ * Tie-breaker: when two commands are equidistant (e.g. `gaol` is dist 2
+ * from BOTH `goal` and `tail`), prefer the one that shares the first
+ * character with the input. People rarely typo the first letter.
+ */
+function suggestSubcommand(input: string): string | undefined {
+  let best: { name: string; d: number; sharesFirst: boolean } | undefined;
+  for (const name of KNOWN_SUBCOMMANDS) {
+    const d = levenshtein(input, name);
+    if (d > 2) continue;
+    const sharesFirst = input[0] === name[0];
+    if (!best) {
+      best = { name, d, sharesFirst };
+      continue;
+    }
+    // Lower distance wins. On a tie, sharesFirst wins.
+    if (d < best.d || (d === best.d && sharesFirst && !best.sharesFirst)) {
+      best = { name, d, sharesFirst };
+    }
+  }
+  return best?.name;
+}
+
+function levenshtein(a: string, b: string): number {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  const prev = new Array(b.length + 1).fill(0).map((_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    let prevDiag = prev[0];
+    prev[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const tmp = prev[j];
+      prev[j] = a[i - 1] === b[j - 1]
+        ? prevDiag
+        : 1 + Math.min(prev[j], prev[j - 1], prevDiag);
+      prevDiag = tmp;
+    }
+  }
+  return prev[b.length];
 }
 
 main().then(
