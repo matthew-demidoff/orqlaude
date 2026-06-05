@@ -143,9 +143,9 @@ These let primary Claude push messages to and pull answers from the **user** (vi
 | `notify_user(plan_id, text, urgency?, task_id?)` | One-way push to user's Telegram. urgency = `low`/`normal`/`high` (affects emoji). Returns immediately. |
 | `request_user_response(plan_id, prompt, options?[], timeout_sec?, task_id?)` | Ask the user a question. With `options`, Telegram shows inline-keyboard buttons; without, user replies via `/respond <short_id> <text>`. Returns `request_id` + `short_id`. Defaults to a 10-minute timeout. |
 | `poll_user_response(request_id)` | Returns `status: pending\|answered\|timed_out\|cancelled` + `response` once available. Safe to poll repeatedly. |
-| `stream_to_user_start(plan_id, title, initial_content?, task_id?)` | **v0.5+** Open a streaming Telegram message. Returns `stream_id`. |
-| `stream_to_user_append(stream_id, chunk)` | **v0.5+** Append a chunk; notifier edits the Telegram message in place (throttled ~1 edit/1.5s). |
-| `stream_to_user_end(stream_id, final_chunk?)` | **v0.5+** Finalize the stream — adds a `✓` marker to the message. |
+| `stream_to_user_start(plan_id, title, initial_content?, task_id?)` | Open a streaming Telegram message. Returns `stream_id`. |
+| `stream_to_user_append(stream_id, chunk)` | Append a chunk; notifier edits the Telegram message in place (throttled ~1 edit/1.5s). |
+| `stream_to_user_end(stream_id, final_chunk?)` | Finalize the stream — adds a `✓` marker to the message. |
 
 Without a running `orqlaude tg start`, `notify_user` queues silently, `request_user_response` will always `timed_out`, and streaming tools accumulate content in state but no message lands on Telegram. Fall back to `AskUserQuestion` if Telegram is unavailable.
 
@@ -185,7 +185,7 @@ User says: *"Refactor the auth system — magic-link login, update the docs, add
 
 `ask_user` and its companion `wait_for_user_response` are the bounded-block loop primary Claude uses to put a question on Telegram and stay alive past the MCP host's 60s per-request timeout.
 
-The split exists because Claude Desktop and Claude Code both use the SDK default `DEFAULT_REQUEST_TIMEOUT_MSEC = 60000`. v0.10.2's progress notifications turned out to be ignored unless the client passes `resetTimeoutOnProgress: true` (it doesn't), so a single blocking call can't outrun the host. Instead, `ask_user` blocks at most 45s (the new `initial_block_sec`, capped at 45). The question's overall lifetime is `total_timeout_sec` (default 900s, max 3600s) -- that's how long it stays answerable. If the user replies inside the first window, you get `status: "answered"`. Otherwise you get `status: "still_pending"` with a `short_id`, and the caller must invoke `wait_for_user_response(short_id)` to keep waiting.
+The split exists because Claude Desktop and Claude Code both use the SDK default `DEFAULT_REQUEST_TIMEOUT_MSEC = 60000`. Progress notifications are ignored unless the client passes `resetTimeoutOnProgress: true` (it doesn't), so a single blocking call can't outrun the host. Instead, `ask_user` blocks at most 45s (the new `initial_block_sec`, capped at 45). The question's overall lifetime is `total_timeout_sec` (default 900s, max 3600s) -- that's how long it stays answerable. If the user replies inside the first window, you get `status: "answered"`. Otherwise you get `status: "still_pending"` with a `short_id`, and the caller must invoke `wait_for_user_response(short_id)` to keep waiting.
 
 Loop pattern (TS pseudocode):
 
@@ -528,8 +528,8 @@ orqlaude tg start
 - `/show <plan_id>` — raw plan JSON
 - `/notes <plan_id>` — recent agent notes
 - `/kill <plan_id> <task_id> <reason>` — STOP a runaway agent
-- `/respond <short_id> <text>` — answer a `request_user_response` question (v0.4+)
-- Tap inline-keyboard buttons on any `request_user_response` with options (v0.4+)
+- `/respond <short_id> <text>` — answer a `request_user_response` question
+- Tap inline-keyboard buttons on any `request_user_response` with options
 - `/whitelist <user_id> [label]` (owner-only) — add another user
 - `/help` / `/whoami`
 
@@ -545,10 +545,10 @@ The bot uses raw `fetch` against Telegram's Bot API — zero extra deps. State i
 ## Troubleshooting
 
 **Symptom: `ENOENT: no such file or directory, mkdir '/.orqlaude'` on `create_plan`.**
-Your MCP host launched orqlaude with `cwd=/`. v0.3.2+ auto-falls back to `~/.orqlaude/projects/...` but the explicit fix is to set `ORQLAUDE_STATE_DIR` in your `.mcp.json` env block (see `.mcp.json.template`). Verify with `mcp__orqlaude__ping` — it now returns `warnings` and `state_dir_source`.
+Your MCP host launched orqlaude with `cwd=/`. orqlaude auto-falls back to `~/.orqlaude/projects/...` but the explicit fix is to set `ORQLAUDE_STATE_DIR` in your `.mcp.json` env block (see `.mcp.json.template`). Verify with `mcp__orqlaude__ping` — it now returns `warnings` and `state_dir_source`.
 
 **Symptom: `spawn_via_cli` returned a PID but `status()` shows `died_at_launch` shortly after, with a stderr_excerpt + command_line.**
-This is the v0.7.0 hardening doing its job. The child `claude -p` process exited within the 1.5s healthcheck window. Read `stderr_excerpt` (or open `stderr_path` directly) for the cause. Common ones:
+The child `claude -p` process exited within the 1.5s healthcheck window. Read `stderr_excerpt` (or open `stderr_path` directly) for the cause. Common ones:
 1. `claude` isn't authenticated on this user account (`claude auth status` to check; `claude auth login --claudeai` to fix).
 2. The `--mcp-config` JSON references a server entry that doesn't exist (rare; orqlaude validates this pre-spawn).
 3. The user's environment lacks something `claude` needs (HOME, locale).
@@ -558,10 +558,10 @@ Copy the `command_line` field and paste it into a shell to reproduce by hand.
 The child agent isn't calling `checkin` on its first turn — its prompt didn't get the orqlaude protocol block, or `mcp__orqlaude__checkin` isn't available in the spawned session. Manual unblock: `register_spawn(plan_id, task_id, session_id)` where session_id is the child's session UUID (find via `mcp__ccd_session_mgmt__list_sessions`). For the proper fix, make sure orqlaude is in the spawned worktree's `.mcp.json` (commit `.mcp.json` to the repo so worktrees inherit it).
 
 **Symptom: agents in worktrees can't see the parent fleet's plan.**
-v0.3.1+ resolves `<cwd>/.git` files (worktree pointers) back to the parent checkout's `.orqlaude`. If a child still can't find its plan, run `orqlaude where` inside the worktree — `source` should be `worktree`. If it's `home-fallback`, the worktree pointer is malformed or `.git` isn't where the resolver expected.
+orqlaude resolves `<cwd>/.git` files (worktree pointers) back to the parent checkout's `.orqlaude`. If a child still can't find its plan, run `orqlaude where` inside the worktree — `source` should be `worktree`. If it's `home-fallback`, the worktree pointer is malformed or `.git` isn't where the resolver expected.
 
 **Symptom: Telegram bot stops sending notifications.**
-Check `/tmp/orqlaude-tg.log` (if you used the launchd plist) or wherever the bot is logging. The most likely cause is a Markdown parse error from an unescaped `_`/`*`/`` ` ``/`[` in a task title or note. v0.3.1+ escapes these but anything user-supplied that bypasses our path (e.g. content posted manually via `post_note` to a stale older bot) can still hit it.
+Check `/tmp/orqlaude-tg.log` (if you used the launchd plist) or wherever the bot is logging. The most likely cause is a Markdown parse error from an unescaped `_`/`*`/`` ` ``/`[` in a task title or note. orqlaude escapes these but anything user-supplied that bypasses our path (e.g. content posted manually via `post_note` to a stale older bot) can still hit it.
 
 ## License
 
