@@ -4,6 +4,8 @@ Multi-agent orchestrator for Claude Code. One primary Claude session decomposes 
 
 The name is **orq**hestrator + **Claude**.
 
+![orql demo](demo.gif)
+
 > Status: **v0.12.1** — 35+ tools, 236 tests passing, CI green. Live HTML dashboard (`orql web` — keyboard shortcuts, click-to-copy, SSE w/ heartbeat + CSP), cost analytics with sparklines (`orql cost`), goal quickstart wizard (`orql goal new`), token-first budgets (Max-friendly), self-registering child agents, hallucination detection, file-claim broker, durable memory + backlog, autopilot daemon, audit log, resumability, auto-review pipeline, and a **Telegram bot** for fleet notifications + remote control.
 
 ## Why orqlaude exists
