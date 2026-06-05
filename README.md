@@ -1,4 +1,4 @@
-# @synaplink/orqlaude
+# @bnecko/orqlaude
 
 Multi-agent orchestrator for Claude Code. One primary Claude session decomposes a complex task into N parallel **Agnets** (orqlaude's name for spawned workers), gets a single user approval, then dispatches each Agnet (in its own session and worktree) via the Claude Desktop app's native `mcp__ccd_session__spawn_task`. Tracks cost/tokens via JSONL tails, brokers messages between Agnets, detects hallucination, manages PRs, streams updates to your Telegram, and can spawn a reviewer Agnet per PR at the end.
 
@@ -41,7 +41,7 @@ orqlaude is the thin layer that adds those things. It never spawns processes its
 ## Install
 
 ```sh
-npm install -g @synaplink/orqlaude   # CLI + MCP server
+npm install -g @bnecko/orqlaude   # CLI + MCP server
 ```
 
 Then wire it into Claude Desktop's MCP config in one command:
@@ -67,7 +67,7 @@ If you'd rather edit the config yourself, the entry should look like:
   "mcpServers": {
     "orqlaude": {
       "command": "npx",
-      "args": ["-y", "-p", "@synaplink/orqlaude", "orqlaude-mcp"],
+      "args": ["-y", "-p", "@bnecko/orqlaude", "orqlaude-mcp"],
       "env": {
         "ORQLAUDE_STATE_DIR": "/absolute/path/to/your/project/.orqlaude"
       }
@@ -448,7 +448,7 @@ Colors disable automatically when stdout isn't a TTY, when `NO_COLOR` is set ([n
 
 ```
 orqlaude/
-├── package.json                # @synaplink/orqlaude
+├── package.json                # @bnecko/orqlaude
 ├── tsconfig.json
 ├── .mcp.json                   # local dev wiring
 ├── .mcp.json.template          # production wiring (npx-based)
