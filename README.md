@@ -134,7 +134,7 @@ If an Agnet is dispatched but doesn't call `mcp__orqlaude__checkin` within 60 s,
 | `resume_plan(plan_id)` | Pick up an in-flight plan after a Desktop-app restart or new session. Refreshes per-task status from JSONL, returns a "do this next" hint. |
 | `list_plans(include_collected?)` | All plans known to orqlaude in this project, active first. |
 
-### Broker-to-user (v0.4+, expanded in v0.5)
+### Broker-to-user
 
 These let primary Claude push messages to and pull answers from the **user** (via Telegram if configured, with a `/respond` text fallback).
 
@@ -152,8 +152,6 @@ Without a running `orqlaude tg start`, `notify_user` queues silently, `request_u
 #### Streaming transport
 
 orqlaude streams by opening a single Telegram message with `sendMessage`, then calling `editMessageText` on each append. The final `stream_to_user_end` does one more edit appending a `✓` marker.
-
-(v0.5.1 briefly used `sendMessageDraft` for animated, ephemeral previews — reverted in v0.5.4 after that endpoint proved unreliable in the standard Bot API.)
 
 Limits to know:
 - A Telegram message tops out at 4096 chars. orqlaude caps stream content at 3800 to leave room for the title + completion marker; further appends are silently truncated.
@@ -181,9 +179,9 @@ User says: *"Refactor the auth system — magic-link login, update the docs, add
 6. Periodically: `orqlaude.status` (shows hallucination scores) + `orqlaude.poll_notes`. Forward cross-cutting info via `send_message`. If an agent goes off the rails, `kill_task`.
 7. Agents call `orqlaude.post_note(..., pr_url=...)` when their PR is open.
 8. `orqlaude.collect` → three PR URLs and summaries.
-9. **NEW**: `orqlaude.review_prs(plan_id)` → spawns three reviewer agents, one per PR. Each reviews, runs tests, posts findings. You aggregate the second-round notes.
+9. `orqlaude.review_prs(plan_id)` → spawns three reviewer agents, one per PR. Each reviews, runs tests, posts findings. You aggregate the second-round notes.
 
-## Asking the user (v0.10.4 pattern)
+## Asking the user
 
 `ask_user` and its companion `wait_for_user_response` are the bounded-block loop primary Claude uses to put a question on Telegram and stay alive past the MCP host's 60s per-request timeout.
 
@@ -387,13 +385,13 @@ When you call `status(plan_id)`, every agent's snapshot includes a `hallucinatio
 | `moderate` | `send_message` to the agent with a nudge ("re-read X.ts before editing"), or `request_stop` if the work is salvageable. |
 | `severe` | `kill_task` and consider re-spawning with a clearer prompt. |
 
-False positives are acceptable here — we surface concerns, we don't auto-kill. A v0.4 addition is opt-in second-model cross-validation (a cheap Haiku reading the agent's recent turns and rating "is this lost?").
+False positives are acceptable here — we surface concerns, we don't auto-kill.
 
 ## CLI
 
 Two binaries are installed: `orqlaude` and the short alias `orql`. Use whichever feels right. All commands work the same.
 
-### Live (v0.6+)
+### Live
 
 ```sh
 orql watch <plan_id>            # live-updating dashboard (1Hz, Ctrl-C to exit)
@@ -430,7 +428,7 @@ Every read command supports `--json` to emit machine-readable output for scripti
 
 Read-only. For active orchestration, use the MCP from inside Claude Code.
 
-### Branding & colors (v0.5+)
+### Branding & colors
 
 CLI output uses the Anthropic palette via ANSI truecolor:
 
@@ -455,24 +453,46 @@ orqlaude/
 ├── .github/workflows/ci.yml    # typecheck + build + test
 ├── src/
 │   ├── server.ts               # MCP stdio entry
-│   ├── cli.ts                  # `orqlaude` CLI binary
+│   ├── cli.ts                  # `orqlaude` / `orql` CLI binary
+│   ├── cli/
+│   │   ├── autopilot.ts        # orql autopilot subcommands
+│   │   ├── cost.ts             # orql cost (spend analytics + sparklines)
+│   │   ├── goal.ts             # orql goal subcommands
+│   │   ├── web.ts              # orql web (HTML dashboard server)
+│   │   ├── watch.ts            # orql watch (TUI dashboard)
+│   │   ├── backlog.ts          # orql backlog subcommands
+│   │   └── ...                 # tail, memory, open, doctor, about
 │   ├── lib/
-│   │   ├── state.ts            # JSON-backed ledger, schema v2
+│   │   ├── state.ts            # JSON-backed ledger, atomic writes
+│   │   ├── json_store.ts       # generic atomic JSON store
 │   │   ├── budgeting.ts        # token-first budget, daily quota reader
-│   │   ├── pricing.ts          # USD pricing table (informational)
+│   │   ├── guardrails.ts       # rolling-window cost thresholds
 │   │   ├── hallucination.ts    # deterministic detectors
+│   │   ├── memory.ts           # lore / playbook / ledger / atlas store
+│   │   ├── backlog.ts          # goal queue, priority, deadline boost
+│   │   ├── templates.ts        # fleet template definitions
+│   │   ├── web_server.ts       # SSE dashboard (heartbeat, CSP, backpressure)
 │   │   ├── jsonl_tail.ts       # cached byte-offset session tail
-│   │   └── audit.ts            # append-only audit log
+│   │   ├── audit.ts            # append-only audit log
+│   │   └── ...                 # pricing, spawn_cli, retry, style, ...
 │   ├── tools/
-│   │   ├── ping.ts
 │   │   ├── planning.ts         # create_plan, estimate, request_approval, confirm
-│   │   ├── dispatch.ts         # next_task, register_spawn, status, collect
-│   │   ├── broker.ts           # checkin, post_note, claim_files, release_files, poll_notes, send_message
+│   │   ├── dispatch.ts         # next_task, status, collect, register_spawn
+│   │   ├── broker.ts           # checkin, post_note, claim_files, poll_notes, send_message
 │   │   ├── lifecycle.ts        # kill_task, resume_plan, list_plans
-│   │   └── review.ts           # review_prs
-│   └── __tests__/
-│       ├── state.test.ts
-│       └── hallucination.test.ts
+│   │   ├── review.ts           # review_prs
+│   │   ├── memory.ts           # remember, recall, forget, compose_memory_context
+│   │   ├── backlog.ts          # enqueue_goal, list_goals, update_goal, pick_next_goal
+│   │   ├── templates.ts        # list/suggest/apply fleet templates
+│   │   ├── userio.ts           # notify_user, request_user_response, stream_*
+│   │   └── ping.ts
+│   ├── telegram/
+│   │   ├── bot.ts              # polling loop
+│   │   ├── commands.ts         # /plans, /status, /kill, /respond, ...
+│   │   ├── notifier.ts         # push events to user
+│   │   ├── api.ts              # raw Bot API client
+│   │   └── config.ts           # ~/.orqlaude/telegram.json
+│   └── __tests__/              # 29 test files, 236 tests
 └── dist/                       # tsc output (published to npm)
 ```
 
@@ -515,13 +535,12 @@ orqlaude tg start
 
 The bot uses raw `fetch` against Telegram's Bot API — zero extra deps. State is shared with the MCP via the same `StateStore`, so commands take effect on the next status() / checkin().
 
-## Known gaps (v0.3 → v0.4 roadmap)
+## Known gaps
 
 - **Cost-learning estimates** — current baselines are tuned to a single Haiku probe. Future: write per-task realized costs to history and use moving averages.
 - **N chips = N clicks** — Anthropic's `spawn_task` is per-click by design. Worth filing as feedback. Until then, batch-spawn isn't possible through that API.
 - **Second-model hallucination check** — periodic Haiku cross-validation of recent activity, opt-in.
 - **Multi-project Telegram bot** — currently the bot watches a single project. Multi-project watching is a small extension to the config schema.
-- **Inline approve buttons in Telegram** — `/approve <plan_id>` and inline keyboards so you can confirm fleets from your phone.
 
 ## Troubleshooting
 
